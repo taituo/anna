@@ -420,6 +420,10 @@ curl localhost:8080/policy/snapshot
 curl -H 'If-None-Match: "REVISION_HASH"' localhost:8080/policy/revision
 curl -H 'If-Match: "REVISION_HASH"' localhost:8080/policy/snapshot
 
+# Sync snapshot locally with revision-safe preconditions
+anna policy-sync
+anna policy-sync --output ./state/policy.snapshot.json
+
 # List workflows
 curl localhost:8080/workflows
 
@@ -506,7 +510,7 @@ triage: incident-triage
 
 Flows can be accessed via multiple interfaces while keeping one execution contract:
 
-- CLI (`anna run`, `anna submit`, `anna status`, `anna logs`, `anna can-chat`, `anna chat-intents`, `anna chat`)
+- CLI (`anna run`, `anna submit`, `anna status`, `anna logs`, `anna can-chat`, `anna chat-intents`, `anna chat`, `anna policy-sync`)
 - HTTP control API (run, status, stop, hook, chat intent routing, log streaming)
 - MCP server tools (`list_flows`, `run_flow`, `session_status`, `tail_logs`, `stop_flow`, `can_run_chat_intent`, `list_chat_intents`, `run_chat_intent`)
 - Chat gateways (intent -> approved flow run via control API)

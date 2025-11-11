@@ -60,6 +60,7 @@ anna stats
 anna policy
 anna policy-revision
 anna policy-snapshot
+anna policy-sync
 anna llm-adapters
 anna llm-adapters --json
 anna llm-adapters --daemon http://127.0.0.1:8080
@@ -110,6 +111,22 @@ curl -H 'If-None-Match: "REVISION_HASH"' localhost:8080/policy/revision
 # strong precondition (rejects with 412 if revision changed)
 curl -H 'If-Match: "REVISION_HASH"' localhost:8080/policy/snapshot
 ```
+
+Policy snapshot sync to local cache (revision-safe + atomic write):
+
+```bash
+# default output: ~/.anna/policy.snapshot.json
+anna policy-sync
+
+# custom output path
+anna policy-sync --output ./state/policy.snapshot.json
+
+# reduce retry budget for revision races (default 3)
+anna policy-sync --retries 1
+```
+
+`policy-sync` uses `If-None-Match` against `/policy/revision` and `If-Match` against `/policy/snapshot`.
+This prevents stale writes when policy changes mid-fetch and writes the local file via temp+rename.
 
 Daemon retention limits (in-memory + persisted snapshots):
 
@@ -307,7 +324,7 @@ Current MVP intentionally leaves some advanced features for next steps (multi-no
 
 ## Access Channels
 
-- CLI (`anna run`, `anna submit`, `anna can-run`, `anna can-chat`, `anna can-run-yaml`, `anna status`, `anna policy`, `anna policy-revision`, `anna policy-snapshot`, `anna chat-intents`, `anna chat`)
+- CLI (`anna run`, `anna submit`, `anna can-run`, `anna can-chat`, `anna can-run-yaml`, `anna status`, `anna policy`, `anna policy-revision`, `anna policy-snapshot`, `anna policy-sync`, `anna chat-intents`, `anna chat`)
 - HTTP control API (`/policy`, `/policy/revision`, `/policy/snapshot`, `/llm/adapters`, `/workflow`, `/workflow/check`, `/workflow/{name}/check`, `/workflow/{name}/run`, `/workflows`, `/workflows/meta`, `/chat/intents`, `/chat/{intent}/check`, `/chat/run`, `/hook/*`, `/hitl`, `/hitl/{id}/resolve`, `/ws`)
 - MCP stdio server (`anna mcp`) with tools: `list_flows`, `list_flows_meta`, `run_flow`, `can_run_flow`, `can_run_flow_yaml`, `can_run_chat_intent`, `session_status`, `tail_logs`, `stop_flow`, `list_sessions`, `stats`, `policy`, `policy_revision`, `policy_snapshot`, `list_llm_adapters`, `daemon_llm_adapters`, `trigger_hook`, `list_chat_intents`, `run_chat_intent`, `list_hitl`, `resolve_hitl`
 - Chat gateway (maps chat intents to approved flow runs)
