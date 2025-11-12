@@ -2,6 +2,7 @@ use crate::providers::llm::{active_llm_adapter_name, load_llm_adapter_catalog_fr
 use anyhow::{Context, Result, anyhow};
 use reqwest::Client;
 use serde_json::{Value, json};
+use std::path::{Path, PathBuf};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter};
 
 #[derive(Debug, Clone)]
@@ -282,6 +283,18 @@ fn tool_specs() -> Vec<Value> {
                 "properties": {
                     "if_match": { "type": "string" },
                     "if_none_match": { "type": "string" }
+                },
+                "additionalProperties": false
+            }
+        }),
+        json!({
+            "name": "policy_sync",
+            "description": "Sync daemon policy snapshot to local file with revision-safe preconditions",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "output": { "type": "string" },
+                    "retries": { "type": "integer", "minimum": 0 }
                 },
                 "additionalProperties": false
             }
@@ -612,6 +625,17 @@ async fn handle_tools_call(client: &Client, config: &McpConfig, params: &Value) 
             .await?;
             Ok(body)
         }
+        "policy_sync" => {
+            let output = arg_string(&args, "output")?
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty())
+                .map(PathBuf::from);
+            let retries = arg_u64(&args, "retries")?
+                .map(|v| usize::try_from(v).context("tool argument 'retries' is too large"))
+                .transpose()?
+                .unwrap_or(3);
+            sync_policy_snapshot(client, &daemon, &config.daemon_token, output, retries).await
+        }
         "list_llm_adapters" => {
             let loaded = load_llm_adapter_catalog_from_env()?;
             let payload = match loaded {
@@ -847,6 +871,261 @@ async fn send(builder: reqwest::RequestBuilder) -> Result<String> {
     ))
 }
 
+async fn sync_policy_snapshot(
+    client: &Client,
+    daemon: &str,
+    token: &Option<String>,
+    output: Option<PathBuf>,
+    retries: usize,
+) -> Result<String> {
+    let output = output.unwrap_or_else(default_local_policy_snapshot_path);
+    let previous_revision = read_local_policy_revision(&output).await?;
+    let mut attempt = 0usize;
+
+    loop {
+        attempt += 1;
+        let mut revision_request = authed(client.get(format!("{}/policy/revision", daemon)), token);
+        if let Some(previous_revision) = previous_revision.as_deref() {
+            revision_request =
+                with_optional_etag_preconditions(revision_request, None, Some(previous_revision));
+        }
+
+        let revision_response = revision_request
+            .send()
+            .await
+            .context("daemon request failed (policy revision)")?;
+        let revision_status = revision_response.status();
+        if revision_status == reqwest::StatusCode::NOT_MODIFIED {
+            let payload = json!({
+                "status": "not_modified",
+                "path": output.display().to_string(),
+                "policy_revision": previous_revision,
+                "attempts": attempt,
+            });
+            return Ok(serde_json::to_string_pretty(&payload)?);
+        }
+
+        let revision_etag = etag_revision(revision_response.headers());
+        let revision_body = revision_response
+            .text()
+            .await
+            .context("failed reading daemon policy revision response body")?;
+        if !revision_status.is_success() {
+            if revision_body.trim().is_empty() {
+                return Err(anyhow!(
+                    "daemon policy revision request failed with status {}",
+                    revision_status
+                ));
+            }
+            return Err(anyhow!(
+                "daemon policy revision request failed with status {}: {}",
+                revision_status,
+                revision_body
+            ));
+        }
+
+        let revision_json: Value = serde_json::from_str(&revision_body)
+            .context("daemon policy revision response was not valid json")?;
+        let remote_revision = policy_revision_from_json(&revision_json)
+            .or(revision_etag)
+            .ok_or_else(|| anyhow!("daemon policy revision response missing 'policy_revision'"))?;
+
+        let snapshot_response = with_optional_etag_preconditions(
+            authed(client.get(format!("{}/policy/snapshot", daemon)), token),
+            Some(&remote_revision),
+            None,
+        )
+        .send()
+        .await
+        .context("daemon request failed (policy snapshot)")?;
+        let snapshot_status = snapshot_response.status();
+        let snapshot_etag = etag_revision(snapshot_response.headers());
+        let snapshot_body = snapshot_response
+            .text()
+            .await
+            .context("failed reading daemon policy snapshot response body")?;
+
+        if snapshot_status == reqwest::StatusCode::PRECONDITION_FAILED {
+            if attempt <= retries {
+                continue;
+            }
+            let current_revision = snapshot_etag
+                .or_else(|| policy_revision_from_raw_json(&snapshot_body).ok().flatten());
+            if snapshot_body.trim().is_empty() {
+                if let Some(current_revision) = current_revision {
+                    return Err(anyhow!(
+                        "policy snapshot precondition failed after {} attempts; current revision '{}'",
+                        attempt,
+                        current_revision
+                    ));
+                }
+                return Err(anyhow!(
+                    "policy snapshot precondition failed after {} attempts",
+                    attempt
+                ));
+            }
+            if let Some(current_revision) = current_revision {
+                return Err(anyhow!(
+                    "policy snapshot precondition failed after {} attempts (current revision '{}'): {}",
+                    attempt,
+                    current_revision,
+                    snapshot_body
+                ));
+            }
+            return Err(anyhow!(
+                "policy snapshot precondition failed after {} attempts: {}",
+                attempt,
+                snapshot_body
+            ));
+        }
+
+        if !snapshot_status.is_success() {
+            if snapshot_body.trim().is_empty() {
+                return Err(anyhow!(
+                    "daemon policy snapshot request failed with status {}",
+                    snapshot_status
+                ));
+            }
+            return Err(anyhow!(
+                "daemon policy snapshot request failed with status {}: {}",
+                snapshot_status,
+                snapshot_body
+            ));
+        }
+
+        let snapshot_json: Value = serde_json::from_str(&snapshot_body)
+            .context("daemon policy snapshot response was not valid json")?;
+        let snapshot_revision = policy_revision_from_json(&snapshot_json)
+            .or(snapshot_etag)
+            .ok_or_else(|| anyhow!("daemon policy snapshot response missing 'policy_revision'"))?;
+        if snapshot_revision != remote_revision {
+            if attempt <= retries {
+                continue;
+            }
+            return Err(anyhow!(
+                "policy snapshot revision mismatch after {} attempts (revision endpoint='{}', snapshot='{}')",
+                attempt,
+                remote_revision,
+                snapshot_revision
+            ));
+        }
+
+        write_json_atomic(&output, &snapshot_json).await?;
+        let payload = json!({
+            "status": "synced",
+            "path": output.display().to_string(),
+            "previous_policy_revision": previous_revision,
+            "policy_revision": remote_revision,
+            "attempts": attempt,
+        });
+        return Ok(serde_json::to_string_pretty(&payload)?);
+    }
+}
+
+fn default_local_policy_snapshot_path() -> PathBuf {
+    if let Ok(raw) = std::env::var("ANNA_POLICY_LOCAL_SNAPSHOT_FILE") {
+        let trimmed = raw.trim();
+        if !trimmed.is_empty() {
+            return PathBuf::from(trimmed);
+        }
+    }
+    if let Ok(home) = std::env::var("HOME") {
+        let trimmed = home.trim();
+        if !trimmed.is_empty() {
+            return PathBuf::from(trimmed).join(".anna/policy.snapshot.json");
+        }
+    }
+    PathBuf::from("policy.snapshot.json")
+}
+
+async fn read_local_policy_revision(path: &Path) -> Result<Option<String>> {
+    let raw = match tokio::fs::read_to_string(path).await {
+        Ok(v) => v,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => {
+            return Err(err).with_context(|| {
+                format!("failed reading local policy snapshot '{}'", path.display())
+            });
+        }
+    };
+    policy_revision_from_raw_json(&raw)
+        .with_context(|| format!("failed parsing local policy snapshot '{}'", path.display()))
+}
+
+fn policy_revision_from_raw_json(raw: &str) -> Result<Option<String>> {
+    let parsed: Value = serde_json::from_str(raw).context("policy snapshot is not valid json")?;
+    Ok(policy_revision_from_json(&parsed))
+}
+
+fn policy_revision_from_json(value: &Value) -> Option<String> {
+    value
+        .get("policy_revision")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn etag_revision(headers: &reqwest::header::HeaderMap) -> Option<String> {
+    headers
+        .get(reqwest::header::ETAG)
+        .and_then(|v| v.to_str().ok())
+        .and_then(normalize_etag_value)
+}
+
+fn normalize_etag_value(value: &str) -> Option<String> {
+    let mut trimmed = value.trim();
+    if trimmed.is_empty() || trimmed == "*" {
+        return None;
+    }
+    if let Some(weak) = trimmed
+        .strip_prefix("W/")
+        .or_else(|| trimmed.strip_prefix("w/"))
+    {
+        trimmed = weak.trim();
+    }
+    let normalized = trimmed.trim_matches('"').trim();
+    if normalized.is_empty() || normalized == "*" {
+        return None;
+    }
+    Some(normalized.to_string())
+}
+
+async fn write_json_atomic(path: &Path, value: &Value) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        tokio::fs::create_dir_all(parent).await.with_context(|| {
+            format!(
+                "failed creating local policy snapshot directory '{}'",
+                parent.display()
+            )
+        })?;
+    }
+    let raw = serde_json::to_string_pretty(value).context("serialize policy snapshot json")?;
+    let tmp = temp_json_path(path);
+    tokio::fs::write(&tmp, raw).await.with_context(|| {
+        format!(
+            "failed writing local policy snapshot temp '{}'",
+            tmp.display()
+        )
+    })?;
+    tokio::fs::rename(&tmp, path).await.with_context(|| {
+        format!(
+            "failed moving local policy snapshot '{}' -> '{}'",
+            tmp.display(),
+            path.display()
+        )
+    })?;
+    Ok(())
+}
+
+fn temp_json_path(path: &Path) -> PathBuf {
+    if let Some(name) = path.file_name().and_then(|v| v.to_str()) {
+        let unique = crate::session::gen_session_id();
+        return path.with_file_name(format!("{}.{}.tmp", name, unique));
+    }
+    path.with_extension("tmp")
+}
+
 async fn check_named_flow_readiness(
     client: &Client,
     daemon: &str,
@@ -888,7 +1167,10 @@ fn normalize_daemon_url(url: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{arg_bool, arg_string, arg_string_map, arg_u32, arg_u64, tool_specs};
+    use super::{
+        arg_bool, arg_string, arg_string_map, arg_u32, arg_u64, normalize_etag_value,
+        policy_revision_from_json, tool_specs,
+    };
     use serde_json::json;
 
     #[test]
@@ -911,6 +1193,7 @@ mod tests {
         assert!(names.contains(&"policy"));
         assert!(names.contains(&"policy_revision"));
         assert!(names.contains(&"policy_snapshot"));
+        assert!(names.contains(&"policy_sync"));
         assert!(names.contains(&"list_llm_adapters"));
         assert!(names.contains(&"daemon_llm_adapters"));
         assert!(names.contains(&"list_chat_intents"));
@@ -937,6 +1220,23 @@ mod tests {
         assert_eq!(
             arg_string(&args, "missing").expect("missing should parse"),
             None
+        );
+    }
+
+    #[test]
+    fn etag_and_policy_revision_helpers_are_stable() {
+        assert_eq!(
+            normalize_etag_value("W/\"rev-1\""),
+            Some("rev-1".to_string())
+        );
+        assert_eq!(normalize_etag_value("*"), None);
+
+        let payload = json!({
+            "policy_revision": "abc123"
+        });
+        assert_eq!(
+            policy_revision_from_json(&payload),
+            Some("abc123".to_string())
         );
     }
 }

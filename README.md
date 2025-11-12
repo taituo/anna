@@ -326,7 +326,7 @@ Current MVP intentionally leaves some advanced features for next steps (multi-no
 
 - CLI (`anna run`, `anna submit`, `anna can-run`, `anna can-chat`, `anna can-run-yaml`, `anna status`, `anna policy`, `anna policy-revision`, `anna policy-snapshot`, `anna policy-sync`, `anna chat-intents`, `anna chat`)
 - HTTP control API (`/policy`, `/policy/revision`, `/policy/snapshot`, `/llm/adapters`, `/workflow`, `/workflow/check`, `/workflow/{name}/check`, `/workflow/{name}/run`, `/workflows`, `/workflows/meta`, `/chat/intents`, `/chat/{intent}/check`, `/chat/run`, `/hook/*`, `/hitl`, `/hitl/{id}/resolve`, `/ws`)
-- MCP stdio server (`anna mcp`) with tools: `list_flows`, `list_flows_meta`, `run_flow`, `can_run_flow`, `can_run_flow_yaml`, `can_run_chat_intent`, `session_status`, `tail_logs`, `stop_flow`, `list_sessions`, `stats`, `policy`, `policy_revision`, `policy_snapshot`, `list_llm_adapters`, `daemon_llm_adapters`, `trigger_hook`, `list_chat_intents`, `run_chat_intent`, `list_hitl`, `resolve_hitl`
+- MCP stdio server (`anna mcp`) with tools: `list_flows`, `list_flows_meta`, `run_flow`, `can_run_flow`, `can_run_flow_yaml`, `can_run_chat_intent`, `session_status`, `tail_logs`, `stop_flow`, `list_sessions`, `stats`, `policy`, `policy_revision`, `policy_snapshot`, `policy_sync`, `list_llm_adapters`, `daemon_llm_adapters`, `trigger_hook`, `list_chat_intents`, `run_chat_intent`, `list_hitl`, `resolve_hitl`
 - Chat gateway (maps chat intents to approved flow runs)
 
 Minimal MCP smoke test:

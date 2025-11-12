@@ -512,7 +512,7 @@ Flows can be accessed via multiple interfaces while keeping one execution contra
 
 - CLI (`anna run`, `anna submit`, `anna status`, `anna logs`, `anna can-chat`, `anna chat-intents`, `anna chat`, `anna policy-sync`)
 - HTTP control API (run, status, stop, hook, chat intent routing, log streaming)
-- MCP server tools (`list_flows`, `run_flow`, `session_status`, `tail_logs`, `stop_flow`, `can_run_chat_intent`, `list_chat_intents`, `run_chat_intent`)
+- MCP server tools (`list_flows`, `run_flow`, `session_status`, `tail_logs`, `stop_flow`, `can_run_chat_intent`, `policy`, `policy_revision`, `policy_snapshot`, `policy_sync`, `list_chat_intents`, `run_chat_intent`)
 - Chat gateways (intent -> approved flow run via control API)
 
 For production governance, use a flow registry keyed by `flow_id` + `path` + `tags` + required capabilities.
