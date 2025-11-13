@@ -424,6 +424,10 @@ curl -H 'If-Match: "REVISION_HASH"' localhost:8080/policy/snapshot
 anna policy-sync
 anna policy-sync --output ./state/policy.snapshot.json
 
+# Verify policy revision signature (HMAC-SHA256)
+anna policy-verify --key replace-with-long-random-secret
+ANNA_POLICY_VERIFY_KEY=replace-with-long-random-secret anna policy-verify
+
 # List workflows
 curl localhost:8080/workflows
 
@@ -510,9 +514,9 @@ triage: incident-triage
 
 Flows can be accessed via multiple interfaces while keeping one execution contract:
 
-- CLI (`anna run`, `anna submit`, `anna status`, `anna logs`, `anna can-chat`, `anna chat-intents`, `anna chat`, `anna policy-sync`)
+- CLI (`anna run`, `anna submit`, `anna status`, `anna logs`, `anna can-chat`, `anna chat-intents`, `anna chat`, `anna policy-sync`, `anna policy-verify`)
 - HTTP control API (run, status, stop, hook, chat intent routing, log streaming)
-- MCP server tools (`list_flows`, `run_flow`, `session_status`, `tail_logs`, `stop_flow`, `can_run_chat_intent`, `policy`, `policy_revision`, `policy_snapshot`, `policy_sync`, `list_chat_intents`, `run_chat_intent`)
+- MCP server tools (`list_flows`, `run_flow`, `session_status`, `tail_logs`, `stop_flow`, `can_run_chat_intent`, `policy`, `policy_revision`, `policy_snapshot`, `policy_sync`, `policy_verify`, `list_chat_intents`, `run_chat_intent`)
 - Chat gateways (intent -> approved flow run via control API)
 
 For production governance, use a flow registry keyed by `flow_id` + `path` + `tags` + required capabilities.

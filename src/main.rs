@@ -3,8 +3,10 @@ use anna_rs::providers::llm::{active_llm_adapter_name, load_llm_adapter_catalog_
 use anna_rs::workflow::Workflow;
 use anyhow::{Context, Result, anyhow};
 use clap::{Parser, Subcommand};
+use hmac::{Hmac, Mac};
 use reqwest::Client;
 use serde_json::json;
+use sha2::Sha256;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -215,6 +217,18 @@ enum Commands {
         /// Retries when revision changes between /policy/revision and /policy/snapshot
         #[arg(long, default_value_t = 3)]
         retries: usize,
+    },
+    /// Verify daemon policy revision signature (HMAC-SHA256)
+    PolicyVerify {
+        /// Daemon base URL
+        #[arg(long, default_value = "http://127.0.0.1:8080")]
+        daemon: String,
+        /// Verification key (fallback: ANNA_POLICY_VERIFY_KEY, then ANNA_POLICY_SIGNING_KEY)
+        #[arg(long)]
+        key: Option<String>,
+        /// Do not fail when daemon policy revision is unsigned
+        #[arg(long, default_value_t = false)]
+        allow_unsigned: bool,
     },
     /// Show local or daemon LLM adapter catalog
     LlmAdapters {
@@ -668,6 +682,14 @@ async fn main() -> Result<()> {
             let output = output.unwrap_or_else(default_local_policy_snapshot_path);
             sync_policy_snapshot(&daemon, &output, retries).await
         }
+        Commands::PolicyVerify {
+            daemon,
+            key,
+            allow_unsigned,
+        } => {
+            let daemon = normalize_daemon_url(&daemon);
+            verify_policy_revision_signature(&daemon, key.as_deref(), allow_unsigned).await
+        }
         Commands::LlmAdapters { json, daemon } => {
             if let Some(daemon) = daemon {
                 let daemon = normalize_daemon_url(&daemon);
@@ -1099,6 +1121,107 @@ async fn sync_policy_snapshot(daemon: &str, output: &Path, retries: usize) -> Re
     }
 }
 
+async fn verify_policy_revision_signature(
+    daemon: &str,
+    key: Option<&str>,
+    allow_unsigned: bool,
+) -> Result<()> {
+    let client = Client::new();
+    let response = with_daemon_auth(client.get(format!("{}/policy/revision", daemon)))
+        .send()
+        .await
+        .with_context(|| format!("failed querying policy revision at {}", daemon))?;
+    let status = response.status();
+    let body = response
+        .text()
+        .await
+        .context("failed reading policy revision response body")?;
+    if !status.is_success() {
+        if body.trim().is_empty() {
+            return Err(anyhow!(
+                "policy revision request failed with status {}",
+                status
+            ));
+        }
+        return Err(anyhow!(
+            "policy revision request failed with status {}: {}",
+            status,
+            body
+        ));
+    }
+
+    let payload: serde_json::Value =
+        serde_json::from_str(&body).context("daemon returned non-json policy revision response")?;
+    let policy_revision = policy_revision_from_json(&payload)
+        .ok_or_else(|| anyhow!("policy revision response missing 'policy_revision'"))?;
+    let policy_signature = policy_signature_from_json(&payload);
+    let signed = payload
+        .get("signed")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+        || policy_signature.is_some();
+    let signature_algorithm = payload
+        .get("policy_signature_algorithm")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .unwrap_or("hmac-sha256")
+        .to_string();
+
+    if !signed || policy_signature.is_none() {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "status": "unsigned",
+                "verified": false,
+                "policy_revision": policy_revision,
+                "signature_algorithm": serde_json::Value::Null,
+            }))?
+        );
+        if allow_unsigned {
+            return Ok(());
+        }
+        return Err(anyhow!(
+            "policy revision is unsigned; set --allow-unsigned to ignore"
+        ));
+    }
+
+    if !signature_algorithm.eq_ignore_ascii_case("hmac-sha256") {
+        return Err(anyhow!(
+            "unsupported policy signature algorithm '{}'",
+            signature_algorithm
+        ));
+    }
+
+    let key = resolve_policy_verify_key(key).ok_or_else(|| {
+        anyhow!(
+            "missing verification key; pass --key or set ANNA_POLICY_VERIFY_KEY / ANNA_POLICY_SIGNING_KEY"
+        )
+    })?;
+    let expected_signature = sign_policy_revision_hex(&policy_revision, &key)
+        .ok_or_else(|| anyhow!("failed to compute policy signature"))?;
+    let received_signature = policy_signature.unwrap_or_default();
+    let verified = received_signature.eq_ignore_ascii_case(&expected_signature);
+
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&json!({
+            "status": if verified { "verified" } else { "invalid_signature" },
+            "verified": verified,
+            "policy_revision": policy_revision,
+            "signature_algorithm": signature_algorithm,
+            "received_signature": received_signature,
+            "expected_signature": expected_signature,
+        }))?
+    );
+
+    if verified {
+        Ok(())
+    } else {
+        Err(anyhow!("policy signature verification failed"))
+    }
+}
+
 fn default_local_policy_snapshot_path() -> PathBuf {
     if let Ok(raw) = std::env::var("ANNA_POLICY_LOCAL_SNAPSHOT_FILE") {
         let trimmed = raw.trim();
@@ -1142,6 +1265,49 @@ fn policy_revision_from_json(value: &serde_json::Value) -> Option<String> {
         .map(str::trim)
         .filter(|v| !v.is_empty())
         .map(ToOwned::to_owned)
+}
+
+fn policy_signature_from_json(value: &serde_json::Value) -> Option<String> {
+    value
+        .get("policy_signature")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn resolve_policy_verify_key(key: Option<&str>) -> Option<String> {
+    key.map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(ToOwned::to_owned)
+        .or_else(|| {
+            std::env::var("ANNA_POLICY_VERIFY_KEY")
+                .ok()
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty())
+        })
+        .or_else(|| {
+            std::env::var("ANNA_POLICY_SIGNING_KEY")
+                .ok()
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty())
+        })
+}
+
+fn sign_policy_revision_hex(revision: &str, key: &str) -> Option<String> {
+    type HmacSha256 = Hmac<Sha256>;
+    let mut mac = HmacSha256::new_from_slice(key.as_bytes()).ok()?;
+    mac.update(revision.as_bytes());
+    let bytes = mac.finalize().into_bytes();
+    Some(hex_encode(&bytes))
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push_str(&format!("{:02x}", byte));
+    }
+    out
 }
 
 fn etag_revision(headers: &reqwest::header::HeaderMap) -> Option<String> {
@@ -1290,7 +1456,10 @@ fn is_terminal_status(status: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_terminal_status, normalize_etag_value, policy_revision_from_json};
+    use super::{
+        is_terminal_status, normalize_etag_value, policy_revision_from_json,
+        policy_signature_from_json, resolve_policy_verify_key, sign_policy_revision_hex,
+    };
     use serde_json::json;
 
     #[test]
@@ -1330,5 +1499,37 @@ mod tests {
         assert_eq!(policy_revision_from_json(&missing), None);
         let empty = json!({ "policy_revision": "   " });
         assert_eq!(policy_revision_from_json(&empty), None);
+    }
+
+    #[test]
+    fn policy_signature_from_json_reads_non_empty_value() {
+        let value = json!({
+            "policy_signature": "sig-abc",
+        });
+        assert_eq!(
+            policy_signature_from_json(&value),
+            Some("sig-abc".to_string())
+        );
+        assert_eq!(policy_signature_from_json(&json!({})), None);
+        assert_eq!(
+            policy_signature_from_json(&json!({ "policy_signature": "  " })),
+            None
+        );
+    }
+
+    #[test]
+    fn sign_policy_revision_hex_is_stable_and_keyed() {
+        let first = sign_policy_revision_hex("rev-1", "secret-a").expect("signature");
+        let same = sign_policy_revision_hex("rev-1", "secret-a").expect("signature");
+        let different = sign_policy_revision_hex("rev-1", "secret-b").expect("signature");
+        assert_eq!(first, same);
+        assert_ne!(first, different);
+        assert_eq!(first.len(), 64);
+    }
+
+    #[test]
+    fn resolve_policy_verify_key_prefers_explicit_input() {
+        let key = resolve_policy_verify_key(Some("  my-key  "));
+        assert_eq!(key, Some("my-key".to_string()));
     }
 }
