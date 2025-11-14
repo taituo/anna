@@ -137,6 +137,12 @@ anna policy-sync --output ./state/policy.snapshot.json
 
 # reduce retry budget for revision races (default 3)
 anna policy-sync --retries 1
+
+# verify snapshot signature before writing
+anna policy-sync --verify --key replace-with-long-random-secret
+
+# in verify mode, tolerate unsigned snapshots
+anna policy-sync --verify --allow-unsigned
 ```
 
 `policy-sync` uses `If-None-Match` against `/policy/revision` and `If-Match` against `/policy/snapshot`.

@@ -296,7 +296,10 @@ fn tool_specs() -> Vec<Value> {
                 "type": "object",
                 "properties": {
                     "output": { "type": "string" },
-                    "retries": { "type": "integer", "minimum": 0 }
+                    "retries": { "type": "integer", "minimum": 0 },
+                    "verify": { "type": "boolean" },
+                    "key": { "type": "string" },
+                    "allow_unsigned": { "type": "boolean" }
                 },
                 "additionalProperties": false
             }
@@ -648,7 +651,20 @@ async fn handle_tools_call(client: &Client, config: &McpConfig, params: &Value) 
                 .map(|v| usize::try_from(v).context("tool argument 'retries' is too large"))
                 .transpose()?
                 .unwrap_or(3);
-            sync_policy_snapshot(client, &daemon, &config.daemon_token, output, retries).await
+            let verify = arg_bool(&args, "verify")?.unwrap_or(false);
+            let key = arg_string(&args, "key")?;
+            let allow_unsigned = arg_bool(&args, "allow_unsigned")?.unwrap_or(false);
+            sync_policy_snapshot(
+                client,
+                &daemon,
+                &config.daemon_token,
+                output,
+                retries,
+                verify,
+                key,
+                allow_unsigned,
+            )
+            .await
         }
         "policy_verify" => {
             let key = arg_string(&args, "key")?;
@@ -903,6 +919,9 @@ async fn sync_policy_snapshot(
     token: &Option<String>,
     output: Option<PathBuf>,
     retries: usize,
+    verify: bool,
+    key: Option<String>,
+    allow_unsigned: bool,
 ) -> Result<String> {
     let output = output.unwrap_or_else(default_local_policy_snapshot_path);
     let previous_revision = read_local_policy_revision(&output).await?;
@@ -1036,14 +1055,37 @@ async fn sync_policy_snapshot(
             ));
         }
 
+        let signature_check = if verify {
+            let check = verify_policy_signature_fields(
+                &remote_revision,
+                policy_signature_from_json(&snapshot_json).as_deref(),
+                policy_signature_algorithm_from_json(&snapshot_json).as_deref(),
+                key.clone(),
+                allow_unsigned,
+            )?;
+            if !check.verified && check.status != "unsigned" {
+                return Err(anyhow!(
+                    "policy snapshot signature verification failed (received='{}', expected='{}')",
+                    check.received_signature.as_deref().unwrap_or(""),
+                    check.expected_signature.as_deref().unwrap_or("")
+                ));
+            }
+            Some(check)
+        } else {
+            None
+        };
+
         write_json_atomic(&output, &snapshot_json).await?;
-        let payload = json!({
+        let mut payload = json!({
             "status": "synced",
             "path": output.display().to_string(),
             "previous_policy_revision": previous_revision,
             "policy_revision": remote_revision,
             "attempts": attempt,
         });
+        if let Some(check) = signature_check.as_ref() {
+            payload["signature_verification"] = policy_signature_check_json(check);
+        }
         return Ok(serde_json::to_string_pretty(&payload)?);
     }
 }
@@ -1082,58 +1124,22 @@ async fn verify_policy_revision_signature(
         .context("daemon policy revision response was not valid json")?;
     let policy_revision = policy_revision_from_json(&payload)
         .ok_or_else(|| anyhow!("daemon policy revision response missing 'policy_revision'"))?;
-    let policy_signature = policy_signature_from_json(&payload);
-    let signed = payload
-        .get("signed")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false)
-        || policy_signature.is_some();
-    let signature_algorithm = payload
-        .get("policy_signature_algorithm")
-        .and_then(|v| v.as_str())
-        .map(str::trim)
-        .filter(|v| !v.is_empty())
-        .unwrap_or("hmac-sha256")
-        .to_string();
-
-    if !signed || policy_signature.is_none() {
-        let output = json!({
-            "status": "unsigned",
-            "verified": false,
-            "policy_revision": policy_revision,
-            "signature_algorithm": Value::Null,
-        });
-        if allow_unsigned {
-            return Ok(serde_json::to_string_pretty(&output)?);
-        }
-        return Err(anyhow!("{}", serde_json::to_string_pretty(&output)?));
-    }
-
-    if !signature_algorithm.eq_ignore_ascii_case("hmac-sha256") {
-        return Err(anyhow!(
-            "unsupported policy signature algorithm '{}'",
-            signature_algorithm
-        ));
-    }
-
-    let key = resolve_policy_verify_key(key).ok_or_else(|| {
-        anyhow!(
-            "missing verification key; pass tool argument 'key' or set ANNA_POLICY_VERIFY_KEY / ANNA_POLICY_SIGNING_KEY"
-        )
-    })?;
-    let expected_signature = sign_policy_revision_hex(&policy_revision, &key)
-        .ok_or_else(|| anyhow!("failed to compute policy signature"))?;
-    let received_signature = policy_signature.unwrap_or_default();
-    let verified = received_signature.eq_ignore_ascii_case(&expected_signature);
+    let check = verify_policy_signature_fields(
+        &policy_revision,
+        policy_signature_from_json(&payload).as_deref(),
+        policy_signature_algorithm_from_json(&payload).as_deref(),
+        key,
+        allow_unsigned,
+    )?;
     let output = json!({
-        "status": if verified { "verified" } else { "invalid_signature" },
-        "verified": verified,
+        "status": check.status,
+        "verified": check.verified,
         "policy_revision": policy_revision,
-        "signature_algorithm": signature_algorithm,
-        "received_signature": received_signature,
-        "expected_signature": expected_signature,
+        "signature_algorithm": check.signature_algorithm,
+        "received_signature": check.received_signature,
+        "expected_signature": check.expected_signature,
     });
-    if verified {
+    if check.verified || check.status == "unsigned" {
         return Ok(serde_json::to_string_pretty(&output)?);
     }
     Err(anyhow!("{}", serde_json::to_string_pretty(&output)?))
@@ -1190,6 +1196,91 @@ fn policy_signature_from_json(value: &Value) -> Option<String> {
         .map(str::trim)
         .filter(|v| !v.is_empty())
         .map(ToOwned::to_owned)
+}
+
+fn policy_signature_algorithm_from_json(value: &Value) -> Option<String> {
+    value
+        .get("policy_signature_algorithm")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+#[derive(Debug, Clone)]
+struct PolicySignatureCheck {
+    status: &'static str,
+    verified: bool,
+    signature_algorithm: Option<String>,
+    received_signature: Option<String>,
+    expected_signature: Option<String>,
+}
+
+fn policy_signature_check_json(check: &PolicySignatureCheck) -> Value {
+    json!({
+        "status": check.status,
+        "verified": check.verified,
+        "signature_algorithm": check.signature_algorithm,
+        "received_signature": check.received_signature,
+        "expected_signature": check.expected_signature,
+    })
+}
+
+fn verify_policy_signature_fields(
+    revision: &str,
+    signature: Option<&str>,
+    signature_algorithm: Option<&str>,
+    key: Option<String>,
+    allow_unsigned: bool,
+) -> Result<PolicySignatureCheck> {
+    let signature = signature.map(str::trim).filter(|v| !v.is_empty());
+    if signature.is_none() {
+        if allow_unsigned {
+            return Ok(PolicySignatureCheck {
+                status: "unsigned",
+                verified: false,
+                signature_algorithm: None,
+                received_signature: None,
+                expected_signature: None,
+            });
+        }
+        return Err(anyhow!(
+            "policy revision is unsigned; set allow_unsigned=true to ignore"
+        ));
+    }
+
+    let signature_algorithm = signature_algorithm
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .unwrap_or("hmac-sha256")
+        .to_string();
+    if !signature_algorithm.eq_ignore_ascii_case("hmac-sha256") {
+        return Err(anyhow!(
+            "unsupported policy signature algorithm '{}'",
+            signature_algorithm
+        ));
+    }
+
+    let key = resolve_policy_verify_key(key).ok_or_else(|| {
+        anyhow!(
+            "missing verification key; pass tool argument 'key' or set ANNA_POLICY_VERIFY_KEY / ANNA_POLICY_SIGNING_KEY"
+        )
+    })?;
+    let expected_signature = sign_policy_revision_hex(revision, &key)
+        .ok_or_else(|| anyhow!("failed to compute policy signature"))?;
+    let received_signature = signature.unwrap_or_default().to_string();
+    let verified = received_signature.eq_ignore_ascii_case(&expected_signature);
+    Ok(PolicySignatureCheck {
+        status: if verified {
+            "verified"
+        } else {
+            "invalid_signature"
+        },
+        verified,
+        signature_algorithm: Some(signature_algorithm),
+        received_signature: Some(received_signature),
+        expected_signature: Some(expected_signature),
+    })
 }
 
 fn resolve_policy_verify_key(key: Option<String>) -> Option<String> {
@@ -1328,8 +1419,9 @@ fn normalize_daemon_url(url: &str) -> String {
 mod tests {
     use super::{
         arg_bool, arg_string, arg_string_map, arg_u32, arg_u64, normalize_etag_value,
-        policy_revision_from_json, policy_signature_from_json, resolve_policy_verify_key,
-        sign_policy_revision_hex, tool_specs,
+        policy_revision_from_json, policy_signature_algorithm_from_json,
+        policy_signature_from_json, resolve_policy_verify_key, sign_policy_revision_hex,
+        tool_specs, verify_policy_signature_fields,
     };
     use serde_json::json;
 
@@ -1418,6 +1510,23 @@ mod tests {
         assert_eq!(first, same);
         assert_ne!(first, different);
         assert_eq!(first.len(), 64);
+    }
+
+    #[test]
+    fn signature_algorithm_and_verify_helpers_work() {
+        let payload = json!({
+            "policy_signature_algorithm": "hmac-sha256"
+        });
+        assert_eq!(
+            policy_signature_algorithm_from_json(&payload),
+            Some("hmac-sha256".to_string())
+        );
+        assert_eq!(policy_signature_algorithm_from_json(&json!({})), None);
+
+        let unsigned = verify_policy_signature_fields("rev-1", None, None, None, true)
+            .expect("unsigned allowed should pass");
+        assert_eq!(unsigned.status, "unsigned");
+        assert!(!unsigned.verified);
     }
 
     #[test]

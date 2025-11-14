@@ -423,6 +423,7 @@ curl -H 'If-Match: "REVISION_HASH"' localhost:8080/policy/snapshot
 # Sync snapshot locally with revision-safe preconditions
 anna policy-sync
 anna policy-sync --output ./state/policy.snapshot.json
+anna policy-sync --verify --key replace-with-long-random-secret
 
 # Verify policy revision signature (HMAC-SHA256)
 anna policy-verify --key replace-with-long-random-secret
