@@ -1269,7 +1269,11 @@ fn verify_policy_signature_fields(
     let expected_signature = sign_policy_revision_hex(revision, &key)
         .ok_or_else(|| anyhow!("failed to compute policy signature"))?;
     let received_signature = signature.unwrap_or_default().to_string();
-    let verified = received_signature.eq_ignore_ascii_case(&expected_signature);
+    let received_bytes = decode_hex(&received_signature)
+        .ok_or_else(|| anyhow!("policy signature is not valid hexadecimal"))?;
+    let expected_bytes = decode_hex(&expected_signature)
+        .ok_or_else(|| anyhow!("internal error: computed signature is not valid hexadecimal"))?;
+    let verified = constant_time_eq(&received_bytes, &expected_bytes);
     Ok(PolicySignatureCheck {
         status: if verified {
             "verified"
@@ -1314,6 +1318,41 @@ fn hex_encode(bytes: &[u8]) -> String {
         out.push_str(&format!("{:02x}", byte));
     }
     out
+}
+
+fn decode_hex(value: &str) -> Option<Vec<u8>> {
+    let raw = value.trim();
+    if raw.is_empty() || raw.len() % 2 != 0 {
+        return None;
+    }
+    let mut out = Vec::with_capacity(raw.len() / 2);
+    let bytes = raw.as_bytes();
+    for pair in bytes.chunks_exact(2) {
+        let high = hex_nibble(pair[0])?;
+        let low = hex_nibble(pair[1])?;
+        out.push((high << 4) | low);
+    }
+    Some(out)
+}
+
+fn hex_nibble(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
 }
 
 fn etag_revision(headers: &reqwest::header::HeaderMap) -> Option<String> {
@@ -1418,8 +1457,8 @@ fn normalize_daemon_url(url: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        arg_bool, arg_string, arg_string_map, arg_u32, arg_u64, normalize_etag_value,
-        policy_revision_from_json, policy_signature_algorithm_from_json,
+        arg_bool, arg_string, arg_string_map, arg_u32, arg_u64, constant_time_eq, decode_hex,
+        normalize_etag_value, policy_revision_from_json, policy_signature_algorithm_from_json,
         policy_signature_from_json, resolve_policy_verify_key, sign_policy_revision_hex,
         tool_specs, verify_policy_signature_fields,
     };
@@ -1535,5 +1574,13 @@ mod tests {
             resolve_policy_verify_key(Some("  my-key  ".to_string())),
             Some("my-key".to_string())
         );
+    }
+
+    #[test]
+    fn decode_hex_and_constant_time_eq_work_for_mixed_case_input() {
+        let mixed = decode_hex("Aa10").expect("mixed case hex");
+        let lower = decode_hex("aa10").expect("lower hex");
+        assert!(constant_time_eq(&mixed, &lower));
+        assert!(decode_hex("xyz").is_none());
     }
 }
