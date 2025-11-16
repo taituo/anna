@@ -36,3 +36,7 @@ anna daemon
 ```
 
 For complete syntax and advanced examples, read `anna.md` first, then `anna_language.md`.
+
+## License
+
+MIT (see `LICENSE`).
