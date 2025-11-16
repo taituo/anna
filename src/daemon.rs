@@ -1,4 +1,5 @@
 use crate::executor::{Executor, HitlHandler, HitlRequest, RunConfig};
+use crate::policy_crypto::{hex_encode, sign_policy_revision_hmac_sha256};
 use crate::providers::llm::{active_llm_adapter_name, load_llm_adapter_catalog_from_env};
 use crate::session::session_dir;
 use crate::workflow::Workflow;
@@ -14,7 +15,6 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use chrono::{DateTime, Utc};
 use cron::Schedule;
-use hmac::{Hmac, Mac};
 use humantime::parse_duration;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -3391,24 +3391,8 @@ fn policy_revision_and_signature(
     let signature = signing_key
         .map(str::trim)
         .filter(|v| !v.is_empty())
-        .and_then(|key| sign_policy_revision(&revision, key));
+        .and_then(|key| sign_policy_revision_hmac_sha256(&revision, key));
     (revision, signature)
-}
-
-fn sign_policy_revision(revision: &str, key: &str) -> Option<String> {
-    type HmacSha256 = Hmac<Sha256>;
-    let mut mac = HmacSha256::new_from_slice(key.as_bytes()).ok()?;
-    mac.update(revision.as_bytes());
-    let bytes = mac.finalize().into_bytes();
-    Some(hex_encode(&bytes))
-}
-
-fn hex_encode(bytes: &[u8]) -> String {
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        out.push_str(&format!("{:02x}", byte));
-    }
-    out
 }
 
 fn temp_state_path(path: &FsPath) -> PathBuf {

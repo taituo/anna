@@ -3,6 +3,7 @@ pub mod executor;
 pub mod expr;
 pub mod mcp;
 pub mod memory;
+pub mod policy_crypto;
 pub mod providers;
 pub mod result;
 pub mod session;

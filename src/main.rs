@@ -1,12 +1,13 @@
 use anna_rs::executor::{Executor, RunConfig};
+use anna_rs::policy_crypto::{
+    sign_policy_revision_hmac_sha256, verify_policy_revision_hmac_sha256,
+};
 use anna_rs::providers::llm::{active_llm_adapter_name, load_llm_adapter_catalog_from_env};
 use anna_rs::workflow::Workflow;
 use anyhow::{Context, Result, anyhow};
 use clap::{Parser, Subcommand};
-use hmac::{Hmac, Mac};
 use reqwest::Client;
 use serde_json::json;
-use sha2::Sha256;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -1351,14 +1352,11 @@ fn verify_policy_signature_fields(
             "missing verification key; pass --key or set ANNA_POLICY_VERIFY_KEY / ANNA_POLICY_SIGNING_KEY"
         )
     })?;
-    let expected_signature = sign_policy_revision_hex(revision, &key)
+    let expected_signature = sign_policy_revision_hmac_sha256(revision, &key)
         .ok_or_else(|| anyhow!("failed to compute policy signature"))?;
     let received_signature = signature.unwrap_or_default().to_string();
-    let received_bytes = decode_hex(&received_signature)
+    let verified = verify_policy_revision_hmac_sha256(revision, &received_signature, &key)
         .ok_or_else(|| anyhow!("policy signature is not valid hexadecimal"))?;
-    let expected_bytes = decode_hex(&expected_signature)
-        .ok_or_else(|| anyhow!("internal error: computed signature is not valid hexadecimal"))?;
-    let verified = constant_time_eq(&received_bytes, &expected_bytes);
     Ok(PolicySignatureCheck {
         status: if verified {
             "verified"
@@ -1388,57 +1386,6 @@ fn resolve_policy_verify_key(key: Option<&str>) -> Option<String> {
                 .map(|v| v.trim().to_string())
                 .filter(|v| !v.is_empty())
         })
-}
-
-fn sign_policy_revision_hex(revision: &str, key: &str) -> Option<String> {
-    type HmacSha256 = Hmac<Sha256>;
-    let mut mac = HmacSha256::new_from_slice(key.as_bytes()).ok()?;
-    mac.update(revision.as_bytes());
-    let bytes = mac.finalize().into_bytes();
-    Some(hex_encode(&bytes))
-}
-
-fn hex_encode(bytes: &[u8]) -> String {
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        out.push_str(&format!("{:02x}", byte));
-    }
-    out
-}
-
-fn decode_hex(value: &str) -> Option<Vec<u8>> {
-    let raw = value.trim();
-    if raw.is_empty() || raw.len() % 2 != 0 {
-        return None;
-    }
-    let mut out = Vec::with_capacity(raw.len() / 2);
-    let bytes = raw.as_bytes();
-    for pair in bytes.chunks_exact(2) {
-        let high = hex_nibble(pair[0])?;
-        let low = hex_nibble(pair[1])?;
-        out.push((high << 4) | low);
-    }
-    Some(out)
-}
-
-fn hex_nibble(byte: u8) -> Option<u8> {
-    match byte {
-        b'0'..=b'9' => Some(byte - b'0'),
-        b'a'..=b'f' => Some(byte - b'a' + 10),
-        b'A'..=b'F' => Some(byte - b'A' + 10),
-        _ => None,
-    }
-}
-
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut diff = 0u8;
-    for (x, y) in a.iter().zip(b.iter()) {
-        diff |= x ^ y;
-    }
-    diff == 0
 }
 
 fn etag_revision(headers: &reqwest::header::HeaderMap) -> Option<String> {
@@ -1588,11 +1535,11 @@ fn is_terminal_status(status: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        constant_time_eq, decode_hex, is_terminal_status, normalize_etag_value,
-        policy_revision_from_json, policy_signature_algorithm_from_json,
-        policy_signature_from_json, resolve_policy_verify_key, sign_policy_revision_hex,
-        verify_policy_signature_fields,
+        is_terminal_status, normalize_etag_value, policy_revision_from_json,
+        policy_signature_algorithm_from_json, policy_signature_from_json,
+        resolve_policy_verify_key, verify_policy_signature_fields,
     };
+    use anna_rs::policy_crypto::{constant_time_eq, decode_hex, sign_policy_revision_hmac_sha256};
     use serde_json::json;
 
     #[test]
@@ -1663,10 +1610,10 @@ mod tests {
     }
 
     #[test]
-    fn sign_policy_revision_hex_is_stable_and_keyed() {
-        let first = sign_policy_revision_hex("rev-1", "secret-a").expect("signature");
-        let same = sign_policy_revision_hex("rev-1", "secret-a").expect("signature");
-        let different = sign_policy_revision_hex("rev-1", "secret-b").expect("signature");
+    fn sign_policy_revision_hmac_sha256_is_stable_and_keyed() {
+        let first = sign_policy_revision_hmac_sha256("rev-1", "secret-a").expect("signature");
+        let same = sign_policy_revision_hmac_sha256("rev-1", "secret-a").expect("signature");
+        let different = sign_policy_revision_hmac_sha256("rev-1", "secret-b").expect("signature");
         assert_eq!(first, same);
         assert_ne!(first, different);
         assert_eq!(first.len(), 64);
