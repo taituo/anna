@@ -298,6 +298,7 @@ fn tool_specs() -> Vec<Value> {
                     "retries": { "type": "integer", "minimum": 0 },
                     "verify": { "type": "boolean" },
                     "key": { "type": "string" },
+                    "key_file": { "type": "string" },
                     "allow_unsigned": { "type": "boolean" }
                 },
                 "additionalProperties": false
@@ -310,6 +311,7 @@ fn tool_specs() -> Vec<Value> {
                 "type": "object",
                 "properties": {
                     "key": { "type": "string" },
+                    "key_file": { "type": "string" },
                     "allow_unsigned": { "type": "boolean" }
                 },
                 "additionalProperties": false
@@ -651,7 +653,14 @@ async fn handle_tools_call(client: &Client, config: &McpConfig, params: &Value) 
                 .transpose()?
                 .unwrap_or(3);
             let verify = arg_bool(&args, "verify")?.unwrap_or(false);
-            let key = arg_string(&args, "key")?;
+            let key_file = arg_string(&args, "key_file")?
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty())
+                .map(PathBuf::from);
+            let key = resolve_inline_or_file_key(
+                arg_string(&args, "key")?.as_deref(),
+                key_file.as_deref(),
+            )?;
             let allow_unsigned = arg_bool(&args, "allow_unsigned")?.unwrap_or(false);
             sync_policy_snapshot(
                 client,
@@ -666,7 +675,14 @@ async fn handle_tools_call(client: &Client, config: &McpConfig, params: &Value) 
             .await
         }
         "policy_verify" => {
-            let key = arg_string(&args, "key")?;
+            let key_file = arg_string(&args, "key_file")?
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty())
+                .map(PathBuf::from);
+            let key = resolve_inline_or_file_key(
+                arg_string(&args, "key")?.as_deref(),
+                key_file.as_deref(),
+            )?;
             let allow_unsigned = arg_bool(&args, "allow_unsigned")?.unwrap_or(false);
             verify_policy_revision_signature(
                 client,
@@ -1399,13 +1415,35 @@ fn normalize_daemon_url(url: &str) -> String {
     url.trim_end_matches('/').to_string()
 }
 
+fn resolve_inline_or_file_key(
+    inline: Option<&str>,
+    key_file: Option<&Path>,
+) -> Result<Option<String>> {
+    if let Some(inline) = inline.map(str::trim).filter(|v| !v.is_empty()) {
+        return Ok(Some(inline.to_string()));
+    }
+    let Some(path) = key_file else {
+        return Ok(None);
+    };
+    let raw = std::fs::read_to_string(path)
+        .with_context(|| format!("failed reading verification key file '{}'", path.display()))?;
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(anyhow!(
+            "verification key file '{}' is empty",
+            path.display()
+        ));
+    }
+    Ok(Some(trimmed.to_string()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         arg_bool, arg_string, arg_string_map, arg_u32, arg_u64, normalize_etag_value,
         policy_revision_from_json, policy_signature_algorithm_from_json,
-        policy_signature_from_json, resolve_policy_verify_key, tool_specs,
-        verify_policy_signature_fields,
+        policy_signature_from_json, resolve_inline_or_file_key, resolve_policy_verify_key,
+        tool_specs, verify_policy_signature_fields,
     };
     use crate::policy_crypto::{constant_time_eq, decode_hex, sign_policy_revision_hmac_sha256};
     use serde_json::json;
@@ -1528,5 +1566,20 @@ mod tests {
         let lower = decode_hex("aa10").expect("lower hex");
         assert!(constant_time_eq(&mixed, &lower));
         assert!(decode_hex("xyz").is_none());
+    }
+
+    #[test]
+    fn resolve_inline_or_file_key_reads_trimmed_file_value() {
+        let path = std::env::temp_dir().join(format!(
+            "anna-mcp-policy-key-{}-{}.txt",
+            std::process::id(),
+            rand::random::<u32>()
+        ));
+        std::fs::write(&path, "  file-key  \n").expect("write key file");
+        let key = resolve_inline_or_file_key(None, Some(&path))
+            .expect("resolve key")
+            .expect("key should exist");
+        assert_eq!(key, "file-key");
+        let _ = std::fs::remove_file(&path);
     }
 }

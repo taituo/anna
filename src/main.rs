@@ -224,6 +224,9 @@ enum Commands {
         /// Verification key (fallback: ANNA_POLICY_VERIFY_KEY, then ANNA_POLICY_SIGNING_KEY)
         #[arg(long)]
         key: Option<String>,
+        /// Verification key file path (read, trim, and use as key)
+        #[arg(long)]
+        key_file: Option<PathBuf>,
         /// Do not fail verify mode when daemon policy snapshot is unsigned
         #[arg(long, default_value_t = false)]
         allow_unsigned: bool,
@@ -236,6 +239,9 @@ enum Commands {
         /// Verification key (fallback: ANNA_POLICY_VERIFY_KEY, then ANNA_POLICY_SIGNING_KEY)
         #[arg(long)]
         key: Option<String>,
+        /// Verification key file path (read, trim, and use as key)
+        #[arg(long)]
+        key_file: Option<PathBuf>,
         /// Do not fail when daemon policy revision is unsigned
         #[arg(long, default_value_t = false)]
         allow_unsigned: bool,
@@ -689,10 +695,12 @@ async fn main() -> Result<()> {
             retries,
             verify,
             key,
+            key_file,
             allow_unsigned,
         } => {
             let daemon = normalize_daemon_url(&daemon);
             let output = output.unwrap_or_else(default_local_policy_snapshot_path);
+            let key = resolve_inline_or_file_key(key.as_deref(), key_file.as_deref())?;
             sync_policy_snapshot(
                 &daemon,
                 &output,
@@ -706,9 +714,11 @@ async fn main() -> Result<()> {
         Commands::PolicyVerify {
             daemon,
             key,
+            key_file,
             allow_unsigned,
         } => {
             let daemon = normalize_daemon_url(&daemon);
+            let key = resolve_inline_or_file_key(key.as_deref(), key_file.as_deref())?;
             verify_policy_revision_signature(&daemon, key.as_deref(), allow_unsigned).await
         }
         Commands::LlmAdapters { json, daemon } => {
@@ -918,6 +928,28 @@ fn parse_var_overrides(raw: Vec<String>) -> Result<HashMap<String, String>> {
 
 fn normalize_daemon_url(url: &str) -> String {
     url.trim_end_matches('/').to_string()
+}
+
+fn resolve_inline_or_file_key(
+    inline: Option<&str>,
+    key_file: Option<&Path>,
+) -> Result<Option<String>> {
+    if let Some(inline) = inline.map(str::trim).filter(|v| !v.is_empty()) {
+        return Ok(Some(inline.to_string()));
+    }
+    let Some(path) = key_file else {
+        return Ok(None);
+    };
+    let raw = std::fs::read_to_string(path)
+        .with_context(|| format!("failed reading verification key file '{}'", path.display()))?;
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(anyhow!(
+            "verification key file '{}' is empty",
+            path.display()
+        ));
+    }
+    Ok(Some(trimmed.to_string()))
 }
 
 fn daemon_auth_token() -> Option<String> {
@@ -1537,7 +1569,7 @@ mod tests {
     use super::{
         is_terminal_status, normalize_etag_value, policy_revision_from_json,
         policy_signature_algorithm_from_json, policy_signature_from_json,
-        resolve_policy_verify_key, verify_policy_signature_fields,
+        resolve_inline_or_file_key, resolve_policy_verify_key, verify_policy_signature_fields,
     };
     use anna_rs::policy_crypto::{constant_time_eq, decode_hex, sign_policy_revision_hmac_sha256};
     use serde_json::json;
@@ -1623,6 +1655,21 @@ mod tests {
     fn resolve_policy_verify_key_prefers_explicit_input() {
         let key = resolve_policy_verify_key(Some("  my-key  "));
         assert_eq!(key, Some("my-key".to_string()));
+    }
+
+    #[test]
+    fn resolve_inline_or_file_key_reads_trimmed_file_value() {
+        let path = std::env::temp_dir().join(format!(
+            "anna-policy-key-{}-{}.txt",
+            std::process::id(),
+            rand::random::<u32>()
+        ));
+        std::fs::write(&path, "  file-key  \n").expect("write key file");
+        let key = resolve_inline_or_file_key(None, Some(&path))
+            .expect("resolve key")
+            .expect("key should exist");
+        assert_eq!(key, "file-key");
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

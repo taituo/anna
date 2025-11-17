@@ -109,6 +109,9 @@ Verify signed policy revision from client side:
 # explicit key
 anna policy-verify --key replace-with-long-random-secret
 
+# key from file
+anna policy-verify --key-file /run/secrets/anna-policy-key
+
 # env fallback (preferred for automation)
 ANNA_POLICY_VERIFY_KEY=replace-with-long-random-secret anna policy-verify
 
@@ -140,6 +143,9 @@ anna policy-sync --retries 1
 
 # verify snapshot signature before writing
 anna policy-sync --verify --key replace-with-long-random-secret
+
+# verify snapshot signature with key file
+anna policy-sync --verify --key-file /run/secrets/anna-policy-key
 
 # in verify mode, tolerate unsigned snapshots
 anna policy-sync --verify --allow-unsigned
