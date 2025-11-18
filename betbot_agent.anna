@@ -1,0 +1,135 @@
+name: betbot-living-agent
+mode: continuous
+memory: true
+tags: [botbet, agent, self-improving, api, chat]
+workdir: /Users/tiny/Documents/projects2/botbet
+
+trigger:
+  webhook: /betbot-bootstrap
+  cron: "*/20 * * * *"
+
+vars:
+  PROJECT: /Users/tiny/Documents/projects2/botbet
+  STATE_DIR: /Users/tiny/Documents/projects2/botbet/.anna
+
+stages:
+  - id: bootstrap
+    exec: |
+      set -e
+      mkdir -p .anna
+      echo "session=$SESSION" > .anna/session.env
+      echo "started=$(date -u +%FT%TZ)" >> .anna/session.env
+      echo "branch=$(git rev-parse --abbrev-ref HEAD)" >> .anna/session.env
+      echo "head=$(git rev-parse --short HEAD)" >> .anna/session.env
+
+  - id: discover
+    exec: |
+      set -e
+      rg --files spine brain execution infra tools > .anna/file_index.txt
+      printf "readme\n-----\n" > .anna/context.txt
+      sed -n '1,200p' README.md >> .anna/context.txt
+      printf "\n\nconfig\n-----\n" >> .anna/context.txt
+      sed -n '1,200p' config.yaml >> .anna/context.txt
+    needs: [bootstrap]
+
+  - id: plan_next_change
+    provider: llm
+    trust: read
+    system: "You are a deterministic engineering planner for BotBet."
+    do: |
+      Goal:
+      Build BotBet to stable API/chat operation with strict safety.
+
+      Rules:
+      - Propose exactly ONE small, testable change.
+      - Prioritize deterministic reliability over new features.
+      - Keep changes reversible and auditable.
+
+      Inputs:
+      - Session: $bootstrap
+      - Repo context: $discover
+      - Previous plan memory: $memory.plan_next_change
+
+      Output format:
+      TASK: <one sentence>
+      FILES: <comma separated paths>
+      VERIFY: <exact command list>
+    needs: [discover]
+    output: .anna/next_plan.txt
+
+  - id: implement
+    provider: llm
+    trust: all
+    system: "You implement one minimal change safely in this repository."
+    do: |
+      Implement the plan below as a minimal diff.
+      If plan is risky or unclear, return NO_CHANGE with reason.
+
+      PLAN:
+      $plan_next_change
+    needs: [plan_next_change]
+    hitl: true
+    hitl_prompt: "Apply this BotBet iteration?"
+    hitl_options: [yes, no, edit]
+
+  - id: verify
+    exec: |
+      set -e
+      mkdir -p .anna
+      python3 -m py_compile main.py orchestrator.py brain/service.py
+      if [ -f spine/Cargo.toml ]; then
+        cargo check --manifest-path spine/Cargo.toml
+      fi
+      if [ -d tests ]; then
+        python3 -m pytest -q tests
+      fi
+      echo "VERIFY_OK"
+    needs: [implement]
+    retry: 1
+    retry_delay: 20s
+    timeout: 20m
+
+  - id: readiness_gate
+    provider: llm
+    trust: read
+    do: |
+      Decide readiness for persistent API/chat operation.
+
+      Readiness criteria:
+      - Verify stage completed.
+      - No critical safety gap in bankroll/risk path.
+      - Clear run command for API service exists.
+
+      Context:
+      - Verify output: $verify
+      - Prior readiness memory: $memory.readiness_gate
+
+      Respond EXACTLY:
+      READY: yes|no
+      REASON: <one line>
+    needs: [verify]
+    output: .anna/readiness.txt
+
+  - id: publish_manifest
+    when: "$readiness_gate contains 'READY: yes'"
+    exec: |
+      set -e
+      mkdir -p .anna
+      cat > .anna/agent_manifest.json << 'JSON'
+      {
+        "name": "betbot-living-agent",
+        "mode": "continuous",
+        "transport": ["api", "chat"],
+        "api_entrypoint": "python3 brain_api.py",
+        "chat_entrypoint": "anna daemon",
+        "state_dir": ".anna"
+      }
+      JSON
+      echo "READY $(date -u +%FT%TZ)" > .anna/READY
+    needs: [readiness_gate]
+
+  - id: announce_ready
+    provider: http
+    when: "$readiness_gate contains 'READY: yes'"
+    exec: "POST http://localhost:8080/hook/betbot-ready"
+    needs: [publish_manifest]

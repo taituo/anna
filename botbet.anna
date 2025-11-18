@@ -1,0 +1,19 @@
+name: botbet-spine-check
+tags: [botbet, doomsignal, spine, rust, python]
+workdir: /Users/tiny/Documents/projects2/botbet
+
+stages:
+  - id: repo_status
+    exec: "git status --short --branch"
+
+  - id: core_layout
+    exec: "ls -1 spine brain execution infra tools"
+    needs: [repo_status]
+
+  - id: spine_smoke
+    exec: "cargo check --manifest-path spine/Cargo.toml"
+    needs: [core_layout]
+
+  - id: brain_smoke
+    exec: "python3 -m py_compile brain/service.py"
+    needs: [core_layout]
