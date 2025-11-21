@@ -59,13 +59,19 @@ workdir: string           # default working directory for all stages
 
 stages:
   - id: string            # stage id (required, unique)
-    provider: shell|llm|http|k8s  # execution provider (default: shell)
+    provider: shell|cli|llm|http|k8s  # execution provider (default: shell)
     
     # Shell provider
     exec: string          # shell command
     workdir: string       # working directory
     env:                  # environment variables
       KEY: value
+
+    # CLI provider (native wrapper)
+    exec: string          # provider binary or command name
+    args: [strings]       # command arguments
+    stdin: string         # optional stdin payload
+    parse: text|json      # output parsing mode (default: text)
     
     # LLM provider
     do: string            # prompt
@@ -145,7 +151,21 @@ stages:
   timeout: 5m
 ```
 
+### cli (recommended wrapper layer)
+```yaml
+- id: model-review
+  provider: cli
+  exec: "anna-llm-provider"
+  args: ["--model", "gpt-4o-mini"]
+  stdin: "Review this code: $code"
+  parse: text
+```
+
+Detailed contract: see `provider_cli_spec.md`.
+
 ### llm
+`llm` should be implemented as an adapter/provider wrapper, not hardwired into core runtime.
+
 ```yaml
 - id: analyze
   provider: llm
@@ -329,6 +349,16 @@ anna -model gpt-4o wf.anna  # override model
 anna --dry-run wf.anna      # print without running
 ```
 
+## Runtime Profiles
+
+Anna supports three runtime profiles with the same workflow DSL:
+
+- `single`: one workflow run from CLI, then exit
+- `daemon`: long-running server for triggers and API control
+- `multi-ha`: multiple daemon nodes with shared control-plane policy
+
+The workflow file format is identical across all three profiles.
+
 ## Daemon API
 
 ```bash
@@ -353,6 +383,40 @@ curl -X POST localhost:8080/hook/deploy
 # WebSocket logs
 wscat -c ws://localhost:8080/ws?id=SESSION_ID
 ```
+
+## Control and Access Layers
+
+Flows can be accessed via multiple interfaces while keeping one execution contract:
+
+- CLI (`anna run`, `anna submit`, `anna status`, `anna logs`)
+- HTTP control API (run, status, stop, hook, log streaming)
+- MCP server tools (`list_flows`, `run_flow`, `session_status`, `tail_logs`, `stop_flow`)
+- Chat gateways (intent -> approved flow run via control API)
+
+For production governance, use a flow registry keyed by `flow_id` + `path` + `tags` + required capabilities.
+
+## Security and Control Invariants
+
+In all runtime profiles:
+
+- agent workflows can request capacity or provider changes, but cannot self-elevate capability ceiling
+- trust/policy ceilings are controlled by master control-plane policy
+- critical flows should require HITL gates for apply/deploy/policy mutation stages
+- secret resolution should use vault/env/file providers, never hardcoded values
+
+## Provider Failure Semantics
+
+Provider failures should be explicit and machine-readable:
+
+- `provider_not_found`: configured provider binary or command does not exist
+- `provider_start_failed`: provider process could not start
+- `provider_timeout`: provider exceeded stage timeout
+- `provider_invalid_response`: parse mode is `json` but output is invalid
+- `provider_exec_failed`: provider returned non-zero execution status
+
+These errors must fail the stage deterministically (no hidden fallback), unless workflow retry policy is configured.
+
+See `architecture_modes.md` for deployment topology and control-plane patterns.
 
 ## Examples
 
@@ -408,5 +472,3 @@ stages:
     do: "Review this PR for bugs and style issues"
     vote: "Pick the most thorough and accurate review"
 ```
-
-

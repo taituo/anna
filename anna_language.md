@@ -28,6 +28,50 @@ Anna exists because the industry needed a language that treats LLMs as infrastru
 
 ---
 
+## Anna as Master Control
+
+Anna is the control plane. Providers are replaceable execution backends under Anna policy.
+
+That means:
+
+- Changing provider internals does not change workflow semantics.
+- The abstraction layer remains stable even when engines evolve (Go now, Rust later, mixed runtime, etc.).
+- Agent workflows can evolve themselves only within bounded capability ceilings.
+- LLM integration can be replaced independently as a provider adapter (preferably via CLI wrapper contract).
+
+This is the key to safe autonomy: the system can iterate, but policy remains above the agent.
+
+## Runtime Modes
+
+Anna should run in three modes without forking the language:
+
+- Single mode: run one flow deterministically and exit.
+- Daemon mode: long-running service with trigger and API support.
+- Multi-HA mode: distributed daemon nodes under shared policy.
+
+The same `.anna` workflow must execute consistently in all three modes.
+
+## Access Model (CLI, API, MCP, Chat)
+
+Anna is not only a CLI. Enterprise usage needs multiple access channels:
+
+- CLI for operators.
+- HTTP API for systems and automation.
+- MCP tools for LLM-native agent interfaces.
+- Chat gateway for human command and approval workflows.
+
+All channels should map into one control contract so auditing, policy, and replay remain uniform.
+
+## Kubernetes Optional, Not Required
+
+Anna can run with Kubernetes, but it must also operate without Kubernetes in edge or small deployments.
+
+A single-node daemon or VM/container runtime should still be able to talk to master control securely, execute deterministic tasks, and continue with safe fallback policy when disconnected.
+
+This keeps Anna useful from startup-scale single instance deployments to geo-distributed enterprise fleets.
+
+---
+
 ## Milestone
 
 The ultimate validation of Anna as a language is self-improvement: an Anna workflow that enhances Anna itself.
@@ -64,6 +108,4 @@ When this workflow runs successfully—when Anna can read its own source code, i
 That milestone is already reached.
 
 Soft AGI? Maybe not, but with Anna your application can be maintaned, improved and feature developed.
-
-
 
