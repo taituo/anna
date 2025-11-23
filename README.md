@@ -8,6 +8,7 @@ This repository contains the language docs:
 - `anna_language.md`: concept and design rationale ("the missing layer")
 - `architecture_modes.md`: runtime and control-plane architecture (single, daemon, multi-HA)
 - `provider_cli_spec.md`: native provider contract for CLI wrappers (including LLM adapters)
+- `tools/README.md`: reference wrapper usage (`tools/anna-llm-provider`)
 
 ## What Anna Supports
 

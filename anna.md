@@ -155,8 +155,8 @@ stages:
 ```yaml
 - id: model-review
   provider: cli
-  exec: "anna-llm-provider"
-  args: ["--model", "gpt-4o-mini"]
+  exec: "./tools/anna-llm-provider"
+  args: ["--model", "gpt-4o-mini", "--mock"]
   stdin: "Review this code: $code"
   parse: text
 ```

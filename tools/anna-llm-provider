@@ -1,0 +1,200 @@
+#!/usr/bin/env python3
+"""Reference CLI wrapper for LLM providers.
+
+Design goals:
+- deterministic, non-interactive wrapper behavior
+- explicit typed failure modes and exit codes
+- simple stdin/stdout contract for Anna `provider: cli`
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import shutil
+import subprocess
+import sys
+from dataclasses import dataclass
+from typing import Optional
+
+
+EXIT_PROVIDER_NOT_FOUND = 10
+EXIT_PROVIDER_START_FAILED = 11
+EXIT_PROVIDER_TIMEOUT = 12
+EXIT_PROVIDER_INVALID_RESPONSE = 13
+EXIT_PROVIDER_EXEC_FAILED = 14
+
+
+@dataclass
+class RunResult:
+    output: str
+
+
+def emit_error(error_code: str, message: str, details: Optional[dict] = None) -> None:
+    payload = {"error_code": error_code, "message": message}
+    if details:
+        payload["details"] = details
+    print(json.dumps(payload, ensure_ascii=True), file=sys.stderr)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="anna-llm-provider",
+        description="Reference LLM CLI wrapper for Anna provider: cli",
+    )
+    parser.add_argument("--model", required=True, help="Model name identifier")
+    parser.add_argument(
+        "--format",
+        choices=["text", "json"],
+        default="text",
+        help="Output format printed to stdout",
+    )
+    parser.add_argument(
+        "--backend-cmd",
+        help=(
+            "Backend command to execute. If omitted, uses ANNA_LLM_BACKEND_CMD. "
+            "The prompt is written to backend stdin."
+        ),
+    )
+    parser.add_argument(
+        "--backend-arg",
+        action="append",
+        default=[],
+        help="Single backend argument, repeat flag for multiple args",
+    )
+    parser.add_argument(
+        "--timeout-seconds",
+        type=float,
+        default=60.0,
+        help="Backend timeout in seconds",
+    )
+    parser.add_argument(
+        "--mock",
+        action="store_true",
+        help="Return deterministic mock output without calling external backend",
+    )
+    parser.add_argument(
+        "--prompt",
+        default=None,
+        help="Prompt string. If omitted, read from stdin.",
+    )
+    return parser
+
+
+def read_prompt(cli_prompt: Optional[str]) -> str:
+    if cli_prompt is not None:
+        return cli_prompt
+    return sys.stdin.read()
+
+
+def run_backend(command: str, args: list[str], prompt: str, timeout_seconds: float) -> RunResult:
+    if shutil.which(command) is None:
+        emit_error(
+            "provider_not_found",
+            f"Backend command not found: {command}",
+            {"command": command},
+        )
+        raise SystemExit(EXIT_PROVIDER_NOT_FOUND)
+
+    cmdline = [command, *args]
+    try:
+        proc = subprocess.run(
+            cmdline,
+            input=prompt,
+            text=True,
+            capture_output=True,
+            timeout=timeout_seconds,
+            check=False,
+        )
+    except FileNotFoundError:
+        emit_error(
+            "provider_not_found",
+            f"Backend command not found: {command}",
+            {"command": command},
+        )
+        raise SystemExit(EXIT_PROVIDER_NOT_FOUND)
+    except subprocess.TimeoutExpired:
+        emit_error(
+            "provider_timeout",
+            f"Backend timed out after {timeout_seconds} seconds",
+            {"command": command, "timeout_seconds": timeout_seconds},
+        )
+        raise SystemExit(EXIT_PROVIDER_TIMEOUT)
+    except Exception as exc:  # noqa: BLE001
+        emit_error(
+            "provider_start_failed",
+            "Failed to start backend process",
+            {"command": command, "error": str(exc)},
+        )
+        raise SystemExit(EXIT_PROVIDER_START_FAILED)
+
+    if proc.returncode != 0:
+        emit_error(
+            "provider_exec_failed",
+            "Backend returned non-zero status",
+            {
+                "command": command,
+                "args": args,
+                "exit_code": proc.returncode,
+                "stderr": proc.stderr.strip(),
+            },
+        )
+        raise SystemExit(EXIT_PROVIDER_EXEC_FAILED)
+
+    return RunResult(output=proc.stdout)
+
+
+def normalize_output_text(raw: str) -> str:
+    return raw.rstrip("\n")
+
+
+def main() -> int:
+    parser = build_parser()
+    args = parser.parse_args()
+
+    prompt = read_prompt(args.prompt)
+
+    if args.mock:
+        model_output = f"[mock:{args.model}] {prompt}".rstrip("\n")
+    else:
+        backend_cmd = args.backend_cmd or os.getenv("ANNA_LLM_BACKEND_CMD")
+        if not backend_cmd:
+            emit_error(
+                "provider_start_failed",
+                "No backend configured. Set --backend-cmd or ANNA_LLM_BACKEND_CMD.",
+            )
+            return EXIT_PROVIDER_START_FAILED
+
+        result = run_backend(
+            command=backend_cmd,
+            args=args.backend_arg,
+            prompt=prompt,
+            timeout_seconds=args.timeout_seconds,
+        )
+        model_output = normalize_output_text(result.output)
+
+    if args.format == "text":
+        print(model_output)
+        return 0
+
+    payload = {
+        "status": "success",
+        "provider": "anna-llm-provider",
+        "model": args.model,
+        "output": model_output,
+    }
+    try:
+        print(json.dumps(payload, ensure_ascii=True))
+    except Exception as exc:  # noqa: BLE001
+        emit_error(
+            "provider_invalid_response",
+            "Failed to encode JSON output",
+            {"error": str(exc)},
+        )
+        return EXIT_PROVIDER_INVALID_RESPONSE
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

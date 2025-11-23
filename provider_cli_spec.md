@@ -9,13 +9,16 @@ Use `provider: cli` when:
 - running tool adapters that are not first-class native providers
 - isolating unstable wrappers from core engine releases
 
+Reference implementation in this repository:
+- `tools/anna-llm-provider`
+
 ## Stage Shape
 
 ```yaml
 - id: explain
   provider: cli
-  exec: "anna-llm-provider"
-  args: ["--model", "gpt-4o-mini"]
+  exec: "./tools/anna-llm-provider"
+  args: ["--model", "gpt-4o-mini", "--mock"]
   stdin: "Explain: $input"
   parse: text
   timeout: 2m
@@ -26,6 +29,19 @@ Fields:
 - `args`: CLI arguments (optional)
 - `stdin`: payload written to stdin (optional)
 - `parse`: `text` or `json` (optional, default `text`)
+
+## Quick Start
+
+```bash
+# deterministic smoke test
+./tools/anna-llm-provider --model gpt-4o-mini --mock --prompt "hello"
+
+# JSON output mode
+./tools/anna-llm-provider --model gpt-4o-mini --mock --format json --prompt "hello"
+
+# real backend via env
+ANNA_LLM_BACKEND_CMD=cat ./tools/anna-llm-provider --model local --prompt "ping"
+```
 
 ## Runtime Contract
 
@@ -53,6 +69,13 @@ CLI providers must fail with explicit reason classes:
 - `provider_exec_failed`: command ran but returned failure
 
 No silent fallback is allowed. Errors must remain deterministic and auditable.
+
+Exit codes:
+- `10` -> `provider_not_found`
+- `11` -> `provider_start_failed`
+- `12` -> `provider_timeout`
+- `13` -> `provider_invalid_response`
+- `14` -> `provider_exec_failed`
 
 ## LLM as Adapter (Recommended)
 
