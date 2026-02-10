@@ -79,6 +79,7 @@ struct HookTriggerResponse {
     launched: Vec<HookLaunchedWorkflow>,
     skipped_running: Vec<String>,
     skipped_capability: Vec<HookSkippedCapability>,
+    skipped_concurrency: Vec<HookSkippedConcurrency>,
 }
 
 #[derive(Debug, Serialize)]
@@ -91,6 +92,13 @@ struct HookLaunchedWorkflow {
 struct HookSkippedCapability {
     workflow: String,
     missing_capabilities: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct HookSkippedConcurrency {
+    workflow: String,
+    running: usize,
+    max_concurrency: usize,
 }
 
 #[derive(Debug, Serialize)]
@@ -107,6 +115,8 @@ struct WorkflowMetaResponse {
     owner: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     version: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_concurrency: Option<u32>,
     available: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     missing_capabilities: Vec<String>,
@@ -225,6 +235,8 @@ struct FlowRegistryEntry {
     owner: Option<String>,
     #[serde(default)]
     version: Option<String>,
+    #[serde(default)]
+    max_concurrency: Option<u32>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -435,6 +447,7 @@ async fn list_workflows_meta(
                 required_capabilities: entry.required_capabilities,
                 owner: entry.owner,
                 version: entry.version,
+                max_concurrency: entry.max_concurrency,
                 available: missing.is_empty(),
                 missing_capabilities: missing,
                 trigger_webhook: entry.trigger_webhook,
@@ -578,6 +591,19 @@ async fn run_registered_workflow(
         )
             .into_response();
     }
+    if let Some(max_concurrency) = normalize_max_concurrency(entry.max_concurrency) {
+        let running = running_workflow_count(&state, &entry.workflow_name).await;
+        if running >= max_concurrency {
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                format!(
+                    "workflow '{}' concurrency limit reached: running={} max_concurrency={}",
+                    name, running, max_concurrency
+                ),
+            )
+                .into_response();
+        }
+    }
 
     let mut workflow = match Workflow::load(&entry.path) {
         Ok(v) => v,
@@ -690,6 +716,7 @@ async fn trigger_hook(
     let mut launched = Vec::new();
     let mut skipped_running = Vec::new();
     let mut skipped_capability = Vec::new();
+    let mut skipped_concurrency = Vec::new();
     for entry in entries {
         if let Some(webhook) = entry.trigger_webhook.as_deref()
             && webhook.trim() == hook_path
@@ -710,12 +737,26 @@ async fn trigger_hook(
                         missing_capabilities,
                     });
                 }
+                Ok(TriggerLaunchOutcome::SkippedConcurrency {
+                    running,
+                    max_concurrency,
+                }) => {
+                    skipped_concurrency.push(HookSkippedConcurrency {
+                        workflow: entry.workflow_name,
+                        running,
+                        max_concurrency,
+                    });
+                }
                 Err(_) => {}
             }
         }
     }
 
-    if launched.is_empty() && skipped_running.is_empty() && skipped_capability.is_empty() {
+    if launched.is_empty()
+        && skipped_running.is_empty()
+        && skipped_capability.is_empty()
+        && skipped_concurrency.is_empty()
+    {
         return (StatusCode::NOT_FOUND, "no workflows for hook").into_response();
     }
     (
@@ -725,6 +766,7 @@ async fn trigger_hook(
             launched,
             skipped_running,
             skipped_capability,
+            skipped_concurrency,
         }),
     )
         .into_response()
@@ -900,6 +942,15 @@ async fn run_interval_triggers(
                         missing.join(", ")
                     );
                 }
+                Ok(TriggerLaunchOutcome::SkippedConcurrency {
+                    running,
+                    max_concurrency,
+                }) => {
+                    eprintln!(
+                        "anna-rs scheduler: skipped interval trigger '{}' due to concurrency limit running={} max={}",
+                        entry.workflow_name, running, max_concurrency
+                    );
+                }
                 Err(err) => {
                     eprintln!(
                         "anna-rs scheduler: failed launching interval trigger for '{}': {}",
@@ -962,6 +1013,15 @@ async fn run_cron_triggers(
                         "anna-rs scheduler: skipped cron trigger '{}' due to missing capabilities: {}",
                         entry.workflow_name,
                         missing.join(", ")
+                    );
+                }
+                Ok(TriggerLaunchOutcome::SkippedConcurrency {
+                    running,
+                    max_concurrency,
+                }) => {
+                    eprintln!(
+                        "anna-rs scheduler: skipped cron trigger '{}' due to concurrency limit running={} max={}",
+                        entry.workflow_name, running, max_concurrency
                     );
                 }
                 Err(err) => {
@@ -1033,6 +1093,15 @@ async fn run_watch_triggers(
                         "anna-rs scheduler: skipped watch trigger '{}' due to missing capabilities: {}",
                         entry.workflow_name,
                         missing.join(", ")
+                    );
+                }
+                Ok(TriggerLaunchOutcome::SkippedConcurrency {
+                    running,
+                    max_concurrency,
+                }) => {
+                    eprintln!(
+                        "anna-rs scheduler: skipped watch trigger '{}' due to concurrency limit running={} max={}",
+                        entry.workflow_name, running, max_concurrency
                     );
                 }
                 Err(err) => {
@@ -1110,6 +1179,14 @@ fn missing_required_capabilities(
     missing.sort();
     missing.dedup();
     missing
+}
+
+fn normalize_max_concurrency(raw: Option<u32>) -> Option<usize> {
+    raw.map(|v| v as usize).filter(|v| *v >= 1)
+}
+
+fn trigger_max_concurrency(entry: &WorkflowEntry) -> usize {
+    normalize_max_concurrency(entry.max_concurrency).unwrap_or(1)
 }
 
 fn collect_watch_snapshot(pattern: &str) -> Result<HashMap<String, u64>> {
@@ -1546,6 +1623,7 @@ struct WorkflowEntry {
     required_capabilities: Vec<String>,
     owner: Option<String>,
     version: Option<String>,
+    max_concurrency: Option<u32>,
     trigger_webhook: Option<String>,
     trigger_watch: Option<String>,
     trigger_cron: Option<String>,
@@ -1557,6 +1635,10 @@ enum TriggerLaunchOutcome {
     Launched(String),
     SkippedRunning,
     SkippedCapability(Vec<String>),
+    SkippedConcurrency {
+        running: usize,
+        max_concurrency: usize,
+    },
 }
 
 async fn load_flow_registry(path: &FsPath) -> Result<Vec<FlowRegistryEntry>> {
@@ -1594,6 +1676,13 @@ async fn load_flow_registry(path: &FsPath) -> Result<Vec<FlowRegistryEntry>> {
         if !flow_ids.insert(item.flow_id.clone()) {
             bail!(
                 "flow registry '{}' has duplicate flow_id '{}'",
+                path.display(),
+                item.flow_id
+            );
+        }
+        if item.max_concurrency == Some(0) {
+            bail!(
+                "flow registry '{}' has entry '{}' with invalid max_concurrency=0",
                 path.display(),
                 item.flow_id
             );
@@ -1644,6 +1733,7 @@ async fn find_workflow_entries_with_registry(
                 required_capabilities: spec.required_capabilities,
                 owner: spec.owner,
                 version: spec.version,
+                max_concurrency: spec.max_concurrency,
                 trigger_webhook: wf.trigger.webhook,
                 trigger_watch: wf.trigger.watch,
                 trigger_cron: wf.trigger.cron,
@@ -1690,6 +1780,7 @@ async fn find_workflow_entries_with_registry(
             required_capabilities: vec![],
             owner: None,
             version: None,
+            max_concurrency: None,
             trigger_webhook: wf.trigger.webhook,
             trigger_watch: wf.trigger.watch,
             trigger_cron: wf.trigger.cron,
@@ -1745,12 +1836,24 @@ async fn launch_workflow_from_entry(
         ));
     }
 
-    if is_workflow_running(state, &entry.workflow_name).await {
+    let running = running_workflow_count(state, &entry.workflow_name).await;
+    let max_concurrency = trigger_max_concurrency(entry);
+    if running >= max_concurrency {
+        if max_concurrency == 1 {
+            println!(
+                "anna-rs daemon trigger={} workflow='{}' skipped: already running",
+                trigger_source, entry.workflow_name
+            );
+            return Ok(TriggerLaunchOutcome::SkippedRunning);
+        }
         println!(
-            "anna-rs daemon trigger={} workflow='{}' skipped: already running",
-            trigger_source, entry.workflow_name
+            "anna-rs daemon trigger={} workflow='{}' skipped: concurrency limit running={} max={}",
+            trigger_source, entry.workflow_name, running, max_concurrency
         );
-        return Ok(TriggerLaunchOutcome::SkippedRunning);
+        return Ok(TriggerLaunchOutcome::SkippedConcurrency {
+            running,
+            max_concurrency,
+        });
     }
 
     let mut wf = Workflow::load(&entry.path)?;
@@ -1765,13 +1868,14 @@ async fn launch_workflow_from_entry(
     Ok(TriggerLaunchOutcome::Launched(req_id))
 }
 
-async fn is_workflow_running(state: &AppState, workflow_name: &str) -> bool {
+async fn running_workflow_count(state: &AppState, workflow_name: &str) -> usize {
     state
         .sessions
         .read()
         .await
         .values()
-        .any(|s| s.workflow == workflow_name && s.status == "running")
+        .filter(|s| s.workflow == workflow_name && s.status == "running")
+        .count()
 }
 
 fn parse_run_registered_options(body: &str) -> Result<RunRegisteredOptions> {
@@ -1920,7 +2024,7 @@ mod tests {
         let valid = dir.join("registry.yml");
         tokio::fs::write(
             &valid,
-            "flows:\n  - flow_id: alpha\n    path: a.anna\n  - flow_id: beta\n    path: b.anna\n",
+            "flows:\n  - flow_id: alpha\n    path: a.anna\n    max_concurrency: 2\n  - flow_id: beta\n    path: b.anna\n",
         )
         .await
         .expect("write valid registry");
@@ -1929,6 +2033,7 @@ mod tests {
             .expect("parse valid registry");
         assert_eq!(parsed.len(), 2);
         assert_eq!(parsed[0].flow_id, "alpha");
+        assert_eq!(parsed[0].max_concurrency, Some(2));
 
         let duplicate = dir.join("registry-dup.yml");
         tokio::fs::write(
@@ -1941,6 +2046,18 @@ mod tests {
             .await
             .expect_err("duplicate flow_id should fail");
         assert!(err.to_string().contains("duplicate flow_id"));
+
+        let invalid_concurrency = dir.join("registry-invalid.yml");
+        tokio::fs::write(
+            &invalid_concurrency,
+            "flows:\n  - flow_id: bad\n    path: a.anna\n    max_concurrency: 0\n",
+        )
+        .await
+        .expect("write invalid registry");
+        let err = load_flow_registry(&invalid_concurrency)
+            .await
+            .expect_err("max_concurrency=0 should fail");
+        assert!(err.to_string().contains("max_concurrency=0"));
     }
 
     #[tokio::test]
@@ -2002,6 +2119,7 @@ mod tests {
             required_capabilities: vec!["K8S".to_string(), "vault".to_string()],
             owner: None,
             version: None,
+            max_concurrency: Some(2),
             trigger_webhook: None,
             trigger_watch: None,
             trigger_cron: None,
@@ -2057,6 +2175,7 @@ mod tests {
             required_capabilities: vec!["k8s".to_string(), "vault".to_string()],
             owner: Some("platform".to_string()),
             version: Some("v1".to_string()),
+            max_concurrency: Some(2),
             available: false,
             missing_capabilities: vec!["vault".to_string()],
             trigger_webhook: Some("/deploy".to_string()),
