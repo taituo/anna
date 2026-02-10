@@ -5,9 +5,11 @@ use crate::result::RunResult;
 use crate::session::{add_child_session, init_session_meta, session_dir, write_stage_log};
 use crate::workflow::{Stage, Workflow};
 use anyhow::{Result, anyhow};
+use async_trait::async_trait;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::Arc;
 use tokio::process::Command;
 use tokio::task::JoinSet;
 use tokio::time::sleep;
@@ -18,10 +20,25 @@ pub struct RunConfig {
     pub session_id_override: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+pub struct HitlRequest {
+    pub session_id: String,
+    pub workflow: String,
+    pub stage_id: String,
+    pub prompt: Option<String>,
+    pub options: Vec<String>,
+}
+
+#[async_trait]
+pub trait HitlHandler: Send + Sync {
+    async fn await_decision(&self, request: HitlRequest) -> Result<String>;
+}
+
 #[derive(Clone, Default)]
 pub struct Executor {
     providers: ProviderRegistry,
     memory: MemoryStore,
+    hitl: Option<Arc<dyn HitlHandler>>,
 }
 
 impl Executor {
@@ -29,6 +46,7 @@ impl Executor {
         Self {
             providers: default_registry(),
             memory: MemoryStore::default(),
+            hitl: None,
         }
     }
 
@@ -36,7 +54,13 @@ impl Executor {
         Self {
             providers: default_registry(),
             memory,
+            hitl: None,
         }
+    }
+
+    pub fn with_hitl_handler(mut self, hitl: Arc<dyn HitlHandler>) -> Self {
+        self.hitl = Some(hitl);
+        self
     }
 
     pub async fn run(&self, workflow: &Workflow, config: RunConfig) -> Result<RunResult> {
@@ -176,9 +200,20 @@ impl Executor {
                     let _ = self.run_hook(workflow, &runtime_stage, after, result).await;
                 }
                 if runtime_stage.hitl {
+                    let decision = self
+                        .resolve_hitl_decision(workflow, &runtime_stage, result)
+                        .await?;
                     result
                         .outputs
-                        .insert(format!("{}.hitl", runtime_stage.id), "skipped".into());
+                        .insert(format!("{}.hitl", runtime_stage.id), decision.clone());
+                    if is_hitl_rejection(&decision) {
+                        result.success.insert(runtime_stage.id.clone(), false);
+                        return Err(anyhow!(
+                            "HITL rejected stage '{}' with decision '{}'",
+                            runtime_stage.id,
+                            decision
+                        ));
+                    }
                 }
 
                 let broken = match &runtime_stage.break_when {
@@ -330,6 +365,41 @@ impl Executor {
             )),
             (Ok(out), None) => Ok(out),
         }
+    }
+
+    async fn resolve_hitl_decision(
+        &self,
+        workflow: &Workflow,
+        stage: &Stage,
+        result: &RunResult,
+    ) -> Result<String> {
+        let decision = if let Some(hitl) = &self.hitl {
+            hitl.await_decision(HitlRequest {
+                session_id: result.session_id.clone(),
+                workflow: workflow.name.clone(),
+                stage_id: stage.id.clone(),
+                prompt: stage.hitl_prompt.clone(),
+                options: stage.hitl_options.clone(),
+            })
+            .await?
+        } else {
+            "skipped".to_string()
+        };
+
+        let normalized = decision.trim().to_string();
+        if !stage.hitl_options.is_empty()
+            && !stage
+                .hitl_options
+                .iter()
+                .any(|option| option.eq_ignore_ascii_case(&normalized))
+        {
+            return Err(anyhow!(
+                "HITL decision '{}' is not in allowed options for stage '{}'",
+                normalized,
+                stage.id
+            ));
+        }
+        Ok(normalized)
     }
 
     async fn execute_stage(
@@ -925,6 +995,13 @@ fn sanitize_token(input: &str) -> String {
     }
 }
 
+fn is_hitl_rejection(decision: &str) -> bool {
+    matches!(
+        decision.trim().to_ascii_lowercase().as_str(),
+        "reject" | "rejected" | "deny" | "denied" | "stop" | "abort" | "no" | "false"
+    )
+}
+
 fn deps_ok(stage: &Stage, result: &RunResult) -> bool {
     stage
         .needs
@@ -970,11 +1047,24 @@ fn resolve_subworkflow_path(workflow: &Workflow, stage: &Stage, target: &str) ->
 
 #[cfg(test)]
 mod tests {
-    use super::{Executor, RunConfig, sanitize_token};
+    use super::{Executor, HitlHandler, HitlRequest, RunConfig, sanitize_token};
     use crate::memory::MemoryStore;
     use crate::session::session_dir;
     use crate::workflow::{Stage, Workflow};
+    use async_trait::async_trait;
+    use std::sync::Arc;
     use std::time::{Duration, Instant};
+
+    struct FixedHitl {
+        decision: String,
+    }
+
+    #[async_trait]
+    impl HitlHandler for FixedHitl {
+        async fn await_decision(&self, _request: HitlRequest) -> anyhow::Result<String> {
+            Ok(self.decision.clone())
+        }
+    }
 
     #[tokio::test]
     async fn forks_populate_indexed_outputs() {
@@ -1278,6 +1368,87 @@ mod tests {
 
         assert_eq!(res.success.get("use_mem"), Some(&true));
         assert_eq!(res.outputs.get("use_mem"), Some(&"prev:first".to_string()));
+    }
+
+    #[tokio::test]
+    async fn hitl_decision_is_recorded() {
+        let wf = Workflow {
+            name: "hitl-ok".into(),
+            mode: "once".into(),
+            memory: false,
+            tags: vec![],
+            vars: Default::default(),
+            env: Default::default(),
+            workdir: None,
+            trigger: Default::default(),
+            stages: vec![Stage {
+                id: "approve_me".into(),
+                provider: "shell".into(),
+                exec: Some("echo done".into()),
+                hitl: true,
+                hitl_options: vec!["approve".into(), "reject".into()],
+                ..Default::default()
+            }],
+            source_path: None,
+        };
+
+        let exec = Executor::new().with_hitl_handler(Arc::new(FixedHitl {
+            decision: "approve".to_string(),
+        }));
+        let res = exec
+            .run(
+                &wf,
+                RunConfig {
+                    max_iterations: Some(1),
+                    session_id_override: None,
+                },
+            )
+            .await
+            .expect("workflow should run");
+
+        assert_eq!(res.success.get("approve_me"), Some(&true));
+        assert_eq!(
+            res.outputs.get("approve_me.hitl"),
+            Some(&"approve".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn hitl_reject_fails_workflow() {
+        let wf = Workflow {
+            name: "hitl-reject".into(),
+            mode: "once".into(),
+            memory: false,
+            tags: vec![],
+            vars: Default::default(),
+            env: Default::default(),
+            workdir: None,
+            trigger: Default::default(),
+            stages: vec![Stage {
+                id: "must_approve".into(),
+                provider: "shell".into(),
+                exec: Some("echo done".into()),
+                hitl: true,
+                hitl_options: vec!["approve".into(), "reject".into()],
+                ..Default::default()
+            }],
+            source_path: None,
+        };
+
+        let exec = Executor::new().with_hitl_handler(Arc::new(FixedHitl {
+            decision: "reject".to_string(),
+        }));
+        let err = exec
+            .run(
+                &wf,
+                RunConfig {
+                    max_iterations: Some(1),
+                    session_id_override: None,
+                },
+            )
+            .await
+            .expect_err("workflow should fail on hitl rejection");
+        assert!(err.to_string().contains("HITL rejected"));
     }
 
     #[tokio::test]

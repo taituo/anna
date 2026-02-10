@@ -49,7 +49,7 @@ This repository now includes a Rust runtime foundation in `src/`:
 - provider registry with `shell`, `cli`, `http`, `llm`, `k8s` (LLM and k8s via CLI adapters)
 - executor with `needs`, `when`, retry, timeout, hooks, `stage.loop`/`break_when`/`max_iterations`, session logs, and `stage.worktree` git isolation
 - session metadata files (`/tmp/anna/<session>/_meta.json`) with parent/child linkage
-- daemon API + trigger scheduler (`health`, workflow submit/status/stop/logs, `/hook/*`, `/ws`, plus `trigger.interval|cron|watch`)
+- daemon API + trigger scheduler (`health`, workflow submit/status/stop/logs, `/hook/*`, `/hitl/*`, `/ws`, plus `trigger.interval|cron|watch`)
 
 Run locally:
 
@@ -70,7 +70,7 @@ Current MVP intentionally leaves some advanced features for next steps (multi-no
 ## Access Channels
 
 - CLI (`anna run`, `anna submit`, `anna status`)
-- HTTP control API (`/workflow`, `/hook/*`, `/ws`)
+- HTTP control API (`/workflow`, `/hook/*`, `/hitl`, `/hitl/{id}/resolve`, `/ws`)
 - MCP tools (`list_flows`, `run_flow`, `session_status`, `tail_logs`, `stop_flow`)
 - Chat gateway (maps chat intents to approved flow runs)
 

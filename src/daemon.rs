@@ -1,7 +1,8 @@
-use crate::executor::{Executor, RunConfig};
+use crate::executor::{Executor, HitlHandler, HitlRequest, RunConfig};
 use crate::session::session_dir;
 use crate::workflow::Workflow;
 use anyhow::Result;
+use async_trait::async_trait;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
@@ -16,7 +17,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path as FsPath, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
-use std::time::{Instant, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
 use tokio::time::{Duration, sleep};
@@ -27,6 +28,7 @@ struct AppState {
     plays_dir: PathBuf,
     sessions: Arc<RwLock<HashMap<String, SessionInfo>>>,
     handles: Arc<RwLock<HashMap<String, JoinHandle<()>>>>,
+    hitl: Arc<RwLock<HashMap<String, HitlPending>>>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -81,6 +83,27 @@ struct WsLogFrame {
     errors: Vec<String>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+struct HitlPending {
+    id: String,
+    session_id: String,
+    workflow: String,
+    stage_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    prompt: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    options: Vec<String>,
+    status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    decision: Option<String>,
+    created_at: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct HitlResolveBody {
+    decision: String,
+}
+
 #[derive(Debug, Default)]
 struct TriggerScheduler {
     interval_next: HashMap<String, Instant>,
@@ -88,12 +111,54 @@ struct TriggerScheduler {
     watch_snapshots: HashMap<String, HashMap<String, u64>>,
 }
 
+#[derive(Clone)]
+struct DaemonHitl {
+    pending: Arc<RwLock<HashMap<String, HitlPending>>>,
+}
+
+#[async_trait]
+impl HitlHandler for DaemonHitl {
+    async fn await_decision(&self, request: HitlRequest) -> Result<String> {
+        let request_id = crate::session::gen_session_id();
+        self.pending.write().await.insert(
+            request_id.clone(),
+            HitlPending {
+                id: request_id.clone(),
+                session_id: request.session_id,
+                workflow: request.workflow,
+                stage_id: request.stage_id,
+                prompt: request.prompt,
+                options: request.options,
+                status: "pending".to_string(),
+                decision: None,
+                created_at: now_unix_secs(),
+            },
+        );
+
+        loop {
+            let state = self.pending.read().await.get(&request_id).cloned();
+            let Some(current) = state else {
+                return Ok("reject".to_string());
+            };
+            if let Some(decision) = current.decision {
+                return Ok(decision);
+            }
+            sleep(Duration::from_millis(300)).await;
+        }
+    }
+}
+
 pub async fn run_daemon(bind: &str, plays_dir: PathBuf) -> Result<()> {
+    let hitl = Arc::new(RwLock::new(HashMap::<String, HitlPending>::new()));
+    let executor = Executor::new().with_hitl_handler(Arc::new(DaemonHitl {
+        pending: hitl.clone(),
+    }));
     let state = AppState {
-        executor: Executor::new(),
+        executor,
         plays_dir,
         sessions: Arc::new(RwLock::new(HashMap::new())),
         handles: Arc::new(RwLock::new(HashMap::new())),
+        hitl,
     };
     tokio::spawn(trigger_scheduler_loop(state.clone()));
 
@@ -105,6 +170,8 @@ pub async fn run_daemon(bind: &str, plays_dir: PathBuf) -> Result<()> {
         .route("/workflow/{id}", get(workflow_status).delete(stop_workflow))
         .route("/workflow/{id}/logs", get(workflow_logs))
         .route("/hook/{name}", post(trigger_hook))
+        .route("/hitl", get(list_hitl))
+        .route("/hitl/{id}/resolve", post(resolve_hitl))
         .route("/ws", get(ws_logs))
         .with_state(state);
 
@@ -314,6 +381,37 @@ async fn workflow_logs(State(state): State<AppState>, Path(id): Path<String>) ->
         )
             .into_response(),
     }
+}
+
+async fn list_hitl(State(state): State<AppState>) -> impl IntoResponse {
+    let mut out = state
+        .hitl
+        .read()
+        .await
+        .values()
+        .cloned()
+        .collect::<Vec<_>>();
+    out.sort_by_key(|v| v.created_at);
+    Json(out).into_response()
+}
+
+async fn resolve_hitl(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(body): Json<HitlResolveBody>,
+) -> impl IntoResponse {
+    let decision = body.decision.trim().to_string();
+    if decision.is_empty() {
+        return (StatusCode::BAD_REQUEST, "decision is required").into_response();
+    }
+
+    let mut pending = state.hitl.write().await;
+    let Some(item) = pending.get_mut(&id) else {
+        return (StatusCode::NOT_FOUND, "hitl request not found").into_response();
+    };
+    item.decision = Some(decision);
+    item.status = "resolved".to_string();
+    (StatusCode::OK, Json(item.clone())).into_response()
 }
 
 async fn ws_logs(
@@ -576,6 +674,13 @@ fn trigger_key(entry: &WorkflowEntry, trigger_kind: &str, trigger_value: &str) -
     )
 }
 
+fn now_unix_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|v| v.as_secs())
+        .unwrap_or(0)
+}
+
 async fn find_workflows(root: &FsPath) -> Result<Vec<String>> {
     let mut out = find_workflow_entries(root)
         .await?
@@ -816,9 +921,14 @@ async fn launch_workflow(state: &AppState, workflow: Workflow) -> Result<String>
 #[cfg(test)]
 mod tests {
     use super::{
-        collect_watch_snapshot, find_workflow_entries, resolve_registered_workflow_path,
-        resolve_watch_pattern,
+        DaemonHitl, HitlPending, collect_watch_snapshot, find_workflow_entries,
+        resolve_registered_workflow_path, resolve_watch_pattern,
     };
+    use crate::executor::{HitlHandler, HitlRequest};
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio::sync::RwLock;
 
     #[tokio::test]
     async fn resolves_workflow_by_file_and_name() {
@@ -926,5 +1036,44 @@ mod tests {
         std::fs::write(&file, "bbb").expect("write updated content");
         let after = collect_watch_snapshot(&pattern).expect("collect after snapshot");
         assert_ne!(before, after);
+    }
+
+    #[tokio::test]
+    async fn daemon_hitl_handler_waits_for_resolution() {
+        let pending = Arc::new(RwLock::new(HashMap::<String, HitlPending>::new()));
+        let handler = DaemonHitl {
+            pending: pending.clone(),
+        };
+
+        let waiter = tokio::spawn(async move {
+            handler
+                .await_decision(HitlRequest {
+                    session_id: "sess-x".to_string(),
+                    workflow: "wf".to_string(),
+                    stage_id: "stage".to_string(),
+                    prompt: Some("approve?".to_string()),
+                    options: vec!["approve".to_string(), "reject".to_string()],
+                })
+                .await
+                .expect("hitl should resolve")
+        });
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let request_id = {
+            let read = pending.read().await;
+            read.keys()
+                .next()
+                .cloned()
+                .expect("pending hitl request should exist")
+        };
+        {
+            let mut write = pending.write().await;
+            let item = write.get_mut(&request_id).expect("pending request by id");
+            item.decision = Some("approve".to_string());
+            item.status = "resolved".to_string();
+        }
+
+        let decision = waiter.await.expect("join waiter");
+        assert_eq!(decision, "approve");
     }
 }
