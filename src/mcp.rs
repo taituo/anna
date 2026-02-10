@@ -236,6 +236,11 @@ fn tool_specs() -> Vec<Value> {
             "inputSchema": { "type": "object", "additionalProperties": false }
         }),
         json!({
+            "name": "daemon_llm_adapters",
+            "description": "Fetch daemon LLM adapter catalog from /llm/adapters",
+            "inputSchema": { "type": "object", "additionalProperties": false }
+        }),
+        json!({
             "name": "trigger_hook",
             "description": "Trigger daemon webhook hook by name",
             "inputSchema": {
@@ -487,6 +492,14 @@ async fn handle_tools_call(client: &Client, config: &McpConfig, params: &Value) 
             };
             Ok(serde_json::to_string_pretty(&payload)?)
         }
+        "daemon_llm_adapters" => {
+            let body = send(authed(
+                client.get(format!("{}/llm/adapters", daemon)),
+                &config.daemon_token,
+            ))
+            .await?;
+            Ok(body)
+        }
         "trigger_hook" => {
             let name = arg_required_string(&args, "name")?;
             let body = send(authed(
@@ -692,6 +705,7 @@ mod tests {
         assert!(names.contains(&"stats"));
         assert!(names.contains(&"policy"));
         assert!(names.contains(&"list_llm_adapters"));
+        assert!(names.contains(&"daemon_llm_adapters"));
     }
 
     #[test]

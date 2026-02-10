@@ -1,4 +1,5 @@
 use crate::executor::{Executor, HitlHandler, HitlRequest, RunConfig};
+use crate::providers::llm::{active_llm_adapter_name, load_llm_adapter_catalog_from_env};
 use crate::session::session_dir;
 use crate::workflow::Workflow;
 use anyhow::{Context, Result, bail};
@@ -14,6 +15,7 @@ use chrono::{DateTime, Utc};
 use cron::Schedule;
 use humantime::parse_duration;
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path as FsPath, PathBuf};
 use std::str::FromStr;
@@ -413,6 +415,7 @@ pub async fn run_daemon(bind: &str, plays_dir: PathBuf) -> Result<()> {
     let app = Router::new()
         .route("/health", get(health))
         .route("/policy", get(policy))
+        .route("/llm/adapters", get(llm_adapters))
         .route("/stats", get(stats))
         .route("/sessions", get(list_sessions))
         .route("/workflows", get(list_workflows))
@@ -474,6 +477,37 @@ async fn policy(State(state): State<AppState>, headers: HeaderMap) -> impl IntoR
         retention_max_hitl: state.retention.max_hitl,
     })
     .into_response()
+}
+
+async fn llm_adapters(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
+    if let Some(resp) = ensure_authorized(&state, &headers) {
+        return resp;
+    }
+
+    match load_llm_adapter_catalog_from_env() {
+        Ok(Some(loaded)) => Json(json!({
+            "configured": true,
+            "source": loaded.path,
+            "selected": active_llm_adapter_name(Some(&loaded.catalog)),
+            "default": loaded.catalog.default,
+            "adapters": loaded.catalog.adapters,
+        }))
+        .into_response(),
+        Ok(None) => Json(json!({
+            "configured": false,
+            "source": null,
+            "selected": null,
+            "default": null,
+            "adapters": {},
+            "note": "set ANNA_LLM_ADAPTERS_FILE to enable adapter catalog"
+        }))
+        .into_response(),
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("failed reading llm adapter catalog: {}", err),
+        )
+            .into_response(),
+    }
 }
 
 async fn stats(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {

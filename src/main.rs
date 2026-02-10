@@ -155,11 +155,14 @@ enum Commands {
         #[arg(long, default_value = "http://127.0.0.1:8080")]
         daemon: String,
     },
-    /// Show local LLM adapter catalog resolved from environment
+    /// Show local or daemon LLM adapter catalog
     LlmAdapters {
         /// Print JSON instead of compact text table
         #[arg(long, default_value_t = false)]
         json: bool,
+        /// Query daemon adapter catalog instead of local environment
+        #[arg(long)]
+        daemon: Option<String>,
     },
     /// Wait until workflow reaches terminal state
     Wait {
@@ -490,7 +493,18 @@ async fn main() -> Result<()> {
                 .with_context(|| format!("failed querying policy at {}", daemon))?;
             print_response(response).await
         }
-        Commands::LlmAdapters { json } => {
+        Commands::LlmAdapters { json, daemon } => {
+            if let Some(daemon) = daemon {
+                let daemon = normalize_daemon_url(&daemon);
+                let client = Client::new();
+                let response = with_daemon_auth(client.get(format!("{}/llm/adapters", daemon)))
+                    .send()
+                    .await
+                    .with_context(|| {
+                        format!("failed querying daemon llm adapters at {}", daemon)
+                    })?;
+                return print_response(response).await;
+            }
             let loaded = load_llm_adapter_catalog_from_env()?;
             match loaded {
                 Some(loaded) => {

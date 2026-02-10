@@ -94,6 +94,7 @@ Adapter catalog support in runtime:
 - `llm_adapter` in stage (or `ANNA_LLM_ADAPTER`) selects adapter entry.
 - `anna llm-adapters --json` prints resolved local catalog state.
 - `llm.adapters.example.yml` is a starter template in this repository.
+- daemon endpoint `GET /llm/adapters` exposes active daemon adapter catalog state.
 
 Example catalog:
 

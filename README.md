@@ -56,6 +56,7 @@ anna stats
 anna policy
 anna llm-adapters
 anna llm-adapters --json
+anna llm-adapters --daemon http://127.0.0.1:8080
 anna wait <request_id> --timeout-sec 300
 anna hitl list
 anna hitl list --status pending --workflow my-flow
@@ -186,8 +187,8 @@ Current MVP intentionally leaves some advanced features for next steps (multi-no
 ## Access Channels
 
 - CLI (`anna run`, `anna submit`, `anna can-run`, `anna status`)
-- HTTP control API (`/policy`, `/workflow`, `/workflow/{name}/check`, `/workflow/{name}/run`, `/workflows`, `/workflows/meta`, `/hook/*`, `/hitl`, `/hitl/{id}/resolve`, `/ws`)
-- MCP stdio server (`anna mcp`) with tools: `list_flows`, `list_flows_meta`, `run_flow`, `can_run_flow`, `session_status`, `tail_logs`, `stop_flow`, `list_sessions`, `stats`, `policy`, `list_llm_adapters`, `trigger_hook`, `list_hitl`, `resolve_hitl`
+- HTTP control API (`/policy`, `/llm/adapters`, `/workflow`, `/workflow/{name}/check`, `/workflow/{name}/run`, `/workflows`, `/workflows/meta`, `/hook/*`, `/hitl`, `/hitl/{id}/resolve`, `/ws`)
+- MCP stdio server (`anna mcp`) with tools: `list_flows`, `list_flows_meta`, `run_flow`, `can_run_flow`, `session_status`, `tail_logs`, `stop_flow`, `list_sessions`, `stats`, `policy`, `list_llm_adapters`, `daemon_llm_adapters`, `trigger_hook`, `list_hitl`, `resolve_hitl`
 - Chat gateway (maps chat intents to approved flow runs)
 
 Minimal MCP smoke test:
