@@ -131,6 +131,11 @@ fn tool_specs() -> Vec<Value> {
             "inputSchema": { "type": "object", "additionalProperties": false }
         }),
         json!({
+            "name": "list_flows_meta",
+            "description": "List registered workflows with metadata and capability availability",
+            "inputSchema": { "type": "object", "additionalProperties": false }
+        }),
+        json!({
             "name": "run_flow",
             "description": "Run workflow by registered name, or submit raw YAML",
             "inputSchema": {
@@ -244,6 +249,14 @@ async fn handle_tools_call(client: &Client, config: &McpConfig, params: &Value) 
         "list_flows" => {
             let body = send(authed(
                 client.get(format!("{}/workflows", daemon)),
+                &config.daemon_token,
+            ))
+            .await?;
+            Ok(body)
+        }
+        "list_flows_meta" => {
+            let body = send(authed(
+                client.get(format!("{}/workflows/meta", daemon)),
                 &config.daemon_token,
             ))
             .await?;
@@ -449,6 +462,7 @@ mod tests {
             .filter_map(|v| v.get("name").and_then(|n| n.as_str()))
             .collect::<Vec<_>>();
         assert!(names.contains(&"list_flows"));
+        assert!(names.contains(&"list_flows_meta"));
         assert!(names.contains(&"run_flow"));
         assert!(names.contains(&"session_status"));
         assert!(names.contains(&"tail_logs"));

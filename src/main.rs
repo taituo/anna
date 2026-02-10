@@ -70,6 +70,12 @@ enum Commands {
         #[arg(long, default_value = "http://127.0.0.1:8080")]
         daemon: String,
     },
+    /// List registered workflows with metadata and capability availability
+    WorkflowsMeta {
+        /// Daemon base URL
+        #[arg(long, default_value = "http://127.0.0.1:8080")]
+        daemon: String,
+    },
     /// Run registered workflow by name/file stem on daemon
     RunNamed {
         /// Workflow name, file name, or file stem
@@ -266,6 +272,15 @@ async fn main() -> Result<()> {
                 .send()
                 .await
                 .with_context(|| format!("failed querying workflows at {}", daemon))?;
+            print_response(response).await
+        }
+        Commands::WorkflowsMeta { daemon } => {
+            let daemon = normalize_daemon_url(&daemon);
+            let client = Client::new();
+            let response = with_daemon_auth(client.get(format!("{}/workflows/meta", daemon)))
+                .send()
+                .await
+                .with_context(|| format!("failed querying workflow metadata at {}", daemon))?;
             print_response(response).await
         }
         Commands::RunNamed { name, daemon } => {

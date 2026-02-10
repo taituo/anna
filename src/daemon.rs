@@ -93,6 +93,33 @@ struct HookSkippedCapability {
     missing_capabilities: Vec<String>,
 }
 
+#[derive(Debug, Serialize)]
+struct WorkflowMetaResponse {
+    id: String,
+    workflow: String,
+    file: String,
+    path: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    tags: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    required_capabilities: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    owner: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    version: Option<String>,
+    available: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    missing_capabilities: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    trigger_webhook: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    trigger_watch: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    trigger_cron: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    trigger_interval: Option<String>,
+}
+
 #[derive(Debug, Deserialize)]
 struct WsQuery {
     id: String,
@@ -279,6 +306,7 @@ pub async fn run_daemon(bind: &str, plays_dir: PathBuf) -> Result<()> {
         .route("/stats", get(stats))
         .route("/sessions", get(list_sessions))
         .route("/workflows", get(list_workflows))
+        .route("/workflows/meta", get(list_workflows_meta))
         .route("/workflow", post(start_workflow))
         .route("/workflow/{name}/run", post(run_registered_workflow))
         .route("/workflow/{id}", get(workflow_status).delete(stop_workflow))
@@ -343,6 +371,52 @@ async fn list_workflows(State(state): State<AppState>, headers: HeaderMap) -> im
         )
             .into_response(),
     }
+}
+
+async fn list_workflows_meta(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Some(resp) = ensure_authorized(&state, &headers) {
+        return resp;
+    }
+    let entries =
+        match find_workflow_entries_with_registry(&state.plays_dir, state.registry_file.as_deref())
+            .await
+        {
+            Ok(v) => v,
+            Err(err) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("failed listing workflows: {}", err),
+                )
+                    .into_response();
+            }
+        };
+    let mut out = entries
+        .into_iter()
+        .map(|entry| {
+            let missing = missing_required_capabilities(&entry, &state.node_capabilities);
+            WorkflowMetaResponse {
+                id: workflow_public_id(&entry),
+                workflow: entry.workflow_name,
+                file: entry.file_name,
+                path: entry.path.display().to_string(),
+                tags: entry.tags,
+                required_capabilities: entry.required_capabilities,
+                owner: entry.owner,
+                version: entry.version,
+                available: missing.is_empty(),
+                missing_capabilities: missing,
+                trigger_webhook: entry.trigger_webhook,
+                trigger_watch: entry.trigger_watch,
+                trigger_cron: entry.trigger_cron,
+                trigger_interval: entry.trigger_interval,
+            }
+        })
+        .collect::<Vec<_>>();
+    out.sort_by(|a, b| a.id.cmp(&b.id));
+    Json(out).into_response()
 }
 
 async fn list_sessions(
@@ -1265,6 +1339,15 @@ fn status_matches(status: &str, filter: &str) -> bool {
     status.eq_ignore_ascii_case(filter.trim())
 }
 
+fn workflow_public_id(entry: &WorkflowEntry) -> String {
+    entry
+        .flow_id
+        .as_ref()
+        .filter(|v| !v.trim().is_empty())
+        .cloned()
+        .unwrap_or_else(|| entry.file_name.clone())
+}
+
 async fn find_workflows_with_registry(
     root: &FsPath,
     registry_file: Option<&FsPath>,
@@ -1272,7 +1355,7 @@ async fn find_workflows_with_registry(
     let mut out = find_workflow_entries_with_registry(root, registry_file)
         .await?
         .into_iter()
-        .map(|v| v.flow_id.unwrap_or(v.file_name))
+        .map(|v| workflow_public_id(&v))
         .collect::<Vec<_>>();
     out.sort();
     out.dedup();
@@ -1366,7 +1449,10 @@ struct WorkflowEntry {
     flow_id: Option<String>,
     workflow_name: String,
     path: PathBuf,
+    tags: Vec<String>,
     required_capabilities: Vec<String>,
+    owner: Option<String>,
+    version: Option<String>,
     trigger_webhook: Option<String>,
     trigger_watch: Option<String>,
     trigger_cron: Option<String>,
@@ -1456,13 +1542,15 @@ async fn find_workflow_entries_with_registry(
                 .ok_or_else(|| {
                     anyhow::anyhow!("invalid workflow filename in '{}'", path.display())
                 })?;
-            let _ = (&spec.tags, &spec.owner, &spec.version);
             out.push(WorkflowEntry {
                 file_name,
                 flow_id: Some(spec.flow_id),
                 workflow_name: wf.name,
                 path,
+                tags: spec.tags,
                 required_capabilities: spec.required_capabilities,
+                owner: spec.owner,
+                version: spec.version,
                 trigger_webhook: wf.trigger.webhook,
                 trigger_watch: wf.trigger.watch,
                 trigger_cron: wf.trigger.cron,
@@ -1505,7 +1593,10 @@ async fn find_workflow_entries_with_registry(
             flow_id: None,
             workflow_name: wf.name,
             path,
+            tags: vec![],
             required_capabilities: vec![],
+            owner: None,
+            version: None,
             trigger_webhook: wf.trigger.webhook,
             trigger_watch: wf.trigger.watch,
             trigger_cron: wf.trigger.cron,
@@ -1800,7 +1891,10 @@ mod tests {
             flow_id: Some("x".to_string()),
             workflow_name: "x".to_string(),
             path: std::path::PathBuf::from("/tmp/x.anna"),
+            tags: vec![],
             required_capabilities: vec!["K8S".to_string(), "vault".to_string()],
+            owner: None,
+            version: None,
             trigger_webhook: None,
             trigger_watch: None,
             trigger_cron: None,

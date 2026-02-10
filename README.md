@@ -41,6 +41,7 @@ anna daemon
 anna mcp
 anna submit workflow.anna
 anna workflows
+anna workflows-meta
 anna hook deploy
 anna status <request_id>
 anna sessions --status running
@@ -102,6 +103,7 @@ flows:
 
 When registry is enabled:
 - `anna workflows` lists `flow_id` values
+- `anna workflows-meta` shows owner/version/tags/capability availability
 - `anna run-named <name>` accepts `flow_id`, workflow name, or file name
 - hook/cron/watch/interval trigger scans are limited to registry entries
 - flows with missing `required_capabilities` are skipped/blocked with explicit reason
@@ -136,8 +138,8 @@ Current MVP intentionally leaves some advanced features for next steps (multi-no
 ## Access Channels
 
 - CLI (`anna run`, `anna submit`, `anna status`)
-- HTTP control API (`/workflow`, `/hook/*`, `/hitl`, `/hitl/{id}/resolve`, `/ws`)
-- MCP stdio server (`anna mcp`) with tools: `list_flows`, `run_flow`, `session_status`, `tail_logs`, `stop_flow`, `list_sessions`, `stats`, `trigger_hook`, `list_hitl`, `resolve_hitl`
+- HTTP control API (`/workflow`, `/workflows`, `/workflows/meta`, `/hook/*`, `/hitl`, `/hitl/{id}/resolve`, `/ws`)
+- MCP stdio server (`anna mcp`) with tools: `list_flows`, `list_flows_meta`, `run_flow`, `session_status`, `tail_logs`, `stop_flow`, `list_sessions`, `stats`, `trigger_hook`, `list_hitl`, `resolve_hitl`
 - Chat gateway (maps chat intents to approved flow runs)
 
 Minimal MCP smoke test:
