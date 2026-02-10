@@ -46,7 +46,7 @@ This repository now includes a Rust runtime foundation in `src/`:
 - `workflow` parsing/validation for `.anna` YAML
 - core substitution and `when` evaluation
 - provider registry with `shell`, `cli`, `http`, `llm`, `k8s` (LLM and k8s via CLI adapters)
-- executor with `needs`, `when`, retry, timeout, hooks, and session logs
+- executor with `needs`, `when`, retry, timeout, hooks, session logs, and `stage.worktree` git isolation
 - session metadata files (`/tmp/anna/<session>/_meta.json`) with parent/child linkage
 - daemon API + trigger scheduler (`health`, workflow submit/status/stop/logs, `/hook/*`, `/ws`, plus `trigger.interval|cron|watch`)
 

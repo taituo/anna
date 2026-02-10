@@ -2,11 +2,13 @@ use crate::expr::{eval_when, subst};
 use crate::memory::MemoryStore;
 use crate::providers::{ProviderError, ProviderRegistry, default_registry};
 use crate::result::RunResult;
-use crate::session::{add_child_session, init_session_meta, write_stage_log};
+use crate::session::{add_child_session, init_session_meta, session_dir, write_stage_log};
 use crate::workflow::{Stage, Workflow};
 use anyhow::{Result, anyhow};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
+use tokio::process::Command;
 use tokio::time::sleep;
 
 #[derive(Debug, Clone, Default)]
@@ -111,52 +113,140 @@ impl Executor {
         stage: &Stage,
         result: &mut RunResult,
     ) -> Result<bool> {
-        if let Some(before) = &stage.before {
-            let _ = self.run_hook(workflow, stage, before, result).await;
-        }
+        let (runtime_stage, worktree) = self
+            .prepare_stage_with_worktree(workflow, stage, &result.outputs)
+            .await?;
 
-        let output = match self.execute_stage(workflow, stage, result).await {
-            Ok(v) => v,
-            Err(err) => {
-                let error_message = err.to_string();
-                write_stage_log(&result.session_id, &stage.id, &error_message).await?;
-                result.set_error(&stage.id, error_message.clone());
-
-                if let Some(on_error) = &stage.on_error {
-                    let _ = self.run_hook(workflow, stage, on_error, result).await;
-                }
-                if let Some(after) = &stage.after {
-                    let _ = self.run_hook(workflow, stage, after, result).await;
-                }
-                return Err(anyhow!(error_message));
+        let stage_result = async {
+            if let Some(before) = &runtime_stage.before {
+                let _ = self
+                    .run_hook(workflow, &runtime_stage, before, result)
+                    .await;
             }
-        };
 
-        write_stage_log(&result.session_id, &stage.id, &output).await?;
-        result.set_success(&stage.id, output.clone());
+            let output = match self.execute_stage(workflow, &runtime_stage, result).await {
+                Ok(v) => v,
+                Err(err) => {
+                    let error_message = err.to_string();
+                    write_stage_log(&result.session_id, &runtime_stage.id, &error_message).await?;
+                    result.set_error(&runtime_stage.id, error_message.clone());
 
-        if let Some(path) = &stage.output {
-            self.write_output_file(workflow, stage, path, &output)
-                .await?;
+                    if let Some(on_error) = &runtime_stage.on_error {
+                        let _ = self
+                            .run_hook(workflow, &runtime_stage, on_error, result)
+                            .await;
+                    }
+                    if let Some(after) = &runtime_stage.after {
+                        let _ = self.run_hook(workflow, &runtime_stage, after, result).await;
+                    }
+                    return Err(anyhow!(error_message));
+                }
+            };
+
+            write_stage_log(&result.session_id, &runtime_stage.id, &output).await?;
+            result.set_success(&runtime_stage.id, output.clone());
+
+            if let Some(path) = &runtime_stage.output {
+                self.write_output_file(workflow, &runtime_stage, path, &output)
+                    .await?;
+            }
+            if let Some(after) = &runtime_stage.after {
+                let _ = self.run_hook(workflow, &runtime_stage, after, result).await;
+            }
+            if runtime_stage.hitl {
+                result
+                    .outputs
+                    .insert(format!("{}.hitl", runtime_stage.id), "skipped".into());
+            }
+
+            let broken = match &runtime_stage.break_when {
+                Some(expr) => {
+                    let rendered = subst(expr, &workflow.vars, &result.outputs);
+                    output.contains(&rendered)
+                }
+                None => false,
+            };
+
+            Ok(broken)
         }
-        if let Some(after) = &stage.after {
-            let _ = self.run_hook(workflow, stage, after, result).await;
-        }
-        if stage.hitl {
+        .await;
+
+        if let Some(worktree) = worktree
+            && let Err(err) = cleanup_worktree(&worktree).await
+        {
             result
-                .outputs
-                .insert(format!("{}.hitl", stage.id), "skipped".into());
+                .errors
+                .push(format!("stage '{}': {}", runtime_stage.id, err));
         }
 
-        let broken = match &stage.break_when {
-            Some(expr) => {
-                let rendered = subst(expr, &workflow.vars, &result.outputs);
-                output.contains(&rendered)
-            }
-            None => false,
+        stage_result
+    }
+
+    async fn prepare_stage_with_worktree(
+        &self,
+        workflow: &Workflow,
+        stage: &Stage,
+        outputs: &HashMap<String, String>,
+    ) -> Result<(Stage, Option<PreparedWorktree>)> {
+        let Some(worktree_ref) = stage.worktree.as_deref() else {
+            return Ok((stage.clone(), None));
         };
 
-        Ok(broken)
+        let branch = subst(worktree_ref, &workflow.vars, outputs);
+        let branch = branch.trim();
+        if branch.is_empty() {
+            return Err(anyhow!(
+                "stage '{}' has empty rendered worktree branch",
+                stage.id
+            ));
+        }
+
+        let Some(repo_root) = resolve_repo_root(workflow, stage).await? else {
+            return Err(anyhow!(
+                "stage '{}' requested worktree '{}' but no git repository root was found",
+                stage.id,
+                branch
+            ));
+        };
+
+        let session = outputs
+            .get("SESSION")
+            .cloned()
+            .unwrap_or_else(|| "unknown".to_string());
+        let dir_name = format!(
+            "worktree-{}-{}",
+            sanitize_token(&stage.id),
+            sanitize_token(branch)
+        );
+        let worktree_path = session_dir(&session).join(dir_name);
+
+        if worktree_path.exists() {
+            let _ = tokio::fs::remove_dir_all(&worktree_path).await;
+        }
+        if let Some(parent) = worktree_path.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+
+        add_worktree(&repo_root, &worktree_path, branch)
+            .await
+            .map_err(|err| {
+                anyhow!(
+                    "stage '{}' failed to setup worktree '{}': {}",
+                    stage.id,
+                    branch,
+                    err
+                )
+            })?;
+
+        let mut runtime_stage = stage.clone();
+        runtime_stage.workdir = Some(worktree_path.display().to_string());
+        Ok((
+            runtime_stage,
+            Some(PreparedWorktree {
+                repo_root,
+                path: worktree_path,
+            }),
+        ))
     }
 
     async fn execute_stage(
@@ -504,6 +594,148 @@ impl Executor {
     }
 }
 
+#[derive(Debug, Clone)]
+struct PreparedWorktree {
+    repo_root: PathBuf,
+    path: PathBuf,
+}
+
+async fn resolve_repo_root(workflow: &Workflow, stage: &Stage) -> Result<Option<PathBuf>> {
+    let mut candidates = Vec::new();
+    if let Some(stage_wd) = stage.workdir.as_ref().filter(|v| !v.trim().is_empty()) {
+        candidates.push(PathBuf::from(stage_wd));
+    }
+    if let Some(wf_wd) = workflow.workdir.as_ref().filter(|v| !v.trim().is_empty()) {
+        candidates.push(PathBuf::from(wf_wd));
+    }
+    if let Some(source) = &workflow.source_path
+        && let Some(parent) = source.parent()
+    {
+        candidates.push(parent.to_path_buf());
+    }
+    if let Ok(cwd) = std::env::current_dir() {
+        candidates.push(cwd);
+    }
+
+    for base in candidates {
+        let mut cmd = Command::new("git");
+        cmd.arg("-C")
+            .arg(&base)
+            .arg("rev-parse")
+            .arg("--show-toplevel")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .kill_on_drop(true);
+
+        let output = match cmd.output().await {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        if !output.status.success() {
+            continue;
+        }
+        let root = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if root.is_empty() {
+            continue;
+        }
+        return Ok(Some(PathBuf::from(root)));
+    }
+
+    Ok(None)
+}
+
+async fn add_worktree(repo_root: &Path, worktree_path: &Path, branch: &str) -> Result<()> {
+    let primary = run_git_worktree_add(repo_root, worktree_path, branch, true).await;
+    if primary.is_ok() {
+        return Ok(());
+    }
+
+    run_git_worktree_add(repo_root, worktree_path, branch, false).await?;
+    Ok(())
+}
+
+async fn run_git_worktree_add(
+    repo_root: &Path,
+    worktree_path: &Path,
+    branch: &str,
+    create_branch: bool,
+) -> Result<()> {
+    let mut cmd = Command::new("git");
+    cmd.arg("-C").arg(repo_root).arg("worktree").arg("add");
+    if create_branch {
+        cmd.arg("-b").arg(branch).arg(worktree_path);
+    } else {
+        cmd.arg(worktree_path).arg(branch);
+    }
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+
+    let output = cmd.output().await?;
+    if output.status.success() {
+        return Ok(());
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let msg = if stderr.is_empty() { stdout } else { stderr };
+    Err(anyhow!(
+        "git worktree add failed (repo='{}', branch='{}'): {}",
+        repo_root.display(),
+        branch,
+        msg
+    ))
+}
+
+async fn cleanup_worktree(worktree: &PreparedWorktree) -> Result<()> {
+    let mut cmd = Command::new("git");
+    cmd.arg("-C")
+        .arg(&worktree.repo_root)
+        .arg("worktree")
+        .arg("remove")
+        .arg("--force")
+        .arg(&worktree.path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+
+    let output = cmd.output().await?;
+    if output.status.success() {
+        return Ok(());
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let msg = if stderr.is_empty() { stdout } else { stderr };
+    Err(anyhow!(
+        "git worktree remove failed (repo='{}', path='{}'): {}",
+        worktree.repo_root.display(),
+        worktree.path.display(),
+        msg
+    ))
+}
+
+fn sanitize_token(input: &str) -> String {
+    let out = input
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>();
+    if out.trim_matches('-').is_empty() {
+        "x".to_string()
+    } else {
+        out
+    }
+}
+
 fn deps_ok(stage: &Stage, result: &RunResult) -> bool {
     stage
         .needs
@@ -549,8 +781,9 @@ fn resolve_subworkflow_path(workflow: &Workflow, stage: &Stage, target: &str) ->
 
 #[cfg(test)]
 mod tests {
-    use super::{Executor, RunConfig};
+    use super::{Executor, RunConfig, sanitize_token};
     use crate::memory::MemoryStore;
+    use crate::session::session_dir;
     use crate::workflow::{Stage, Workflow};
 
     #[tokio::test]
@@ -762,5 +995,105 @@ mod tests {
 
         assert_eq!(res.success.get("use_mem"), Some(&true));
         assert_eq!(res.outputs.get("use_mem"), Some(&"prev:first".to_string()));
+    }
+
+    #[tokio::test]
+    async fn stage_worktree_runs_in_isolated_checkout_and_cleans_up() {
+        let repo = std::env::temp_dir().join(format!(
+            "anna-worktree-{}-{}",
+            std::process::id(),
+            rand::random::<u32>()
+        ));
+        tokio::fs::create_dir_all(&repo)
+            .await
+            .expect("create temp repo");
+        tokio::fs::write(repo.join("README.md"), "init\n")
+            .await
+            .expect("write init file");
+
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .arg("init")
+            .arg("-b")
+            .arg("main")
+            .status()
+            .expect("git init should run");
+        assert!(status.success(), "git init should succeed");
+
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .arg("add")
+            .arg("README.md")
+            .status()
+            .expect("git add should run");
+        assert!(status.success(), "git add should succeed");
+
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .arg("-c")
+            .arg("user.email=test@example.com")
+            .arg("-c")
+            .arg("user.name=Anna Test")
+            .arg("commit")
+            .arg("-m")
+            .arg("init")
+            .status()
+            .expect("git commit should run");
+        assert!(status.success(), "git commit should succeed");
+
+        let branch = format!("feat-{}", rand::random::<u16>());
+        let wf = Workflow {
+            name: "worktree-test".into(),
+            mode: "once".into(),
+            memory: false,
+            tags: vec![],
+            vars: Default::default(),
+            env: Default::default(),
+            workdir: Some(repo.display().to_string()),
+            trigger: Default::default(),
+            stages: vec![Stage {
+                id: "wt".into(),
+                provider: "shell".into(),
+                exec: Some("pwd".into()),
+                worktree: Some(branch.clone()),
+                ..Default::default()
+            }],
+            source_path: None,
+        };
+
+        let res = Executor::new()
+            .run(
+                &wf,
+                RunConfig {
+                    max_iterations: Some(1),
+                    session_id_override: None,
+                },
+            )
+            .await
+            .expect("workflow should run");
+
+        assert_eq!(res.success.get("wt"), Some(&true));
+        let output = res.outputs.get("wt").cloned().unwrap_or_default();
+        let expected_name = format!(
+            "worktree-{}-{}",
+            sanitize_token("wt"),
+            sanitize_token(&branch)
+        );
+        assert!(
+            output.contains(&expected_name),
+            "pwd output should include worktree dir name '{}', got '{}'",
+            expected_name,
+            output
+        );
+
+        let worktree_path = session_dir(&res.session_id).join(expected_name);
+        assert!(
+            !worktree_path.exists(),
+            "worktree path should be cleaned up: {}",
+            worktree_path.display()
+        );
     }
 }
