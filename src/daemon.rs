@@ -53,6 +53,18 @@ struct HealthResponse {
 }
 
 #[derive(Debug, Serialize)]
+struct StatsResponse {
+    sessions_total: usize,
+    sessions_running: usize,
+    sessions_done: usize,
+    sessions_failed: usize,
+    sessions_other: usize,
+    hitl_total: usize,
+    hitl_pending: usize,
+    hitl_resolved: usize,
+}
+
+#[derive(Debug, Serialize)]
 struct StartWorkflowResponse {
     id: String,
     status: String,
@@ -184,6 +196,7 @@ pub async fn run_daemon(bind: &str, plays_dir: PathBuf) -> Result<()> {
 
     let app = Router::new()
         .route("/health", get(health))
+        .route("/stats", get(stats))
         .route("/sessions", get(list_sessions))
         .route("/workflows", get(list_workflows))
         .route("/workflow", post(start_workflow))
@@ -204,6 +217,38 @@ pub async fn run_daemon(bind: &str, plays_dir: PathBuf) -> Result<()> {
 
 async fn health() -> Json<HealthResponse> {
     Json(HealthResponse { ok: true })
+}
+
+async fn stats(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
+    if let Some(resp) = ensure_authorized(&state, &headers) {
+        return resp;
+    }
+
+    let sessions = state.sessions.read().await;
+    let hitl = state.hitl.read().await;
+
+    let sessions_total = sessions.len();
+    let sessions_running = sessions.values().filter(|v| v.status == "running").count();
+    let sessions_done = sessions.values().filter(|v| v.status == "done").count();
+    let sessions_failed = sessions.values().filter(|v| v.status == "failed").count();
+    let sessions_other =
+        sessions_total.saturating_sub(sessions_running + sessions_done + sessions_failed);
+
+    let hitl_total = hitl.len();
+    let hitl_pending = hitl.values().filter(|v| v.status == "pending").count();
+    let hitl_resolved = hitl.values().filter(|v| v.status == "resolved").count();
+
+    Json(StatsResponse {
+        sessions_total,
+        sessions_running,
+        sessions_done,
+        sessions_failed,
+        sessions_other,
+        hitl_total,
+        hitl_pending,
+        hitl_resolved,
+    })
+    .into_response()
 }
 
 async fn list_workflows(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {

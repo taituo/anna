@@ -98,6 +98,12 @@ enum Commands {
         #[arg(long)]
         limit: Option<usize>,
     },
+    /// Show daemon stats summary
+    Stats {
+        /// Daemon base URL
+        #[arg(long, default_value = "http://127.0.0.1:8080")]
+        daemon: String,
+    },
     /// Wait until workflow reaches terminal state
     Wait {
         /// Request id
@@ -301,6 +307,15 @@ async fn main() -> Result<()> {
                 .send()
                 .await
                 .with_context(|| format!("failed querying sessions at {}", daemon))?;
+            print_response(response).await
+        }
+        Commands::Stats { daemon } => {
+            let daemon = normalize_daemon_url(&daemon);
+            let client = Client::new();
+            let response = with_daemon_auth(client.get(format!("{}/stats", daemon)))
+                .send()
+                .await
+                .with_context(|| format!("failed querying stats at {}", daemon))?;
             print_response(response).await
         }
         Commands::Wait {

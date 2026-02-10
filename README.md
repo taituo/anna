@@ -44,6 +44,7 @@ anna workflows
 anna hook deploy
 anna status <request_id>
 anna sessions --status running
+anna stats
 anna wait <request_id> --timeout-sec 300
 anna hitl list
 anna hitl list --status pending --workflow my-flow
@@ -88,7 +89,7 @@ Current MVP intentionally leaves some advanced features for next steps (multi-no
 
 - CLI (`anna run`, `anna submit`, `anna status`)
 - HTTP control API (`/workflow`, `/hook/*`, `/hitl`, `/hitl/{id}/resolve`, `/ws`)
-- MCP stdio server (`anna mcp`) with tools: `list_flows`, `run_flow`, `session_status`, `tail_logs`, `stop_flow`, `list_sessions`, `trigger_hook`, `list_hitl`, `resolve_hitl`
+- MCP stdio server (`anna mcp`) with tools: `list_flows`, `run_flow`, `session_status`, `tail_logs`, `stop_flow`, `list_sessions`, `stats`, `trigger_hook`, `list_hitl`, `resolve_hitl`
 - Chat gateway (maps chat intents to approved flow runs)
 
 Minimal MCP smoke test:

@@ -185,6 +185,11 @@ fn tool_specs() -> Vec<Value> {
             }
         }),
         json!({
+            "name": "stats",
+            "description": "Get daemon stats summary",
+            "inputSchema": { "type": "object", "additionalProperties": false }
+        }),
+        json!({
             "name": "trigger_hook",
             "description": "Trigger daemon webhook hook by name",
             "inputSchema": {
@@ -315,6 +320,14 @@ async fn handle_tools_call(client: &Client, config: &McpConfig, params: &Value) 
             let body = send(req).await?;
             Ok(body)
         }
+        "stats" => {
+            let body = send(authed(
+                client.get(format!("{}/stats", daemon)),
+                &config.daemon_token,
+            ))
+            .await?;
+            Ok(body)
+        }
         "trigger_hook" => {
             let name = arg_required_string(&args, "name")?;
             let body = send(authed(
@@ -440,6 +453,7 @@ mod tests {
         assert!(names.contains(&"session_status"));
         assert!(names.contains(&"tail_logs"));
         assert!(names.contains(&"stop_flow"));
+        assert!(names.contains(&"stats"));
     }
 
     #[test]
