@@ -180,6 +180,15 @@ struct RunRegisteredOptions {
     max_iterations: Option<u32>,
 }
 
+#[derive(Debug, Deserialize, Default)]
+struct WorkflowsMetaQuery {
+    tag: Option<String>,
+    owner: Option<String>,
+    capability: Option<String>,
+    available: Option<bool>,
+    limit: Option<usize>,
+}
+
 #[derive(Debug, Default)]
 struct TriggerScheduler {
     interval_next: HashMap<String, Instant>,
@@ -384,6 +393,7 @@ async fn list_workflows(State(state): State<AppState>, headers: HeaderMap) -> im
 async fn list_workflows_meta(
     State(state): State<AppState>,
     headers: HeaderMap,
+    Query(query): Query<WorkflowsMetaQuery>,
 ) -> impl IntoResponse {
     if let Some(resp) = ensure_authorized(&state, &headers) {
         return resp;
@@ -401,6 +411,17 @@ async fn list_workflows_meta(
                     .into_response();
             }
         };
+    let tag_filter = query.tag.as_deref().map(|v| v.trim().to_ascii_lowercase());
+    let owner_filter = query
+        .owner
+        .as_deref()
+        .map(|v| v.trim().to_ascii_lowercase());
+    let capability_filter = query
+        .capability
+        .as_deref()
+        .map(|v| v.trim().to_ascii_lowercase());
+    let available_filter = query.available;
+
     let mut out = entries
         .into_iter()
         .map(|entry| {
@@ -422,8 +443,20 @@ async fn list_workflows_meta(
                 trigger_interval: entry.trigger_interval,
             }
         })
+        .filter(|item| {
+            matches_workflow_meta_filters(
+                item,
+                tag_filter.as_deref(),
+                owner_filter.as_deref(),
+                capability_filter.as_deref(),
+                available_filter,
+            )
+        })
         .collect::<Vec<_>>();
     out.sort_by(|a, b| a.id.cmp(&b.id));
+    if let Some(limit) = query.limit {
+        out.truncate(limit);
+    }
     Json(out).into_response()
 }
 
@@ -1362,6 +1395,52 @@ fn workflow_public_id(entry: &WorkflowEntry) -> String {
         .unwrap_or_else(|| entry.file_name.clone())
 }
 
+fn matches_workflow_meta_filters(
+    item: &WorkflowMetaResponse,
+    tag_filter: Option<&str>,
+    owner_filter: Option<&str>,
+    capability_filter: Option<&str>,
+    available_filter: Option<bool>,
+) -> bool {
+    if let Some(required) = tag_filter {
+        let has_tag = item
+            .tags
+            .iter()
+            .any(|tag| tag.trim().eq_ignore_ascii_case(required));
+        if !has_tag {
+            return false;
+        }
+    }
+
+    if let Some(required) = owner_filter {
+        let owner = item
+            .owner
+            .as_deref()
+            .map(|v| v.trim().to_ascii_lowercase())
+            .unwrap_or_default();
+        if owner != required {
+            return false;
+        }
+    }
+
+    if let Some(required) = capability_filter {
+        let has_capability = item
+            .required_capabilities
+            .iter()
+            .any(|cap| cap.trim().eq_ignore_ascii_case(required));
+        if !has_capability {
+            return false;
+        }
+    }
+
+    if let Some(required) = available_filter
+        && item.available != required
+    {
+        return false;
+    }
+    true
+}
+
 async fn find_workflows_with_registry(
     root: &FsPath,
     registry_file: Option<&FsPath>,
@@ -1777,11 +1856,11 @@ async fn launch_workflow(
 mod tests {
     use super::{
         DaemonHitl, DaemonStateSnapshot, HitlPending, SessionInfo, WorkflowEntry,
-        collect_watch_snapshot, find_workflow_entries_with_registry, is_authorized,
-        load_daemon_state, load_flow_registry, missing_required_capabilities,
-        parse_run_registered_options, prune_hitl_in_place, prune_sessions_in_place,
-        resolve_registered_workflow_entry_with_registry, resolve_watch_pattern, status_matches,
-        temp_state_path,
+        WorkflowMetaResponse, collect_watch_snapshot, find_workflow_entries_with_registry,
+        is_authorized, load_daemon_state, load_flow_registry, matches_workflow_meta_filters,
+        missing_required_capabilities, parse_run_registered_options, prune_hitl_in_place,
+        prune_sessions_in_place, resolve_registered_workflow_entry_with_registry,
+        resolve_watch_pattern, status_matches, temp_state_path,
     };
     use crate::executor::{HitlHandler, HitlRequest};
     use axum::http::{HeaderMap, HeaderValue};
@@ -1965,6 +2044,62 @@ mod tests {
             ])
         );
         assert_eq!(parsed.max_iterations, Some(2));
+    }
+
+    #[test]
+    fn workflow_meta_filters_match_expected_values() {
+        let item = WorkflowMetaResponse {
+            id: "prod-deploy".to_string(),
+            workflow: "deploy".to_string(),
+            file: "deploy.anna".to_string(),
+            path: "/tmp/deploy.anna".to_string(),
+            tags: vec!["prod".to_string(), "deploy".to_string()],
+            required_capabilities: vec!["k8s".to_string(), "vault".to_string()],
+            owner: Some("platform".to_string()),
+            version: Some("v1".to_string()),
+            available: false,
+            missing_capabilities: vec!["vault".to_string()],
+            trigger_webhook: Some("/deploy".to_string()),
+            trigger_watch: None,
+            trigger_cron: None,
+            trigger_interval: None,
+        };
+
+        assert!(matches_workflow_meta_filters(
+            &item,
+            Some("prod"),
+            Some("platform"),
+            Some("k8s"),
+            Some(false)
+        ));
+        assert!(!matches_workflow_meta_filters(
+            &item,
+            Some("staging"),
+            None,
+            None,
+            None
+        ));
+        assert!(!matches_workflow_meta_filters(
+            &item,
+            None,
+            Some("security"),
+            None,
+            None
+        ));
+        assert!(!matches_workflow_meta_filters(
+            &item,
+            None,
+            None,
+            Some("http"),
+            None
+        ));
+        assert!(!matches_workflow_meta_filters(
+            &item,
+            None,
+            None,
+            None,
+            Some(true)
+        ));
     }
 
     #[tokio::test]

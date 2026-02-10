@@ -75,6 +75,21 @@ enum Commands {
         /// Daemon base URL
         #[arg(long, default_value = "http://127.0.0.1:8080")]
         daemon: String,
+        /// Optional tag filter
+        #[arg(long)]
+        tag: Option<String>,
+        /// Optional owner filter
+        #[arg(long)]
+        owner: Option<String>,
+        /// Optional required capability filter
+        #[arg(long)]
+        capability: Option<String>,
+        /// Optional availability filter
+        #[arg(long)]
+        available: Option<bool>,
+        /// Optional max rows
+        #[arg(long)]
+        limit: Option<usize>,
     },
     /// Run registered workflow by name/file stem on daemon
     RunNamed {
@@ -280,10 +295,33 @@ async fn main() -> Result<()> {
                 .with_context(|| format!("failed querying workflows at {}", daemon))?;
             print_response(response).await
         }
-        Commands::WorkflowsMeta { daemon } => {
+        Commands::WorkflowsMeta {
+            daemon,
+            tag,
+            owner,
+            capability,
+            available,
+            limit,
+        } => {
             let daemon = normalize_daemon_url(&daemon);
             let client = Client::new();
-            let response = with_daemon_auth(client.get(format!("{}/workflows/meta", daemon)))
+            let mut request = with_daemon_auth(client.get(format!("{}/workflows/meta", daemon)));
+            if let Some(tag) = tag {
+                request = request.query(&[("tag", tag)]);
+            }
+            if let Some(owner) = owner {
+                request = request.query(&[("owner", owner)]);
+            }
+            if let Some(capability) = capability {
+                request = request.query(&[("capability", capability)]);
+            }
+            if let Some(available) = available {
+                request = request.query(&[("available", available)]);
+            }
+            if let Some(limit) = limit {
+                request = request.query(&[("limit", limit)]);
+            }
+            let response = request
                 .send()
                 .await
                 .with_context(|| format!("failed querying workflow metadata at {}", daemon))?;

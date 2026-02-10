@@ -42,6 +42,7 @@ anna mcp
 anna submit workflow.anna
 anna workflows
 anna workflows-meta
+anna workflows-meta --available true --capability k8s
 anna run-named prod-deploy --var ENV=prod --max-iterations 1
 anna hook deploy
 anna status <request_id>
@@ -104,7 +105,7 @@ flows:
 
 When registry is enabled:
 - `anna workflows` lists `flow_id` values
-- `anna workflows-meta` shows owner/version/tags/capability availability
+- `anna workflows-meta` shows owner/version/tags/capability availability (supports `--tag`, `--owner`, `--capability`, `--available`, `--limit`)
 - `anna run-named <name>` accepts `flow_id`, workflow name, or file name
 - `anna run-named` accepts optional runtime JSON options (`vars`, `max_iterations`)
 - hook/cron/watch/interval trigger scans are limited to registry entries

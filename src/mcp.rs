@@ -133,7 +133,17 @@ fn tool_specs() -> Vec<Value> {
         json!({
             "name": "list_flows_meta",
             "description": "List registered workflows with metadata and capability availability",
-            "inputSchema": { "type": "object", "additionalProperties": false }
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "tag": { "type": "string" },
+                    "owner": { "type": "string" },
+                    "capability": { "type": "string" },
+                    "available": { "type": "boolean" },
+                    "limit": { "type": "integer", "minimum": 1 }
+                },
+                "additionalProperties": false
+            }
         }),
         json!({
             "name": "run_flow",
@@ -260,11 +270,33 @@ async fn handle_tools_call(client: &Client, config: &McpConfig, params: &Value) 
             Ok(body)
         }
         "list_flows_meta" => {
-            let body = send(authed(
+            let tag = arg_string(&args, "tag")?;
+            let owner = arg_string(&args, "owner")?;
+            let capability = arg_string(&args, "capability")?;
+            let available = arg_bool(&args, "available")?;
+            let limit = arg_u64(&args, "limit")?;
+
+            let mut req = authed(
                 client.get(format!("{}/workflows/meta", daemon)),
                 &config.daemon_token,
-            ))
-            .await?;
+            );
+            if let Some(tag) = tag {
+                req = req.query(&[("tag", tag)]);
+            }
+            if let Some(owner) = owner {
+                req = req.query(&[("owner", owner)]);
+            }
+            if let Some(capability) = capability {
+                req = req.query(&[("capability", capability)]);
+            }
+            if let Some(available) = available {
+                req = req.query(&[("available", available)]);
+            }
+            if let Some(limit) = limit {
+                req = req.query(&[("limit", limit)]);
+            }
+
+            let body = send(req).await?;
             Ok(body)
         }
         "run_flow" => {
@@ -465,6 +497,14 @@ fn arg_u32(args: &Value, key: &str) -> Result<Option<u32>> {
     }
 }
 
+fn arg_bool(args: &Value, key: &str) -> Result<Option<bool>> {
+    match args.get(key) {
+        Some(Value::Bool(v)) => Ok(Some(*v)),
+        Some(Value::Null) | None => Ok(None),
+        Some(_) => Err(anyhow!("tool argument '{}' must be boolean", key)),
+    }
+}
+
 fn authed(builder: reqwest::RequestBuilder, token: &Option<String>) -> reqwest::RequestBuilder {
     match token.as_ref().map(|v| v.trim()).filter(|v| !v.is_empty()) {
         Some(token) => builder.bearer_auth(token),
@@ -501,7 +541,7 @@ fn normalize_daemon_url(url: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{arg_string, arg_string_map, arg_u32, arg_u64, tool_specs};
+    use super::{arg_bool, arg_string, arg_string_map, arg_u32, arg_u64, tool_specs};
     use serde_json::json;
 
     #[test]
@@ -522,13 +562,17 @@ mod tests {
 
     #[test]
     fn arg_helpers_parse_values() {
-        let args = json!({ "a": "x", "n": 3, "vars": {"X": "1"} });
+        let args = json!({ "a": "x", "n": 3, "vars": {"X": "1"}, "available": true });
         assert_eq!(
             arg_string(&args, "a").expect("a should parse"),
             Some("x".to_string())
         );
         assert_eq!(arg_u64(&args, "n").expect("n should parse"), Some(3));
         assert_eq!(arg_u32(&args, "n").expect("n should parse"), Some(3));
+        assert_eq!(
+            arg_bool(&args, "available").expect("available should parse"),
+            Some(true)
+        );
         assert_eq!(
             arg_string_map(&args, "vars").expect("vars should parse"),
             std::collections::HashMap::from([(String::from("X"), String::from("1"))])
