@@ -48,6 +48,7 @@ anna run-named prod-deploy --var ENV=prod --max-iterations 1
 anna hook deploy
 anna status <request_id>
 anna sessions --status running
+anna sessions --status running --owner platform --workflow prod-deploy
 anna stats
 anna wait <request_id> --timeout-sec 300
 anna hitl list

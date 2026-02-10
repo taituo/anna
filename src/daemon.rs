@@ -209,6 +209,8 @@ struct HitlListQuery {
 #[derive(Debug, Deserialize, Default)]
 struct SessionsQuery {
     status: Option<String>,
+    owner: Option<String>,
+    workflow: Option<String>,
     limit: Option<usize>,
 }
 
@@ -566,6 +568,19 @@ async fn list_sessions(
         .collect::<Vec<_>>();
     if let Some(filter) = query.status.as_deref() {
         items.retain(|v| status_matches(&v.status, filter));
+    }
+    if let Some(owner_filter) = query.owner.as_deref() {
+        let owner_filter = owner_filter.trim();
+        items.retain(|v| {
+            v.owner
+                .as_deref()
+                .map(|owner| owner.eq_ignore_ascii_case(owner_filter))
+                .unwrap_or(false)
+        });
+    }
+    if let Some(workflow_filter) = query.workflow.as_deref() {
+        let workflow_filter = workflow_filter.trim();
+        items.retain(|v| v.workflow.eq_ignore_ascii_case(workflow_filter));
     }
     items.sort_by(|a, b| b.created_at.cmp(&a.created_at));
     if let Some(limit) = query.limit {
@@ -2555,6 +2570,57 @@ mod tests {
         assert_eq!(super::owner_limit_for(Some("ops"), &policy), Some(2));
         assert_eq!(super::owner_limit_for(Some("other"), &policy), Some(1));
         assert_eq!(super::owner_limit_for(None, &policy), None);
+    }
+
+    #[test]
+    fn build_running_indexes_tracks_workflow_and_owner_counts() {
+        let sessions = std::collections::HashMap::from([
+            (
+                "a".to_string(),
+                SessionInfo {
+                    id: "a".to_string(),
+                    status: "running".to_string(),
+                    workflow: "deploy".to_string(),
+                    owner: Some("Platform".to_string()),
+                    created_at: 1,
+                    updated_at: 1,
+                    runtime_session_id: None,
+                    outputs: std::collections::HashMap::new(),
+                    errors: vec![],
+                },
+            ),
+            (
+                "b".to_string(),
+                SessionInfo {
+                    id: "b".to_string(),
+                    status: "running".to_string(),
+                    workflow: "deploy".to_string(),
+                    owner: Some("platform".to_string()),
+                    created_at: 1,
+                    updated_at: 1,
+                    runtime_session_id: None,
+                    outputs: std::collections::HashMap::new(),
+                    errors: vec![],
+                },
+            ),
+            (
+                "c".to_string(),
+                SessionInfo {
+                    id: "c".to_string(),
+                    status: "done".to_string(),
+                    workflow: "deploy".to_string(),
+                    owner: Some("platform".to_string()),
+                    created_at: 1,
+                    updated_at: 1,
+                    runtime_session_id: None,
+                    outputs: std::collections::HashMap::new(),
+                    errors: vec![],
+                },
+            ),
+        ]);
+        let (by_workflow, by_owner) = super::build_running_indexes(&sessions);
+        assert_eq!(by_workflow.get("deploy"), Some(&2usize));
+        assert_eq!(by_owner.get("platform"), Some(&2usize));
     }
 
     #[test]

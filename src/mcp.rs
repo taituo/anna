@@ -211,6 +211,8 @@ fn tool_specs() -> Vec<Value> {
                 "type": "object",
                 "properties": {
                     "status": { "type": "string" },
+                    "owner": { "type": "string" },
+                    "workflow": { "type": "string" },
                     "limit": { "type": "integer", "minimum": 1 }
                 },
                 "additionalProperties": false
@@ -390,6 +392,8 @@ async fn handle_tools_call(client: &Client, config: &McpConfig, params: &Value) 
         }
         "list_sessions" => {
             let status = arg_string(&args, "status")?;
+            let owner = arg_string(&args, "owner")?;
+            let workflow = arg_string(&args, "workflow")?;
             let limit = arg_u64(&args, "limit")?;
             let mut req = authed(
                 client.get(format!("{}/sessions", daemon)),
@@ -397,6 +401,12 @@ async fn handle_tools_call(client: &Client, config: &McpConfig, params: &Value) 
             );
             if let Some(status) = status {
                 req = req.query(&[("status", status)]);
+            }
+            if let Some(owner) = owner {
+                req = req.query(&[("owner", owner)]);
+            }
+            if let Some(workflow) = workflow {
+                req = req.query(&[("workflow", workflow)]);
             }
             if let Some(limit) = limit {
                 req = req.query(&[("limit", limit)]);

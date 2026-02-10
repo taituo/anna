@@ -129,6 +129,12 @@ enum Commands {
         /// Optional status filter, e.g. running|done|failed
         #[arg(long)]
         status: Option<String>,
+        /// Optional owner filter (registry owner)
+        #[arg(long)]
+        owner: Option<String>,
+        /// Optional workflow name filter
+        #[arg(long)]
+        workflow: Option<String>,
         /// Optional max rows
         #[arg(long)]
         limit: Option<usize>,
@@ -382,6 +388,8 @@ async fn main() -> Result<()> {
         Commands::Sessions {
             daemon,
             status,
+            owner,
+            workflow,
             limit,
         } => {
             let daemon = normalize_daemon_url(&daemon);
@@ -389,6 +397,12 @@ async fn main() -> Result<()> {
             let mut req = with_daemon_auth(client.get(format!("{}/sessions", daemon)));
             if let Some(status) = status {
                 req = req.query(&[("status", status)]);
+            }
+            if let Some(owner) = owner {
+                req = req.query(&[("owner", owner)]);
+            }
+            if let Some(workflow) = workflow {
+                req = req.query(&[("workflow", workflow)]);
             }
             if let Some(limit) = limit {
                 req = req.query(&[("limit", limit)]);
