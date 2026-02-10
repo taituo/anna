@@ -55,6 +55,7 @@ Input from Anna:
   - `ANNA_TRUST`
 
 Current Rust runtime injects these `ANNA_*` variables automatically for `provider: cli` and `provider: shell`.
+When `stage.secrets` is set, mapped env vars are also injected (resolved from `ANNA_SECRET_*` or `~/.anna/secrets.json`).
 
 Output to Anna:
 - `parse: text` -> full stdout captured as stage output

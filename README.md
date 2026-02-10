@@ -15,6 +15,7 @@ This repository contains the language docs:
 - Deterministic stages (`shell`, `http`, `k8s`)
 - Native `cli` provider wrappers for external tools and model CLIs
 - LLM stages as first-class workflow providers (`llm`) decoupled from core
+- Secret injection (`stage.secrets`) with env/file resolution
 - Dependencies and conditions (`needs`, `when`)
 - Triggers in daemon mode (`webhook`, `watch`, `cron`, `interval`)
 - Parallel execution (`forks`, `each`, `each_from`) with optional `vote`

@@ -1,5 +1,7 @@
 use crate::expr::subst;
-use crate::providers::{Provider, ProviderError, ProviderResult, runtime_env};
+use crate::providers::{
+    Provider, ProviderError, ProviderResult, resolve_stage_secrets, runtime_env,
+};
 use crate::workflow::{Stage, Workflow};
 use async_trait::async_trait;
 use std::collections::HashMap;
@@ -52,6 +54,9 @@ impl Provider for CliProvider {
         }
         for (k, v) in runtime_env(stage, workflow, outputs) {
             command.env(k, v);
+        }
+        for (env_key, value) in resolve_stage_secrets(stage, vars, outputs)? {
+            command.env(env_key, value);
         }
 
         let mut child = command.spawn().map_err(map_spawn_error)?;
