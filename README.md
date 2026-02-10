@@ -39,6 +39,8 @@ anna validate
 anna run workflow.anna
 anna daemon
 anna submit workflow.anna
+anna workflows
+anna hook deploy
 anna status <request_id>
 anna hitl list
 ```

@@ -56,6 +56,12 @@ enum Commands {
         #[arg(long, default_value = "http://127.0.0.1:8080")]
         daemon: String,
     },
+    /// List registered workflows from daemon playbook directory
+    Workflows {
+        /// Daemon base URL
+        #[arg(long, default_value = "http://127.0.0.1:8080")]
+        daemon: String,
+    },
     /// Run registered workflow by name/file stem on daemon
     RunNamed {
         /// Workflow name, file name, or file stem
@@ -84,6 +90,14 @@ enum Commands {
     Logs {
         /// Request id
         id: String,
+        /// Daemon base URL
+        #[arg(long, default_value = "http://127.0.0.1:8080")]
+        daemon: String,
+    },
+    /// Trigger webhook hook by name (maps to /hook/{name})
+    Hook {
+        /// Hook name without leading slash, e.g. deploy
+        name: String,
         /// Daemon base URL
         #[arg(long, default_value = "http://127.0.0.1:8080")]
         daemon: String,
@@ -186,6 +200,15 @@ async fn main() -> Result<()> {
                 .with_context(|| format!("failed submitting workflow to {}", daemon))?;
             print_response(response).await
         }
+        Commands::Workflows { daemon } => {
+            let daemon = normalize_daemon_url(&daemon);
+            let client = Client::new();
+            let response = with_daemon_auth(client.get(format!("{}/workflows", daemon)))
+                .send()
+                .await
+                .with_context(|| format!("failed querying workflows at {}", daemon))?;
+            print_response(response).await
+        }
         Commands::RunNamed { name, daemon } => {
             let daemon = normalize_daemon_url(&daemon);
             let client = Client::new();
@@ -223,6 +246,19 @@ async fn main() -> Result<()> {
                 .send()
                 .await
                 .with_context(|| format!("failed reading workflow logs '{}' at {}", id, daemon))?;
+            print_response(response).await
+        }
+        Commands::Hook { name, daemon } => {
+            let daemon = normalize_daemon_url(&daemon);
+            let client = Client::new();
+            let response = with_daemon_auth(client.post(format!(
+                "{}/hook/{}",
+                daemon,
+                name.trim_matches('/')
+            )))
+            .send()
+            .await
+            .with_context(|| format!("failed triggering hook '{}' at {}", name, daemon))?;
             print_response(response).await
         }
         Commands::Hitl { command } => match command {
