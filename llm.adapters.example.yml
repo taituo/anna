@@ -1,0 +1,26 @@
+# Example LLM adapter catalog for Anna.
+#
+# Usage:
+#   cp llm.adapters.example.yml llm.adapters.yml
+#   ANNA_LLM_ADAPTERS_FILE=./llm.adapters.yml anna llm-adapters
+#   ANNA_LLM_ADAPTERS_FILE=./llm.adapters.yml ANNA_LLM_ADAPTER=openbao anna run flow.anna
+
+default: mock
+adapters:
+  mock:
+    exec: ./tools/anna-llm-provider
+    args: ["--mock"]
+    model: gpt-4o-mini
+    parse: text
+
+  openbao:
+    exec: ./tools/anna-llm-provider
+    args:
+      - --backend-cmd
+      - openbao-cli
+      - --timeout-seconds
+      - "90"
+    model: claude-sonnet
+    parse: text
+    env:
+      ANNA_LLM_BACKEND_CMD: openbao-cli

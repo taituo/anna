@@ -9,6 +9,7 @@ This repository contains the language docs:
 - `architecture_modes.md`: runtime and control-plane architecture (single, daemon, multi-HA)
 - `provider_cli_spec.md`: native provider contract for CLI wrappers (including LLM adapters)
 - `tools/README.md`: reference wrapper usage (`tools/anna-llm-provider`)
+- `llm.adapters.example.yml`: starter LLM adapter catalog template
 
 ## What Anna Supports
 
@@ -107,6 +108,7 @@ ANNA_OWNER_MAX_CONCURRENCY="platform=4,research=2,*=1" anna daemon --plays-dir .
 Optional LLM adapter catalog (provider-independent wrapper routing):
 
 ```bash
+cp llm.adapters.example.yml llm.adapters.yml
 ANNA_LLM_ADAPTERS_FILE=./llm.adapters.yml ANNA_LLM_ADAPTER=openbao anna run flow.anna
 ```
 

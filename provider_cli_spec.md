@@ -90,6 +90,7 @@ Adapter catalog support in runtime:
 - `ANNA_LLM_ADAPTERS_FILE=<path>` points to YAML catalog with `default` and `adapters`.
 - `llm_adapter` in stage (or `ANNA_LLM_ADAPTER`) selects adapter entry.
 - `anna llm-adapters --json` prints resolved local catalog state.
+- `llm.adapters.example.yml` is a starter template in this repository.
 
 Example catalog:
 
