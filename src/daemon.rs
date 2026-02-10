@@ -62,6 +62,7 @@ struct StartWorkflowResponse {
 struct HookTriggerResponse {
     hook: String,
     launched: Vec<HookLaunchedWorkflow>,
+    skipped_running: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -413,20 +414,23 @@ async fn trigger_hook(
     };
 
     let mut launched = Vec::new();
+    let mut skipped_running = Vec::new();
     for entry in entries {
         if let Some(webhook) = entry.trigger_webhook.as_deref()
             && webhook.trim() == hook_path
         {
-            if let Ok(session_id) = launch_workflow_from_entry(&state, &entry, "webhook").await {
-                launched.push(HookLaunchedWorkflow {
+            match launch_workflow_from_entry(&state, &entry, "webhook").await {
+                Ok(Some(session_id)) => launched.push(HookLaunchedWorkflow {
                     workflow: entry.workflow_name,
                     session_id,
-                });
+                }),
+                Ok(None) => skipped_running.push(entry.workflow_name),
+                Err(_) => {}
             }
         }
     }
 
-    if launched.is_empty() {
+    if launched.is_empty() && skipped_running.is_empty() {
         return (StatusCode::NOT_FOUND, "no workflows for hook").into_response();
     }
     (
@@ -434,6 +438,7 @@ async fn trigger_hook(
         Json(HookTriggerResponse {
             hook: hook_path,
             launched,
+            skipped_running,
         }),
     )
         .into_response()
@@ -1007,7 +1012,15 @@ async fn launch_workflow_from_entry(
     state: &AppState,
     entry: &WorkflowEntry,
     trigger_source: &str,
-) -> Result<String> {
+) -> Result<Option<String>> {
+    if is_workflow_running(state, &entry.workflow_name).await {
+        println!(
+            "anna-rs daemon trigger={} workflow='{}' skipped: already running",
+            trigger_source, entry.workflow_name
+        );
+        return Ok(None);
+    }
+
     let mut wf = Workflow::load(&entry.path)?;
     if wf.workdir.is_none() {
         wf.workdir = Some(state.plays_dir.display().to_string());
@@ -1017,7 +1030,16 @@ async fn launch_workflow_from_entry(
         "anna-rs daemon trigger={} workflow='{}' request_id={}",
         trigger_source, entry.workflow_name, req_id
     );
-    Ok(req_id)
+    Ok(Some(req_id))
+}
+
+async fn is_workflow_running(state: &AppState, workflow_name: &str) -> bool {
+    state
+        .sessions
+        .read()
+        .await
+        .values()
+        .any(|s| s.workflow == workflow_name && s.status == "running")
 }
 
 async fn launch_workflow(state: &AppState, workflow: Workflow) -> Result<String> {
