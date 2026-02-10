@@ -15,6 +15,7 @@ This repository contains the language docs:
 - Deterministic stages (`shell`, `http`, `k8s`)
 - Native `cli` provider wrappers for external tools and model CLIs
 - LLM stages as first-class workflow providers (`llm`) decoupled from core
+- LLM adapter catalog (`ANNA_LLM_ADAPTERS_FILE`) for model/CLI wrapper routing
 - Secret injection (`stage.secrets`) with env/file resolution
 - Dependencies and conditions (`needs`, `when`)
 - Triggers in daemon mode (`webhook`, `watch`, `cron`, `interval`)
@@ -99,6 +100,27 @@ Optional owner concurrency policy (per `owner` in registry):
 
 ```bash
 ANNA_OWNER_MAX_CONCURRENCY="platform=4,research=2,*=1" anna daemon --plays-dir .
+```
+
+Optional LLM adapter catalog (provider-independent wrapper routing):
+
+```bash
+ANNA_LLM_ADAPTERS_FILE=./llm.adapters.yml ANNA_LLM_ADAPTER=openbao anna run flow.anna
+```
+
+```yaml
+default: mock
+adapters:
+  mock:
+    exec: ./tools/anna-llm-provider
+    args: ["--mock"]
+    model: gpt-4o-mini
+  openbao:
+    exec: ./tools/anna-llm-provider
+    args: ["--backend-cmd", "openbao-cli"]
+    model: claude-sonnet
+    env:
+      ANNA_LLM_BACKEND_CMD: openbao-cli
 ```
 
 Registry format:

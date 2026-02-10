@@ -29,6 +29,8 @@ pub struct Stage {
     pub provider: String,
     #[serde(default)]
     pub model: Option<String>,
+    #[serde(rename = "llm_adapter", default)]
+    pub llm_adapter: Option<String>,
     #[serde(default)]
     pub exec: Option<String>,
     #[serde(rename = "do", default)]

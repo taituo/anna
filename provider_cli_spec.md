@@ -86,6 +86,27 @@ Exit codes:
 - llm stage -> adapter -> `provider: cli` wrapper
 - model/provider switching should happen in adapter config, not Anna core
 
+Adapter catalog support in runtime:
+- `ANNA_LLM_ADAPTERS_FILE=<path>` points to YAML catalog with `default` and `adapters`.
+- `llm_adapter` in stage (or `ANNA_LLM_ADAPTER`) selects adapter entry.
+
+Example catalog:
+
+```yaml
+default: mock
+adapters:
+  mock:
+    exec: ./tools/anna-llm-provider
+    args: ["--mock"]
+    model: gpt-4o-mini
+  openbao:
+    exec: ./tools/anna-llm-provider
+    args: ["--backend-cmd", "openbao-cli"]
+    model: claude-sonnet
+    env:
+      ANNA_LLM_BACKEND_CMD: openbao-cli
+```
+
 This keeps model churn and CLI quirks out of the main execution engine.
 
 ## MCP and CLI Best Practices

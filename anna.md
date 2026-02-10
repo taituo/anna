@@ -77,6 +77,8 @@ stages:
     do: string            # prompt
     system: string        # system prompt
     model: string         # model override
+    llm_adapter: string   # optional adapter key from ANNA_LLM_ADAPTERS_FILE
+    args: [strings]       # extra wrapper args (merged with adapter args)
     context: [files]      # files to include in prompt
     trust: none|read|all  # tool trust level (kiro-cli)
     
@@ -171,9 +173,22 @@ Detailed contract: see `provider_cli_spec.md`.
   provider: llm
   system: "You are a code reviewer."
   do: "Review: $code"
+  llm_adapter: openbao
+  args: ["--timeout-seconds", "90"]
   model: claude-sonnet
   trust: all  # allow tool use
 ```
+
+Adapter resolution order:
+1. `stage.llm_adapter`
+2. `ANNA_LLM_ADAPTER`
+3. catalog `default` from `ANNA_LLM_ADAPTERS_FILE`
+
+Wrapper resolution order:
+1. `stage.exec` (if set on `provider: llm`)
+2. adapter `exec`
+3. `ANNA_LLM_WRAPPER`
+4. `./tools/anna-llm-provider`
 
 ### http
 ```yaml
