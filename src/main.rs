@@ -69,7 +69,13 @@ async fn main() -> Result<()> {
 
             let executor = Executor::new();
             let result = executor
-                .run(&wf, RunConfig { max_iterations })
+                .run(
+                    &wf,
+                    RunConfig {
+                        max_iterations,
+                        session_id_override: None,
+                    },
+                )
                 .await
                 .with_context(|| format!("workflow '{}' failed", wf.name))?;
 

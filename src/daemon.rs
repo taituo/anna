@@ -2,17 +2,19 @@ use crate::executor::{Executor, RunConfig};
 use crate::session::session_dir;
 use crate::workflow::Workflow;
 use anyhow::Result;
-use axum::extract::{Path, State};
+use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path as FsPath, PathBuf};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
+use tokio::time::{Duration, sleep};
 
 #[derive(Clone)]
 struct AppState {
@@ -45,6 +47,23 @@ struct StartWorkflowResponse {
     status: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct WsQuery {
+    id: String,
+}
+
+#[derive(Debug, Serialize)]
+struct WsLogFrame {
+    id: String,
+    status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    runtime_session_id: Option<String>,
+    #[serde(skip_serializing_if = "HashMap::is_empty", default)]
+    logs: HashMap<String, String>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    errors: Vec<String>,
+}
+
 pub async fn run_daemon(bind: &str, plays_dir: PathBuf) -> Result<()> {
     let state = AppState {
         executor: Executor::new(),
@@ -59,6 +78,7 @@ pub async fn run_daemon(bind: &str, plays_dir: PathBuf) -> Result<()> {
         .route("/workflow", post(start_workflow))
         .route("/workflow/{id}", get(workflow_status).delete(stop_workflow))
         .route("/workflow/{id}/logs", get(workflow_logs))
+        .route("/ws", get(ws_logs))
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(bind).await?;
@@ -106,13 +126,14 @@ async fn start_workflow(State(state): State<AppState>, body: String) -> impl Int
     }
 
     let req_id = crate::session::gen_session_id();
+    let runtime_session_id = crate::session::gen_session_id();
     state.sessions.write().await.insert(
         req_id.clone(),
         SessionInfo {
             id: req_id.clone(),
             status: "running".to_string(),
             workflow: workflow.name.clone(),
-            runtime_session_id: None,
+            runtime_session_id: Some(runtime_session_id.clone()),
             outputs: HashMap::new(),
             errors: Vec::new(),
         },
@@ -127,6 +148,7 @@ async fn start_workflow(State(state): State<AppState>, body: String) -> impl Int
                 &workflow,
                 RunConfig {
                     max_iterations: None,
+                    session_id_override: Some(runtime_session_id.clone()),
                 },
             )
             .await;
@@ -215,6 +237,14 @@ async fn workflow_logs(State(state): State<AppState>, Path(id): Path<String>) ->
     }
 }
 
+async fn ws_logs(
+    State(state): State<AppState>,
+    Query(query): Query<WsQuery>,
+    ws: WebSocketUpgrade,
+) -> impl IntoResponse {
+    ws.on_upgrade(move |socket| stream_logs(socket, state, query.id))
+}
+
 async fn find_workflows(root: &FsPath) -> Result<Vec<String>> {
     let mut out = Vec::new();
     let mut dir = tokio::fs::read_dir(root).await?;
@@ -257,4 +287,61 @@ async fn read_session_logs(runtime_session_id: &str) -> Result<HashMap<String, S
         }
     }
     Ok(out)
+}
+
+async fn stream_logs(mut socket: WebSocket, state: AppState, req_id: String) {
+    let mut last_payload = String::new();
+
+    loop {
+        let (payload, should_close) = build_ws_payload(&state, &req_id).await;
+        if payload != last_payload {
+            if socket
+                .send(Message::Text(payload.clone().into()))
+                .await
+                .is_err()
+            {
+                return;
+            }
+            last_payload = payload;
+        }
+
+        if should_close {
+            return;
+        }
+        sleep(Duration::from_millis(700)).await;
+    }
+}
+
+async fn build_ws_payload(state: &AppState, req_id: &str) -> (String, bool) {
+    let info = { state.sessions.read().await.get(req_id).cloned() };
+    let Some(info) = info else {
+        let frame = WsLogFrame {
+            id: req_id.to_string(),
+            status: "not_found".to_string(),
+            runtime_session_id: None,
+            logs: HashMap::new(),
+            errors: vec!["session not found".to_string()],
+        };
+        return (to_json(frame), true);
+    };
+
+    let logs = match info.runtime_session_id.as_deref() {
+        Some(runtime) => read_session_logs(runtime).await.unwrap_or_default(),
+        None => HashMap::new(),
+    };
+    let should_close = matches!(info.status.as_str(), "done" | "failed" | "stopped");
+    let frame = WsLogFrame {
+        id: info.id,
+        status: info.status,
+        runtime_session_id: info.runtime_session_id,
+        logs,
+        errors: info.errors,
+    };
+    (to_json(frame), should_close)
+}
+
+fn to_json(frame: WsLogFrame) -> String {
+    serde_json::to_string(&frame).unwrap_or_else(|_| {
+        "{\"status\":\"error\",\"errors\":[\"serialization error\"]}".to_string()
+    })
 }

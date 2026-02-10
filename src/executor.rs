@@ -12,6 +12,7 @@ use tokio::time::sleep;
 #[derive(Debug, Clone, Default)]
 pub struct RunConfig {
     pub max_iterations: Option<u32>,
+    pub session_id_override: Option<String>,
 }
 
 #[derive(Clone, Default)]
@@ -47,6 +48,10 @@ impl Executor {
         parent_id: Option<String>,
     ) -> Result<RunResult> {
         let mut result = RunResult::new();
+        if let Some(session_id) = config.session_id_override.clone() {
+            result.session_id = session_id.clone();
+            result.outputs.insert("SESSION".to_string(), session_id);
+        }
         result.parent_id = parent_id;
         let mut iterations = 0_u32;
 
@@ -209,6 +214,7 @@ impl Executor {
                 &child_wf,
                 RunConfig {
                     max_iterations: Some(1),
+                    session_id_override: None,
                 },
                 Some(result.session_id.clone()),
             )
@@ -558,6 +564,7 @@ mod tests {
                 &wf,
                 RunConfig {
                     max_iterations: Some(1),
+                    session_id_override: None,
                 },
             )
             .await
@@ -604,6 +611,7 @@ mod tests {
                 &wf,
                 RunConfig {
                     max_iterations: Some(1),
+                    session_id_override: None,
                 },
             )
             .await
@@ -661,6 +669,7 @@ mod tests {
                 &wf,
                 RunConfig {
                     max_iterations: Some(1),
+                    session_id_override: None,
                 },
             )
             .await
@@ -702,6 +711,7 @@ mod tests {
                 &wf1,
                 RunConfig {
                     max_iterations: Some(1),
+                    session_id_override: None,
                 },
             )
             .await
@@ -729,6 +739,7 @@ mod tests {
                 &wf2,
                 RunConfig {
                     max_iterations: Some(1),
+                    session_id_override: None,
                 },
             )
             .await
