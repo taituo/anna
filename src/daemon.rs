@@ -109,6 +109,14 @@ struct HitlResolveBody {
 }
 
 #[derive(Debug, Deserialize, Default)]
+struct HitlListQuery {
+    status: Option<String>,
+    session_id: Option<String>,
+    workflow: Option<String>,
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize, Default)]
 struct SessionsQuery {
     status: Option<String>,
     limit: Option<usize>,
@@ -458,10 +466,15 @@ async fn workflow_logs(
     }
 }
 
-async fn list_hitl(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
+async fn list_hitl(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<HitlListQuery>,
+) -> impl IntoResponse {
     if let Some(resp) = ensure_authorized(&state, &headers) {
         return resp;
     }
+
     let mut out = state
         .hitl
         .read()
@@ -469,7 +482,19 @@ async fn list_hitl(State(state): State<AppState>, headers: HeaderMap) -> impl In
         .values()
         .cloned()
         .collect::<Vec<_>>();
+    if let Some(filter) = query.status.as_deref() {
+        out.retain(|v| status_matches(&v.status, filter));
+    }
+    if let Some(session_filter) = query.session_id.as_deref() {
+        out.retain(|v| v.session_id == session_filter);
+    }
+    if let Some(workflow_filter) = query.workflow.as_deref() {
+        out.retain(|v| v.workflow.eq_ignore_ascii_case(workflow_filter.trim()));
+    }
     out.sort_by_key(|v| v.created_at);
+    if let Some(limit) = query.limit {
+        out.truncate(limit);
+    }
     Json(out).into_response()
 }
 
@@ -1059,7 +1084,7 @@ async fn launch_workflow(state: &AppState, workflow: Workflow) -> Result<String>
 mod tests {
     use super::{
         DaemonHitl, HitlPending, collect_watch_snapshot, find_workflow_entries, is_authorized,
-        resolve_registered_workflow_path, resolve_watch_pattern,
+        resolve_registered_workflow_path, resolve_watch_pattern, status_matches,
     };
     use crate::executor::{HitlHandler, HitlRequest};
     use axum::http::{HeaderMap, HeaderValue};
@@ -1248,8 +1273,8 @@ mod tests {
 
     #[test]
     fn status_filter_is_case_insensitive_exact_match() {
-        assert!(super::status_matches("running", "RUNNING"));
-        assert!(super::status_matches("failed", " failed "));
-        assert!(!super::status_matches("running", "run"));
+        assert!(status_matches("running", "RUNNING"));
+        assert!(status_matches("failed", " failed "));
+        assert!(!status_matches("running", "run"));
     }
 }

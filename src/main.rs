@@ -144,6 +144,18 @@ enum HitlCommands {
         /// Daemon base URL
         #[arg(long, default_value = "http://127.0.0.1:8080")]
         daemon: String,
+        /// Optional status filter, e.g. pending|resolved
+        #[arg(long)]
+        status: Option<String>,
+        /// Optional workflow session id filter
+        #[arg(long)]
+        session_id: Option<String>,
+        /// Optional workflow name filter
+        #[arg(long)]
+        workflow: Option<String>,
+        /// Optional max rows
+        #[arg(long)]
+        limit: Option<usize>,
     },
     /// Resolve HITL request by id
     Resolve {
@@ -319,10 +331,29 @@ async fn main() -> Result<()> {
             print_response(response).await
         }
         Commands::Hitl { command } => match command {
-            HitlCommands::List { daemon } => {
+            HitlCommands::List {
+                daemon,
+                status,
+                session_id,
+                workflow,
+                limit,
+            } => {
                 let daemon = normalize_daemon_url(&daemon);
                 let client = Client::new();
-                let response = with_daemon_auth(client.get(format!("{}/hitl", daemon)))
+                let mut req = with_daemon_auth(client.get(format!("{}/hitl", daemon)));
+                if let Some(status) = status {
+                    req = req.query(&[("status", status)]);
+                }
+                if let Some(session_id) = session_id {
+                    req = req.query(&[("session_id", session_id)]);
+                }
+                if let Some(workflow) = workflow {
+                    req = req.query(&[("workflow", workflow)]);
+                }
+                if let Some(limit) = limit {
+                    req = req.query(&[("limit", limit)]);
+                }
+                let response = req
                     .send()
                     .await
                     .with_context(|| format!("failed querying hitl at {}", daemon))?;

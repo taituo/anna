@@ -45,6 +45,7 @@ anna status <request_id>
 anna sessions --status running
 anna wait <request_id> --timeout-sec 300
 anna hitl list
+anna hitl list --status pending --workflow my-flow
 ```
 
 Optional daemon auth:
