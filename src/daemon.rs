@@ -31,6 +31,7 @@ struct AppState {
     handles: Arc<RwLock<HashMap<String, JoinHandle<()>>>>,
     hitl: Arc<RwLock<HashMap<String, HitlPending>>>,
     auth_token: Option<String>,
+    retention: RetentionConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -152,29 +153,40 @@ struct DaemonStateSnapshot {
     saved_at: u64,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct RetentionConfig {
+    max_sessions: usize,
+    max_hitl: usize,
+}
+
 #[derive(Clone)]
 struct DaemonHitl {
     pending: Arc<RwLock<HashMap<String, HitlPending>>>,
+    max_hitl: usize,
 }
 
 #[async_trait]
 impl HitlHandler for DaemonHitl {
     async fn await_decision(&self, request: HitlRequest) -> Result<String> {
         let request_id = crate::session::gen_session_id();
-        self.pending.write().await.insert(
-            request_id.clone(),
-            HitlPending {
-                id: request_id.clone(),
-                session_id: request.session_id,
-                workflow: request.workflow,
-                stage_id: request.stage_id,
-                prompt: request.prompt,
-                options: request.options,
-                status: "pending".to_string(),
-                decision: None,
-                created_at: now_unix_secs(),
-            },
-        );
+        {
+            let mut pending = self.pending.write().await;
+            pending.insert(
+                request_id.clone(),
+                HitlPending {
+                    id: request_id.clone(),
+                    session_id: request.session_id,
+                    workflow: request.workflow,
+                    stage_id: request.stage_id,
+                    prompt: request.prompt,
+                    options: request.options,
+                    status: "pending".to_string(),
+                    decision: None,
+                    created_at: now_unix_secs(),
+                },
+            );
+            prune_hitl_in_place(&mut pending, self.max_hitl);
+        }
 
         loop {
             let state = self.pending.read().await.get(&request_id).cloned();
@@ -191,6 +203,7 @@ impl HitlHandler for DaemonHitl {
 
 pub async fn run_daemon(bind: &str, plays_dir: PathBuf) -> Result<()> {
     let state_file = daemon_state_file();
+    let retention = daemon_retention_config();
     let (sessions_seed, hitl_seed) = match state_file.as_ref() {
         Some(path) => load_daemon_state(path).await?,
         None => (HashMap::new(), HashMap::new()),
@@ -199,6 +212,7 @@ pub async fn run_daemon(bind: &str, plays_dir: PathBuf) -> Result<()> {
     let hitl = Arc::new(RwLock::new(hitl_seed));
     let executor = Executor::new().with_hitl_handler(Arc::new(DaemonHitl {
         pending: hitl.clone(),
+        max_hitl: retention.max_hitl,
     }));
     let state = AppState {
         executor,
@@ -207,6 +221,7 @@ pub async fn run_daemon(bind: &str, plays_dir: PathBuf) -> Result<()> {
         handles: Arc::new(RwLock::new(HashMap::new())),
         hitl: hitl.clone(),
         auth_token: daemon_auth_token(),
+        retention,
     };
     tokio::spawn(trigger_scheduler_loop(state.clone()));
     if let Some(path) = state_file {
@@ -452,10 +467,17 @@ async fn stop_workflow(
     drop(handles);
 
     let mut sessions = state.sessions.write().await;
-    if let Some(info) = sessions.get_mut(&id) {
-        info.status = if stopped { "stopped" } else { "not_running" }.to_string();
-        info.updated_at = now_unix_secs();
-        return (StatusCode::OK, Json(info.clone())).into_response();
+    if sessions.contains_key(&id) {
+        let updated = {
+            let info = sessions
+                .get_mut(&id)
+                .expect("session exists after contains_key check");
+            info.status = if stopped { "stopped" } else { "not_running" }.to_string();
+            info.updated_at = now_unix_secs();
+            info.clone()
+        };
+        prune_sessions_in_place(&mut sessions, state.retention.max_sessions);
+        return (StatusCode::OK, Json(updated)).into_response();
     }
 
     (StatusCode::NOT_FOUND, "session not found").into_response()
@@ -586,12 +608,19 @@ async fn resolve_hitl(
     }
 
     let mut pending = state.hitl.write().await;
-    let Some(item) = pending.get_mut(&id) else {
+    if !pending.contains_key(&id) {
         return (StatusCode::NOT_FOUND, "hitl request not found").into_response();
+    }
+    let updated = {
+        let item = pending
+            .get_mut(&id)
+            .expect("hitl request exists after contains_key check");
+        item.decision = Some(decision);
+        item.status = "resolved".to_string();
+        item.clone()
     };
-    item.decision = Some(decision);
-    item.status = "resolved".to_string();
-    (StatusCode::OK, Json(item.clone())).into_response()
+    prune_hitl_in_place(&mut pending, state.retention.max_hitl);
+    (StatusCode::OK, Json(updated)).into_response()
 }
 
 async fn ws_logs(
@@ -872,6 +901,21 @@ fn daemon_auth_token() -> Option<String> {
         .filter(|v| !v.is_empty())
 }
 
+fn daemon_retention_config() -> RetentionConfig {
+    RetentionConfig {
+        max_sessions: env_usize_or("ANNA_DAEMON_MAX_SESSIONS", 2000),
+        max_hitl: env_usize_or("ANNA_DAEMON_MAX_HITL", 2000),
+    }
+}
+
+fn env_usize_or(name: &str, default: usize) -> usize {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|v| *v >= 1)
+        .unwrap_or(default)
+}
+
 fn daemon_state_file() -> Option<PathBuf> {
     if let Ok(raw) = std::env::var("ANNA_DAEMON_STATE_FILE") {
         let trimmed = raw.trim();
@@ -971,6 +1015,52 @@ fn temp_state_path(path: &FsPath) -> PathBuf {
         return tmp;
     }
     path.with_extension("tmp")
+}
+
+fn prune_sessions_in_place(sessions: &mut HashMap<String, SessionInfo>, max_sessions: usize) {
+    if max_sessions == 0 || sessions.len() <= max_sessions {
+        return;
+    }
+
+    let mut removable = sessions
+        .iter()
+        .filter(|(_, s)| s.status != "running")
+        .map(|(id, s)| (id.clone(), s.updated_at))
+        .collect::<Vec<_>>();
+    removable.sort_by_key(|(_, updated_at)| *updated_at);
+
+    let mut remove_count = sessions.len().saturating_sub(max_sessions);
+    for (id, _) in removable {
+        if remove_count == 0 {
+            break;
+        }
+        if sessions.remove(&id).is_some() {
+            remove_count -= 1;
+        }
+    }
+}
+
+fn prune_hitl_in_place(hitl: &mut HashMap<String, HitlPending>, max_hitl: usize) {
+    if max_hitl == 0 || hitl.len() <= max_hitl {
+        return;
+    }
+
+    let mut removable = hitl
+        .iter()
+        .filter(|(_, h)| h.status == "resolved")
+        .map(|(id, h)| (id.clone(), h.created_at))
+        .collect::<Vec<_>>();
+    removable.sort_by_key(|(_, created_at)| *created_at);
+
+    let mut remove_count = hitl.len().saturating_sub(max_hitl);
+    for (id, _) in removable {
+        if remove_count == 0 {
+            break;
+        }
+        if hitl.remove(&id).is_some() {
+            remove_count -= 1;
+        }
+    }
 }
 
 fn ensure_authorized(state: &AppState, headers: &HeaderMap) -> Option<axum::response::Response> {
@@ -1215,19 +1305,23 @@ async fn launch_workflow(state: &AppState, workflow: Workflow) -> Result<String>
     let req_id = crate::session::gen_session_id();
     let runtime_session_id = crate::session::gen_session_id();
     let now = now_unix_secs();
-    state.sessions.write().await.insert(
-        req_id.clone(),
-        SessionInfo {
-            id: req_id.clone(),
-            status: "running".to_string(),
-            workflow: workflow.name.clone(),
-            created_at: now,
-            updated_at: now,
-            runtime_session_id: Some(runtime_session_id.clone()),
-            outputs: HashMap::new(),
-            errors: Vec::new(),
-        },
-    );
+    {
+        let mut sessions = state.sessions.write().await;
+        sessions.insert(
+            req_id.clone(),
+            SessionInfo {
+                id: req_id.clone(),
+                status: "running".to_string(),
+                workflow: workflow.name.clone(),
+                created_at: now,
+                updated_at: now,
+                runtime_session_id: Some(runtime_session_id.clone()),
+                outputs: HashMap::new(),
+                errors: Vec::new(),
+            },
+        );
+        prune_sessions_in_place(&mut sessions, state.retention.max_sessions);
+    }
 
     let state_for_task = state.clone();
     let req_id_for_task = req_id.clone();
@@ -1260,6 +1354,7 @@ async fn launch_workflow(state: &AppState, workflow: Workflow) -> Result<String>
                 }
             }
         }
+        prune_sessions_in_place(&mut sessions, state_for_task.retention.max_sessions);
         drop(sessions);
         state_for_task
             .handles
@@ -1275,8 +1370,9 @@ async fn launch_workflow(state: &AppState, workflow: Workflow) -> Result<String>
 mod tests {
     use super::{
         DaemonHitl, DaemonStateSnapshot, HitlPending, SessionInfo, collect_watch_snapshot,
-        find_workflow_entries, is_authorized, load_daemon_state, resolve_registered_workflow_path,
-        resolve_watch_pattern, status_matches, temp_state_path,
+        find_workflow_entries, is_authorized, load_daemon_state, prune_hitl_in_place,
+        prune_sessions_in_place, resolve_registered_workflow_path, resolve_watch_pattern,
+        status_matches, temp_state_path,
     };
     use crate::executor::{HitlHandler, HitlRequest};
     use axum::http::{HeaderMap, HeaderValue};
@@ -1398,6 +1494,7 @@ mod tests {
         let pending = Arc::new(RwLock::new(HashMap::<String, HitlPending>::new()));
         let handler = DaemonHitl {
             pending: pending.clone(),
+            max_hitl: 32,
         };
 
         let waiter = tokio::spawn(async move {
@@ -1523,5 +1620,106 @@ mod tests {
             temp_state_path(&p),
             std::path::PathBuf::from("/tmp/anna-state.json.tmp")
         );
+    }
+
+    #[test]
+    fn prune_sessions_removes_oldest_non_running_first() {
+        let mut sessions = HashMap::new();
+        sessions.insert(
+            "running".to_string(),
+            SessionInfo {
+                id: "running".to_string(),
+                status: "running".to_string(),
+                workflow: "wf".to_string(),
+                created_at: 1,
+                updated_at: 1,
+                runtime_session_id: None,
+                outputs: HashMap::new(),
+                errors: vec![],
+            },
+        );
+        sessions.insert(
+            "old".to_string(),
+            SessionInfo {
+                id: "old".to_string(),
+                status: "done".to_string(),
+                workflow: "wf".to_string(),
+                created_at: 1,
+                updated_at: 1,
+                runtime_session_id: None,
+                outputs: HashMap::new(),
+                errors: vec![],
+            },
+        );
+        sessions.insert(
+            "new".to_string(),
+            SessionInfo {
+                id: "new".to_string(),
+                status: "failed".to_string(),
+                workflow: "wf".to_string(),
+                created_at: 2,
+                updated_at: 2,
+                runtime_session_id: None,
+                outputs: HashMap::new(),
+                errors: vec![],
+            },
+        );
+
+        prune_sessions_in_place(&mut sessions, 2);
+        assert!(sessions.contains_key("running"));
+        assert!(sessions.contains_key("new"));
+        assert!(!sessions.contains_key("old"));
+    }
+
+    #[test]
+    fn prune_hitl_prefers_resolved_items() {
+        let mut hitl = HashMap::new();
+        hitl.insert(
+            "pending".to_string(),
+            HitlPending {
+                id: "pending".to_string(),
+                session_id: "s".to_string(),
+                workflow: "w".to_string(),
+                stage_id: "x".to_string(),
+                prompt: None,
+                options: vec![],
+                status: "pending".to_string(),
+                decision: None,
+                created_at: 1,
+            },
+        );
+        hitl.insert(
+            "resolved-old".to_string(),
+            HitlPending {
+                id: "resolved-old".to_string(),
+                session_id: "s".to_string(),
+                workflow: "w".to_string(),
+                stage_id: "x".to_string(),
+                prompt: None,
+                options: vec![],
+                status: "resolved".to_string(),
+                decision: Some("approve".to_string()),
+                created_at: 1,
+            },
+        );
+        hitl.insert(
+            "resolved-new".to_string(),
+            HitlPending {
+                id: "resolved-new".to_string(),
+                session_id: "s".to_string(),
+                workflow: "w".to_string(),
+                stage_id: "x".to_string(),
+                prompt: None,
+                options: vec![],
+                status: "resolved".to_string(),
+                decision: Some("approve".to_string()),
+                created_at: 2,
+            },
+        );
+
+        prune_hitl_in_place(&mut hitl, 2);
+        assert!(hitl.contains_key("pending"));
+        assert!(hitl.contains_key("resolved-new"));
+        assert!(!hitl.contains_key("resolved-old"));
     }
 }
