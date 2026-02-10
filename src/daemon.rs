@@ -735,6 +735,25 @@ async fn start_workflow(
     if workflow.workdir.is_none() {
         workflow.workdir = Some(state.plays_dir.display().to_string());
     }
+    if let Some(allowed) = state.allowed_providers.as_ref() {
+        let required = collect_required_providers(&workflow);
+        let mut missing = required
+            .into_iter()
+            .filter(|provider| !allowed.contains(provider))
+            .collect::<Vec<_>>();
+        missing.sort();
+        missing.dedup();
+        if !missing.is_empty() {
+            return (
+                StatusCode::FORBIDDEN,
+                format!(
+                    "workflow requires blocked providers: {}",
+                    missing.join(", ")
+                ),
+            )
+                .into_response();
+        }
+    }
 
     let req_id = match launch_workflow(&state, workflow, None, None).await {
         Ok(v) => v,
