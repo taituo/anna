@@ -114,9 +114,14 @@ impl Executor {
         stage: &Stage,
         result: &mut RunResult,
     ) -> Result<bool> {
-        let (runtime_stage, worktree) = self
-            .prepare_stage_with_worktree(workflow, stage, &result.outputs)
-            .await?;
+        let parallel_stage =
+            stage.forks.unwrap_or(0) > 0 || !stage.each.is_empty() || stage.each_from.is_some();
+        let (runtime_stage, worktree) = if parallel_stage && stage.worktree.is_some() {
+            (stage.clone(), None)
+        } else {
+            self.prepare_stage_with_worktree(workflow, stage, &result.outputs)
+                .await?
+        };
 
         let stage_result = async {
             let mut iteration = 0_u32;
@@ -291,6 +296,42 @@ impl Executor {
         ))
     }
 
+    async fn execute_with_optional_worktree(
+        &self,
+        workflow: &Workflow,
+        stage: &Stage,
+        vars: &HashMap<String, String>,
+        outputs: &HashMap<String, String>,
+    ) -> Result<String, ProviderError> {
+        let (runtime_stage, worktree) = self
+            .prepare_stage_with_worktree(workflow, stage, outputs)
+            .await
+            .map_err(|err| {
+                ProviderError::new(
+                    "provider_exec_failed",
+                    format!("stage '{}' worktree setup failed: {}", stage.id, err),
+                )
+            })?;
+
+        let run = self
+            .execute_with_retry(workflow, &runtime_stage, vars, outputs)
+            .await;
+        let cleanup_error = if let Some(worktree) = worktree {
+            cleanup_worktree(&worktree).await.err()
+        } else {
+            None
+        };
+
+        match (run, cleanup_error) {
+            (Err(err), _) => Err(err),
+            (Ok(_), Some(err)) => Err(ProviderError::new(
+                "provider_exec_failed",
+                format!("stage '{}' worktree cleanup failed: {}", stage.id, err),
+            )),
+            (Ok(out), None) => Ok(out),
+        }
+    }
+
     async fn execute_stage(
         &self,
         workflow: &Workflow,
@@ -411,13 +452,17 @@ impl Executor {
             if !stage.models.is_empty() {
                 fork_stage.model = Some(stage.models[(i as usize) % stage.models.len()].clone());
             }
+            if let Some(base_worktree) = stage.worktree.as_ref() {
+                fork_stage.worktree = Some(format!("{}-fork-{}", base_worktree, i));
+                fork_stage.workdir = None;
+            }
             let worker = self.clone();
             let workflow_for_task = workflow_snapshot.clone();
             let vars_for_task = workflow.vars.clone();
             let outputs_for_task = outputs_snapshot.clone();
             join_set.spawn(async move {
                 let out = worker
-                    .execute_with_retry(
+                    .execute_with_optional_worktree(
                         &workflow_for_task,
                         &fork_stage,
                         &vars_for_task,
@@ -521,6 +566,10 @@ impl Executor {
             each_stage.each.clear();
             each_stage.each_from = None;
             each_stage.vote = None;
+            if let Some(base_worktree) = stage.worktree.as_ref() {
+                each_stage.worktree = Some(format!("{}-each-{}", base_worktree, idx));
+                each_stage.workdir = None;
+            }
 
             let mut vars = workflow.vars.clone();
             vars.insert("each".to_string(), item.clone());
@@ -529,7 +578,12 @@ impl Executor {
             let outputs_for_task = outputs_snapshot.clone();
             join_set.spawn(async move {
                 let out = worker
-                    .execute_with_retry(&workflow_for_task, &each_stage, &vars, &outputs_for_task)
+                    .execute_with_optional_worktree(
+                        &workflow_for_task,
+                        &each_stage,
+                        &vars,
+                        &outputs_for_task,
+                    )
                     .await;
                 (idx, out)
             });
@@ -1324,6 +1378,107 @@ mod tests {
             "worktree path should be cleaned up: {}",
             worktree_path.display()
         );
+    }
+
+    #[tokio::test]
+    async fn forks_with_worktree_use_distinct_paths() {
+        let repo = std::env::temp_dir().join(format!(
+            "anna-worktree-forks-{}-{}",
+            std::process::id(),
+            rand::random::<u32>()
+        ));
+        tokio::fs::create_dir_all(&repo)
+            .await
+            .expect("create temp repo");
+        tokio::fs::write(repo.join("README.md"), "init\n")
+            .await
+            .expect("write init file");
+
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .arg("init")
+            .arg("-b")
+            .arg("main")
+            .status()
+            .expect("git init should run");
+        assert!(status.success(), "git init should succeed");
+
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .arg("add")
+            .arg("README.md")
+            .status()
+            .expect("git add should run");
+        assert!(status.success(), "git add should succeed");
+
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .arg("-c")
+            .arg("user.email=test@example.com")
+            .arg("-c")
+            .arg("user.name=Anna Test")
+            .arg("commit")
+            .arg("-m")
+            .arg("init")
+            .status()
+            .expect("git commit should run");
+        assert!(status.success(), "git commit should succeed");
+
+        let wf = Workflow {
+            name: "worktree-forks-test".into(),
+            mode: "once".into(),
+            memory: false,
+            tags: vec![],
+            vars: Default::default(),
+            env: Default::default(),
+            workdir: Some(repo.display().to_string()),
+            trigger: Default::default(),
+            stages: vec![Stage {
+                id: "wtf".into(),
+                provider: "shell".into(),
+                exec: Some("pwd".into()),
+                forks: Some(2),
+                worktree: Some("feat".into()),
+                ..Default::default()
+            }],
+            source_path: None,
+        };
+
+        let res = Executor::new()
+            .run(
+                &wf,
+                RunConfig {
+                    max_iterations: Some(1),
+                    session_id_override: None,
+                },
+            )
+            .await
+            .expect("workflow should run");
+
+        let out0 = res.outputs.get("wtf.0").cloned().unwrap_or_default();
+        let out1 = res.outputs.get("wtf.1").cloned().unwrap_or_default();
+        assert_ne!(out0, out1, "fork worktrees should be distinct");
+
+        let expected0 = format!(
+            "worktree-{}-{}",
+            sanitize_token("wtf"),
+            sanitize_token("feat-fork-0")
+        );
+        let expected1 = format!(
+            "worktree-{}-{}",
+            sanitize_token("wtf"),
+            sanitize_token("feat-fork-1")
+        );
+        assert!(out0.contains(&expected0), "fork 0 path mismatch: {}", out0);
+        assert!(out1.contains(&expected1), "fork 1 path mismatch: {}", out1);
+
+        let path0 = session_dir(&res.session_id).join(expected0);
+        let path1 = session_dir(&res.session_id).join(expected1);
+        assert!(!path0.exists(), "fork 0 worktree should be cleaned");
+        assert!(!path1.exists(), "fork 1 worktree should be cleaned");
     }
 
     #[tokio::test]
