@@ -29,6 +29,7 @@ struct AppState {
     plays_dir: PathBuf,
     registry_file: Option<PathBuf>,
     node_capabilities: HashSet<String>,
+    owner_policy: OwnerConcurrencyPolicy,
     sessions: Arc<RwLock<HashMap<String, SessionInfo>>>,
     handles: Arc<RwLock<HashMap<String, JoinHandle<()>>>>,
     hitl: Arc<RwLock<HashMap<String, HitlPending>>>,
@@ -41,6 +42,8 @@ struct SessionInfo {
     id: String,
     status: String,
     workflow: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    owner: Option<String>,
     created_at: u64,
     updated_at: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -117,6 +120,12 @@ struct WorkflowMetaResponse {
     version: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     max_concurrency: Option<u32>,
+    running: usize,
+    concurrency_blocked: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    owner_max_concurrency: Option<u32>,
+    owner_running: usize,
+    owner_concurrency_blocked: bool,
     available: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     missing_capabilities: Vec<String>,
@@ -136,11 +145,17 @@ struct FlowCheckResponse {
     workflow: String,
     file: String,
     path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    owner: Option<String>,
     can_run: bool,
     running: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     max_concurrency: Option<u32>,
     concurrency_blocked: bool,
+    owner_running: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    owner_max_concurrency: Option<u32>,
+    owner_concurrency_blocked: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     missing_capabilities: Vec<String>,
 }
@@ -260,6 +275,12 @@ struct RetentionConfig {
     max_hitl: usize,
 }
 
+#[derive(Debug, Clone, Default)]
+struct OwnerConcurrencyPolicy {
+    per_owner: HashMap<String, usize>,
+    default_limit: Option<usize>,
+}
+
 #[derive(Clone)]
 struct DaemonHitl {
     pending: Arc<RwLock<HashMap<String, HitlPending>>>,
@@ -307,6 +328,7 @@ pub async fn run_daemon(bind: &str, plays_dir: PathBuf) -> Result<()> {
     let registry_file = flow_registry_file();
     let retention = daemon_retention_config();
     let node_capabilities = daemon_node_capabilities();
+    let owner_policy = daemon_owner_concurrency_policy();
     let (sessions_seed, hitl_seed) = match state_file.as_ref() {
         Some(path) => load_daemon_state(path).await?,
         None => (HashMap::new(), HashMap::new()),
@@ -322,6 +344,7 @@ pub async fn run_daemon(bind: &str, plays_dir: PathBuf) -> Result<()> {
         plays_dir,
         registry_file: registry_file.clone(),
         node_capabilities: node_capabilities.clone(),
+        owner_policy: owner_policy.clone(),
         sessions: Arc::new(RwLock::new(sessions_seed)),
         handles: Arc::new(RwLock::new(HashMap::new())),
         hitl: hitl.clone(),
@@ -343,6 +366,18 @@ pub async fn run_daemon(bind: &str, plays_dir: PathBuf) -> Result<()> {
         let mut capabilities = node_capabilities.iter().cloned().collect::<Vec<_>>();
         capabilities.sort();
         println!("anna-rs node capabilities: {}", capabilities.join(","));
+    }
+    if !owner_policy.per_owner.is_empty() || owner_policy.default_limit.is_some() {
+        let mut entries = owner_policy
+            .per_owner
+            .iter()
+            .map(|(owner, limit)| format!("{}={}", owner, limit))
+            .collect::<Vec<_>>();
+        entries.sort();
+        if let Some(default_limit) = owner_policy.default_limit {
+            entries.push(format!("*={}", default_limit));
+        }
+        println!("anna-rs owner concurrency policy: {}", entries.join(","));
     }
 
     let app = Router::new()
@@ -449,11 +484,30 @@ async fn list_workflows_meta(
         .as_deref()
         .map(|v| v.trim().to_ascii_lowercase());
     let available_filter = query.available;
+    let sessions = state.sessions.read().await;
+    let (running_by_workflow, running_by_owner) = build_running_indexes(&sessions);
+    drop(sessions);
 
     let mut out = entries
         .into_iter()
         .map(|entry| {
-            let missing = missing_required_capabilities(&entry, &state.node_capabilities);
+            let running = running_by_workflow
+                .get(&entry.workflow_name)
+                .copied()
+                .unwrap_or(0);
+            let owner_running = owner_key(entry.owner.as_deref())
+                .and_then(|key| running_by_owner.get(&key).copied())
+                .unwrap_or(0);
+            let owner_max_concurrency =
+                owner_limit_for(entry.owner.as_deref(), &state.owner_policy);
+            let readiness = evaluate_flow_readiness(
+                &entry,
+                &state.node_capabilities,
+                running,
+                None,
+                owner_running,
+                owner_max_concurrency,
+            );
             WorkflowMetaResponse {
                 id: workflow_public_id(&entry),
                 workflow: entry.workflow_name,
@@ -464,8 +518,13 @@ async fn list_workflows_meta(
                 owner: entry.owner,
                 version: entry.version,
                 max_concurrency: entry.max_concurrency,
-                available: missing.is_empty(),
-                missing_capabilities: missing,
+                running: readiness.running,
+                concurrency_blocked: readiness.concurrency_blocked,
+                owner_max_concurrency: readiness.owner_max_concurrency.map(|v| v as u32),
+                owner_running: readiness.owner_running,
+                owner_concurrency_blocked: readiness.owner_concurrency_blocked,
+                available: readiness.can_run(),
+                missing_capabilities: readiness.missing_capabilities,
                 trigger_webhook: entry.trigger_webhook,
                 trigger_watch: entry.trigger_watch,
                 trigger_cron: entry.trigger_cron,
@@ -545,7 +604,7 @@ async fn start_workflow(
         workflow.workdir = Some(state.plays_dir.display().to_string());
     }
 
-    let req_id = match launch_workflow(&state, workflow, None).await {
+    let req_id = match launch_workflow(&state, workflow, None, None).await {
         Ok(v) => v,
         Err(err) => {
             return (
@@ -595,8 +654,16 @@ async fn run_registered_workflow(
                 .into_response();
         }
     };
-    let running = running_workflow_count(&state, &entry.workflow_name).await;
-    let readiness = evaluate_flow_readiness(&entry, &state.node_capabilities, running, None);
+    let (running, owner_running) = running_counts_for_entry(&state, &entry).await;
+    let owner_max_concurrency = owner_limit_for(entry.owner.as_deref(), &state.owner_policy);
+    let readiness = evaluate_flow_readiness(
+        &entry,
+        &state.node_capabilities,
+        running,
+        None,
+        owner_running,
+        owner_max_concurrency,
+    );
     if !readiness.missing_capabilities.is_empty() {
         return (
             StatusCode::FORBIDDEN,
@@ -604,6 +671,19 @@ async fn run_registered_workflow(
                 "workflow '{}' requires missing capabilities: {}",
                 name,
                 readiness.missing_capabilities.join(", ")
+            ),
+        )
+            .into_response();
+    }
+    if readiness.owner_concurrency_blocked {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            format!(
+                "workflow '{}' owner concurrency limit reached: owner='{}' running={} max_concurrency={}",
+                name,
+                entry.owner.as_deref().unwrap_or(""),
+                readiness.owner_running,
+                readiness.owner_max_concurrency.unwrap_or(0)
             ),
         )
             .into_response();
@@ -636,7 +716,8 @@ async fn run_registered_workflow(
     }
     workflow.vars.extend(options.vars);
 
-    let req_id = match launch_workflow(&state, workflow, options.max_iterations).await {
+    let req_id = match launch_workflow(&state, workflow, options.max_iterations, entry.owner).await
+    {
         Ok(v) => v,
         Err(err) => {
             return (
@@ -684,8 +765,16 @@ async fn check_registered_workflow(
         }
     };
 
-    let running = running_workflow_count(&state, &entry.workflow_name).await;
-    let readiness = evaluate_flow_readiness(&entry, &state.node_capabilities, running, None);
+    let (running, owner_running) = running_counts_for_entry(&state, &entry).await;
+    let owner_max_concurrency = owner_limit_for(entry.owner.as_deref(), &state.owner_policy);
+    let readiness = evaluate_flow_readiness(
+        &entry,
+        &state.node_capabilities,
+        running,
+        None,
+        owner_running,
+        owner_max_concurrency,
+    );
     (
         StatusCode::OK,
         Json(FlowCheckResponse {
@@ -693,10 +782,14 @@ async fn check_registered_workflow(
             workflow: entry.workflow_name,
             file: entry.file_name,
             path: entry.path.display().to_string(),
+            owner: entry.owner,
             can_run: readiness.can_run(),
             running: readiness.running,
             max_concurrency: readiness.max_concurrency.map(|v| v as u32),
             concurrency_blocked: readiness.concurrency_blocked,
+            owner_running: readiness.owner_running,
+            owner_max_concurrency: readiness.owner_max_concurrency.map(|v| v as u32),
+            owner_concurrency_blocked: readiness.owner_concurrency_blocked,
             missing_capabilities: readiness.missing_capabilities,
         }),
     )
@@ -1252,16 +1345,24 @@ fn evaluate_flow_readiness(
     node_capabilities: &HashSet<String>,
     running: usize,
     default_max_concurrency: Option<usize>,
+    owner_running: usize,
+    owner_max_concurrency: Option<usize>,
 ) -> FlowReadiness {
     let missing_capabilities = missing_required_capabilities(entry, node_capabilities);
     let max_concurrency = normalize_max_concurrency(entry.max_concurrency)
         .or(default_max_concurrency.filter(|v| *v >= 1));
     let concurrency_blocked = max_concurrency.map(|max| running >= max).unwrap_or(false);
+    let owner_concurrency_blocked = owner_max_concurrency
+        .map(|max| owner_running >= max)
+        .unwrap_or(false);
     FlowReadiness {
         missing_capabilities,
         max_concurrency,
         running,
         concurrency_blocked,
+        owner_running,
+        owner_max_concurrency,
+        owner_concurrency_blocked,
     }
 }
 
@@ -1322,6 +1423,55 @@ fn daemon_node_capabilities() -> HashSet<String> {
         .map(|v| v.trim().to_ascii_lowercase())
         .filter(|v| !v.is_empty())
         .collect::<HashSet<_>>()
+}
+
+fn daemon_owner_concurrency_policy() -> OwnerConcurrencyPolicy {
+    let Ok(raw) = std::env::var("ANNA_OWNER_MAX_CONCURRENCY") else {
+        return OwnerConcurrencyPolicy::default();
+    };
+    let mut policy = OwnerConcurrencyPolicy::default();
+
+    for item in raw.split([',', ';', '\n']) {
+        let trimmed = item.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let Some((owner_raw, limit_raw)) = trimmed.split_once('=') else {
+            eprintln!(
+                "anna-rs daemon: ignoring invalid ANNA_OWNER_MAX_CONCURRENCY entry '{}'",
+                trimmed
+            );
+            continue;
+        };
+        let owner = owner_raw.trim().to_ascii_lowercase();
+        let limit = match limit_raw.trim().parse::<usize>() {
+            Ok(v) if v >= 1 => v,
+            _ => {
+                eprintln!(
+                    "anna-rs daemon: ignoring invalid owner limit '{}={}' (expected >=1)",
+                    owner_raw.trim(),
+                    limit_raw.trim()
+                );
+                continue;
+            }
+        };
+        if owner == "*" {
+            policy.default_limit = Some(limit);
+        } else if !owner.is_empty() {
+            policy.per_owner.insert(owner, limit);
+        }
+    }
+
+    policy
+}
+
+fn owner_limit_for(owner: Option<&str>, policy: &OwnerConcurrencyPolicy) -> Option<usize> {
+    let owner = owner_key(owner)?;
+    policy
+        .per_owner
+        .get(&owner)
+        .copied()
+        .or(policy.default_limit)
 }
 
 fn daemon_retention_config() -> RetentionConfig {
@@ -1548,6 +1698,26 @@ fn workflow_public_id(entry: &WorkflowEntry) -> String {
         .unwrap_or_else(|| entry.file_name.clone())
 }
 
+fn owner_key(owner: Option<&str>) -> Option<String> {
+    owner
+        .map(|v| v.trim().to_ascii_lowercase())
+        .filter(|v| !v.is_empty())
+}
+
+fn build_running_indexes(
+    sessions: &HashMap<String, SessionInfo>,
+) -> (HashMap<String, usize>, HashMap<String, usize>) {
+    let mut by_workflow = HashMap::new();
+    let mut by_owner = HashMap::new();
+    for session in sessions.values().filter(|v| v.status == "running") {
+        *by_workflow.entry(session.workflow.clone()).or_insert(0) += 1;
+        if let Some(owner) = owner_key(session.owner.as_deref()) {
+            *by_owner.entry(owner).or_insert(0) += 1;
+        }
+    }
+    (by_workflow, by_owner)
+}
+
 fn matches_workflow_meta_filters(
     item: &WorkflowMetaResponse,
     tag_filter: Option<&str>,
@@ -1712,11 +1882,16 @@ struct FlowReadiness {
     max_concurrency: Option<usize>,
     running: usize,
     concurrency_blocked: bool,
+    owner_running: usize,
+    owner_max_concurrency: Option<usize>,
+    owner_concurrency_blocked: bool,
 }
 
 impl FlowReadiness {
     fn can_run(&self) -> bool {
-        self.missing_capabilities.is_empty() && !self.concurrency_blocked
+        self.missing_capabilities.is_empty()
+            && !self.concurrency_blocked
+            && !self.owner_concurrency_blocked
     }
 }
 
@@ -1749,6 +1924,16 @@ async fn load_flow_registry(path: &FsPath) -> Result<Vec<FlowRegistryEntry>> {
     for item in &mut entries {
         item.flow_id = item.flow_id.trim().to_string();
         item.path = item.path.trim().to_string();
+        item.owner = item
+            .owner
+            .as_ref()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty());
+        item.version = item
+            .version
+            .as_ref()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty());
         if item.flow_id.is_empty() {
             bail!(
                 "flow registry '{}' has entry with empty flow_id",
@@ -1912,8 +2097,16 @@ async fn launch_workflow_from_entry(
     entry: &WorkflowEntry,
     trigger_source: &str,
 ) -> Result<TriggerLaunchOutcome> {
-    let running = running_workflow_count(state, &entry.workflow_name).await;
-    let readiness = evaluate_flow_readiness(entry, &state.node_capabilities, running, Some(1));
+    let (running, owner_running) = running_counts_for_entry(state, entry).await;
+    let owner_max_concurrency = owner_limit_for(entry.owner.as_deref(), &state.owner_policy);
+    let readiness = evaluate_flow_readiness(
+        entry,
+        &state.node_capabilities,
+        running,
+        Some(1),
+        owner_running,
+        owner_max_concurrency,
+    );
     if !readiness.missing_capabilities.is_empty() {
         println!(
             "anna-rs daemon trigger={} workflow='{}' skipped: missing capabilities [{}]",
@@ -1924,6 +2117,20 @@ async fn launch_workflow_from_entry(
         return Ok(TriggerLaunchOutcome::SkippedCapability(
             readiness.missing_capabilities,
         ));
+    }
+
+    if readiness.owner_concurrency_blocked {
+        println!(
+            "anna-rs daemon trigger={} workflow='{}' skipped: owner limit running={} max={}",
+            trigger_source,
+            entry.workflow_name,
+            readiness.owner_running,
+            readiness.owner_max_concurrency.unwrap_or(0)
+        );
+        return Ok(TriggerLaunchOutcome::SkippedConcurrency {
+            running: readiness.owner_running,
+            max_concurrency: readiness.owner_max_concurrency.unwrap_or(0),
+        });
     }
 
     if readiness.concurrency_blocked {
@@ -1949,7 +2156,7 @@ async fn launch_workflow_from_entry(
     if wf.workdir.is_none() {
         wf.workdir = Some(state.plays_dir.display().to_string());
     }
-    let req_id = launch_workflow(state, wf, None).await?;
+    let req_id = launch_workflow(state, wf, None, entry.owner.clone()).await?;
     println!(
         "anna-rs daemon trigger={} workflow='{}' request_id={}",
         trigger_source, entry.workflow_name, req_id
@@ -1957,14 +2164,22 @@ async fn launch_workflow_from_entry(
     Ok(TriggerLaunchOutcome::Launched(req_id))
 }
 
-async fn running_workflow_count(state: &AppState, workflow_name: &str) -> usize {
-    state
-        .sessions
-        .read()
-        .await
-        .values()
-        .filter(|s| s.workflow == workflow_name && s.status == "running")
-        .count()
+async fn running_counts_for_entry(state: &AppState, entry: &WorkflowEntry) -> (usize, usize) {
+    let target_owner = owner_key(entry.owner.as_deref());
+    let sessions = state.sessions.read().await;
+    let mut running_workflow = 0usize;
+    let mut running_owner = 0usize;
+    for session in sessions.values().filter(|s| s.status == "running") {
+        if session.workflow == entry.workflow_name {
+            running_workflow += 1;
+        }
+        if let Some(target_owner) = target_owner.as_deref()
+            && owner_key(session.owner.as_deref()).as_deref() == Some(target_owner)
+        {
+            running_owner += 1;
+        }
+    }
+    (running_workflow, running_owner)
 }
 
 fn parse_run_registered_options(body: &str) -> Result<RunRegisteredOptions> {
@@ -1980,6 +2195,7 @@ async fn launch_workflow(
     state: &AppState,
     workflow: Workflow,
     max_iterations: Option<u32>,
+    owner: Option<String>,
 ) -> Result<String> {
     let req_id = crate::session::gen_session_id();
     let runtime_session_id = crate::session::gen_session_id();
@@ -1992,6 +2208,7 @@ async fn launch_workflow(
                 id: req_id.clone(),
                 status: "running".to_string(),
                 workflow: workflow.name.clone(),
+                owner,
                 created_at: now,
                 updated_at: now,
                 runtime_session_id: Some(runtime_session_id.clone()),
@@ -2254,16 +2471,17 @@ mod tests {
         };
 
         let caps = std::collections::HashSet::from(["k8s".to_string()]);
-        let ok = evaluate_flow_readiness(&entry, &caps, 1, None);
+        let ok = evaluate_flow_readiness(&entry, &caps, 1, None, 0, None);
         assert!(ok.can_run());
         assert!(!ok.concurrency_blocked);
+        assert!(!ok.owner_concurrency_blocked);
 
-        let blocked = evaluate_flow_readiness(&entry, &caps, 2, None);
+        let blocked = evaluate_flow_readiness(&entry, &caps, 2, None, 0, None);
         assert!(!blocked.can_run());
         assert!(blocked.concurrency_blocked);
 
         let missing_caps = std::collections::HashSet::from(["shell".to_string()]);
-        let missing = evaluate_flow_readiness(&entry, &missing_caps, 0, None);
+        let missing = evaluate_flow_readiness(&entry, &missing_caps, 0, None, 0, None);
         assert!(!missing.can_run());
         assert_eq!(missing.missing_capabilities, vec!["k8s".to_string()]);
     }
@@ -2288,14 +2506,55 @@ mod tests {
         };
         let caps = std::collections::HashSet::new();
 
-        let manual = evaluate_flow_readiness(&entry, &caps, 100, None);
+        let manual = evaluate_flow_readiness(&entry, &caps, 100, None, 0, None);
         assert!(manual.can_run());
         assert_eq!(manual.max_concurrency, None);
 
-        let trigger_default = evaluate_flow_readiness(&entry, &caps, 1, Some(1));
+        let trigger_default = evaluate_flow_readiness(&entry, &caps, 1, Some(1), 0, None);
         assert!(!trigger_default.can_run());
         assert!(trigger_default.concurrency_blocked);
         assert_eq!(trigger_default.max_concurrency, Some(1));
+    }
+
+    #[test]
+    fn evaluate_flow_readiness_blocks_owner_limit() {
+        let entry = WorkflowEntry {
+            file_name: "x.anna".to_string(),
+            flow_id: Some("x".to_string()),
+            workflow_name: "x".to_string(),
+            path: std::path::PathBuf::from("/tmp/x.anna"),
+            tags: vec![],
+            required_capabilities: vec![],
+            owner: Some("platform".to_string()),
+            version: None,
+            max_concurrency: Some(10),
+            trigger_webhook: None,
+            trigger_watch: None,
+            trigger_cron: None,
+            trigger_interval: None,
+            workflow_workdir: None,
+        };
+        let caps = std::collections::HashSet::new();
+        let readiness = evaluate_flow_readiness(&entry, &caps, 0, None, 3, Some(3));
+        assert!(!readiness.can_run());
+        assert!(readiness.owner_concurrency_blocked);
+        assert_eq!(readiness.owner_running, 3);
+        assert_eq!(readiness.owner_max_concurrency, Some(3));
+    }
+
+    #[test]
+    fn owner_limit_for_prefers_specific_over_default() {
+        let policy = super::OwnerConcurrencyPolicy {
+            per_owner: std::collections::HashMap::from([
+                ("platform".to_string(), 5usize),
+                ("ops".to_string(), 2usize),
+            ]),
+            default_limit: Some(1),
+        };
+        assert_eq!(super::owner_limit_for(Some("platform"), &policy), Some(5));
+        assert_eq!(super::owner_limit_for(Some("ops"), &policy), Some(2));
+        assert_eq!(super::owner_limit_for(Some("other"), &policy), Some(1));
+        assert_eq!(super::owner_limit_for(None, &policy), None);
     }
 
     #[test]
@@ -2330,6 +2589,11 @@ mod tests {
             owner: Some("platform".to_string()),
             version: Some("v1".to_string()),
             max_concurrency: Some(2),
+            running: 1,
+            concurrency_blocked: false,
+            owner_max_concurrency: Some(3),
+            owner_running: 1,
+            owner_concurrency_blocked: false,
             available: false,
             missing_capabilities: vec!["vault".to_string()],
             trigger_webhook: Some("/deploy".to_string()),
@@ -2545,6 +2809,7 @@ mod tests {
                 id: "a1".to_string(),
                 status: "running".to_string(),
                 workflow: "wf".to_string(),
+                owner: None,
                 created_at: 1,
                 updated_at: 1,
                 runtime_session_id: None,
@@ -2595,6 +2860,7 @@ mod tests {
                 id: "running".to_string(),
                 status: "running".to_string(),
                 workflow: "wf".to_string(),
+                owner: None,
                 created_at: 1,
                 updated_at: 1,
                 runtime_session_id: None,
@@ -2608,6 +2874,7 @@ mod tests {
                 id: "old".to_string(),
                 status: "done".to_string(),
                 workflow: "wf".to_string(),
+                owner: None,
                 created_at: 1,
                 updated_at: 1,
                 runtime_session_id: None,
@@ -2621,6 +2888,7 @@ mod tests {
                 id: "new".to_string(),
                 status: "failed".to_string(),
                 workflow: "wf".to_string(),
+                owner: None,
                 created_at: 2,
                 updated_at: 2,
                 runtime_session_id: None,

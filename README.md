@@ -92,6 +92,12 @@ Optional node capability ceiling (used against `required_capabilities`):
 ANNA_NODE_CAPABILITIES="shell,http,k8s,vault" anna daemon --plays-dir .
 ```
 
+Optional owner concurrency policy (per `owner` in registry):
+
+```bash
+ANNA_OWNER_MAX_CONCURRENCY="platform=4,research=2,*=1" anna daemon --plays-dir .
+```
+
 Registry format:
 
 ```yaml
@@ -107,12 +113,13 @@ flows:
 
 When registry is enabled:
 - `anna workflows` lists `flow_id` values
-- `anna workflows-meta` shows owner/version/tags/capability availability (supports `--tag`, `--owner`, `--capability`, `--available`, `--limit`)
+- `anna workflows-meta` shows owner/version/tags plus capability/concurrency availability (supports `--tag`, `--owner`, `--capability`, `--available`, `--limit`)
 - `anna run-named <name>` accepts `flow_id`, workflow name, or file name
 - `anna run-named` accepts optional runtime JSON options (`vars`, `max_iterations`)
 - hook/cron/watch/interval trigger scans are limited to registry entries
 - flows with missing `required_capabilities` are skipped/blocked with explicit reason
 - optional `max_concurrency` caps simultaneous runs for named/manual runs and trigger launches
+- optional owner policy (`ANNA_OWNER_MAX_CONCURRENCY`) caps total running sessions per owner
 
 ## Rust Runtime (MVP)
 
