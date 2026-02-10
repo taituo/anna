@@ -440,7 +440,12 @@ mod tests {
         };
 
         let res = Executor::new()
-            .run(&wf, RunConfig { max_iterations: Some(1) })
+            .run(
+                &wf,
+                RunConfig {
+                    max_iterations: Some(1),
+                },
+            )
             .await
             .expect("workflow should run");
 
@@ -480,7 +485,12 @@ mod tests {
         };
 
         let res = Executor::new()
-            .run(&wf, RunConfig { max_iterations: Some(1) })
+            .run(
+                &wf,
+                RunConfig {
+                    max_iterations: Some(1),
+                },
+            )
             .await
             .expect("workflow should run");
 

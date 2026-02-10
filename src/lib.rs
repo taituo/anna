@@ -1,3 +1,4 @@
+pub mod daemon;
 pub mod executor;
 pub mod expr;
 pub mod providers;

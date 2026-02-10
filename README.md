@@ -47,6 +47,7 @@ This repository now includes a Rust runtime foundation in `src/`:
 - core substitution and `when` evaluation
 - provider registry with `shell`, `cli`, `http`, `llm` (LLM via CLI adapter)
 - executor with `needs`, `when`, retry, timeout, hooks, and session logs
+- daemon API scaffold (`health`, workflow submit/status/stop, local workflow listing)
 
 Run locally:
 
@@ -55,8 +56,8 @@ cargo run -- validate botbet.anna
 cargo run -- run botbet.anna --max-iterations 1
 ```
 
-Current MVP intentionally leaves some advanced features for next steps (sub-workflows and full daemon APIs).  
-`forks`, `each/each_from`, and `vote` are now implemented in the Rust executor foundation.
+Current MVP intentionally leaves some advanced features for next steps (sub-workflows, websocket logs, richer daemon scheduling/HA).  
+`forks`, `each/each_from`, and `vote` are implemented in the Rust executor foundation.
 
 ## Runtime Profiles
 

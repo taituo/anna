@@ -37,6 +37,15 @@ enum Commands {
         /// Path to .anna workflow file
         workflow: PathBuf,
     },
+    /// Run HTTP daemon API
+    Daemon {
+        /// Bind address (host:port)
+        #[arg(long, default_value = "127.0.0.1:8080")]
+        bind: String,
+        /// Directory used to list local .anna workflows
+        #[arg(long)]
+        plays_dir: Option<PathBuf>,
+    },
 }
 
 #[tokio::main]
@@ -81,6 +90,14 @@ async fn main() -> Result<()> {
         Commands::Validate { workflow } => {
             let wf = Workflow::load(&workflow)?;
             println!("valid workflow '{}' (stages={})", wf.name, wf.stages.len());
+            Ok(())
+        }
+        Commands::Daemon { bind, plays_dir } => {
+            let root = match plays_dir {
+                Some(v) => v,
+                None => std::env::current_dir().context("failed to read current dir")?,
+            };
+            anna_rs::daemon::run_daemon(&bind, root).await?;
             Ok(())
         }
     }
