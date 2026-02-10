@@ -69,6 +69,36 @@ ANNA_DAEMON_STATE_FILE=/var/lib/anna/state.json anna daemon
 ANNA_DAEMON_STATE_FILE=off anna daemon
 ```
 
+Daemon retention limits (in-memory + persisted snapshots):
+
+```bash
+ANNA_DAEMON_MAX_SESSIONS=5000 anna daemon
+ANNA_DAEMON_MAX_HITL=2000 anna daemon
+```
+
+Optional flow registry (restrict daemon-discoverable flows to approved list):
+
+```bash
+ANNA_FLOW_REGISTRY_FILE=./flows.registry.yml anna daemon --plays-dir .
+```
+
+Registry format:
+
+```yaml
+flows:
+  - flow_id: prod-deploy
+    path: deploy.anna
+    tags: [prod, deploy]
+    required_capabilities: [k8s]
+    owner: platform
+    version: v1
+```
+
+When registry is enabled:
+- `anna workflows` lists `flow_id` values
+- `anna run-named <name>` accepts `flow_id`, workflow name, or file name
+- hook/cron/watch/interval trigger scans are limited to registry entries
+
 ## Rust Runtime (MVP)
 
 This repository now includes a Rust runtime foundation in `src/`:

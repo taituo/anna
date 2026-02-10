@@ -1,7 +1,7 @@
 use crate::executor::{Executor, HitlHandler, HitlRequest, RunConfig};
 use crate::session::session_dir;
 use crate::workflow::Workflow;
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, Query, State};
@@ -27,6 +27,7 @@ use tokio::time::{Duration, sleep};
 struct AppState {
     executor: Executor,
     plays_dir: PathBuf,
+    registry_file: Option<PathBuf>,
     sessions: Arc<RwLock<HashMap<String, SessionInfo>>>,
     handles: Arc<RwLock<HashMap<String, JoinHandle<()>>>>,
     hitl: Arc<RwLock<HashMap<String, HitlPending>>>,
@@ -153,6 +154,27 @@ struct DaemonStateSnapshot {
     saved_at: u64,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+enum FlowRegistryDoc {
+    Wrapped { flows: Vec<FlowRegistryEntry> },
+    List(Vec<FlowRegistryEntry>),
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct FlowRegistryEntry {
+    flow_id: String,
+    path: String,
+    #[serde(default)]
+    tags: Vec<String>,
+    #[serde(default)]
+    required_capabilities: Vec<String>,
+    #[serde(default)]
+    owner: Option<String>,
+    #[serde(default)]
+    version: Option<String>,
+}
+
 #[derive(Debug, Clone, Copy)]
 struct RetentionConfig {
     max_sessions: usize,
@@ -203,6 +225,7 @@ impl HitlHandler for DaemonHitl {
 
 pub async fn run_daemon(bind: &str, plays_dir: PathBuf) -> Result<()> {
     let state_file = daemon_state_file();
+    let registry_file = flow_registry_file();
     let retention = daemon_retention_config();
     let (sessions_seed, hitl_seed) = match state_file.as_ref() {
         Some(path) => load_daemon_state(path).await?,
@@ -217,6 +240,7 @@ pub async fn run_daemon(bind: &str, plays_dir: PathBuf) -> Result<()> {
     let state = AppState {
         executor,
         plays_dir,
+        registry_file: registry_file.clone(),
         sessions: Arc::new(RwLock::new(sessions_seed)),
         handles: Arc::new(RwLock::new(HashMap::new())),
         hitl: hitl.clone(),
@@ -230,6 +254,9 @@ pub async fn run_daemon(bind: &str, plays_dir: PathBuf) -> Result<()> {
             path.display()
         );
         tokio::spawn(state_persist_loop(state.clone(), path));
+    }
+    if let Some(path) = registry_file {
+        println!("anna-rs flow registry enabled at {}", path.display());
     }
 
     let app = Router::new()
@@ -293,7 +320,7 @@ async fn list_workflows(State(state): State<AppState>, headers: HeaderMap) -> im
     if let Some(resp) = ensure_authorized(&state, &headers) {
         return resp;
     }
-    match find_workflows(&state.plays_dir).await {
+    match find_workflows_with_registry(&state.plays_dir, state.registry_file.as_deref()).await {
         Ok(list) => Json(list).into_response(),
         Err(err) => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -387,7 +414,13 @@ async fn run_registered_workflow(
     if let Some(resp) = ensure_authorized(&state, &headers) {
         return resp;
     }
-    let path = match resolve_registered_workflow_path(&state.plays_dir, &name).await {
+    let path = match resolve_registered_workflow_path_with_registry(
+        &state.plays_dir,
+        state.registry_file.as_deref(),
+        &name,
+    )
+    .await
+    {
         Ok(Some(v)) => v,
         Ok(None) => return (StatusCode::NOT_FOUND, "workflow not found").into_response(),
         Err(err) => {
@@ -492,16 +525,19 @@ async fn trigger_hook(
         return resp;
     }
     let hook_path = format!("/{}", name.trim_matches('/'));
-    let entries = match find_workflow_entries(&state.plays_dir).await {
-        Ok(v) => v,
-        Err(err) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("failed scanning workflows: {}", err),
-            )
-                .into_response();
-        }
-    };
+    let entries =
+        match find_workflow_entries_with_registry(&state.plays_dir, state.registry_file.as_deref())
+            .await
+        {
+            Ok(v) => v,
+            Err(err) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("failed scanning workflows: {}", err),
+                )
+                    .into_response();
+            }
+        };
 
     let mut launched = Vec::new();
     let mut skipped_running = Vec::new();
@@ -638,7 +674,12 @@ async fn ws_logs(
 async fn trigger_scheduler_loop(state: AppState) {
     let mut scheduler = TriggerScheduler::default();
     loop {
-        let entries = match find_workflow_entries(&state.plays_dir).await {
+        let entries = match find_workflow_entries_with_registry(
+            &state.plays_dir,
+            state.registry_file.as_deref(),
+        )
+        .await
+        {
             Ok(v) => v,
             Err(err) => {
                 eprintln!("anna-rs scheduler: failed to scan workflows: {}", err);
@@ -916,6 +957,20 @@ fn env_usize_or(name: &str, default: usize) -> usize {
         .unwrap_or(default)
 }
 
+fn flow_registry_file() -> Option<PathBuf> {
+    if let Ok(raw) = std::env::var("ANNA_FLOW_REGISTRY_FILE") {
+        let trimmed = raw.trim();
+        if trimmed.is_empty()
+            || trimmed.eq_ignore_ascii_case("off")
+            || trimmed.eq_ignore_ascii_case("false")
+        {
+            return None;
+        }
+        return Some(PathBuf::from(trimmed));
+    }
+    None
+}
+
 fn daemon_state_file() -> Option<PathBuf> {
     if let Ok(raw) = std::env::var("ANNA_DAEMON_STATE_FILE") {
         let trimmed = raw.trim();
@@ -1102,13 +1157,17 @@ fn status_matches(status: &str, filter: &str) -> bool {
     status.eq_ignore_ascii_case(filter.trim())
 }
 
-async fn find_workflows(root: &FsPath) -> Result<Vec<String>> {
-    let mut out = find_workflow_entries(root)
+async fn find_workflows_with_registry(
+    root: &FsPath,
+    registry_file: Option<&FsPath>,
+) -> Result<Vec<String>> {
+    let mut out = find_workflow_entries_with_registry(root, registry_file)
         .await?
         .into_iter()
-        .map(|v| v.file_name)
+        .map(|v| v.flow_id.unwrap_or(v.file_name))
         .collect::<Vec<_>>();
     out.sort();
+    out.dedup();
     Ok(out)
 }
 
@@ -1196,6 +1255,7 @@ fn to_json(frame: WsLogFrame) -> String {
 #[derive(Debug, Clone)]
 struct WorkflowEntry {
     file_name: String,
+    flow_id: Option<String>,
     workflow_name: String,
     path: PathBuf,
     trigger_webhook: Option<String>,
@@ -1205,7 +1265,103 @@ struct WorkflowEntry {
     workflow_workdir: Option<String>,
 }
 
-async fn find_workflow_entries(root: &FsPath) -> Result<Vec<WorkflowEntry>> {
+async fn load_flow_registry(path: &FsPath) -> Result<Vec<FlowRegistryEntry>> {
+    let raw = tokio::fs::read_to_string(path)
+        .await
+        .with_context(|| format!("failed reading flow registry '{}'", path.display()))?;
+    let parsed: FlowRegistryDoc = serde_yaml::from_str(&raw)
+        .with_context(|| format!("failed parsing flow registry '{}'", path.display()))?;
+
+    let mut entries = match parsed {
+        FlowRegistryDoc::Wrapped { flows } => flows,
+        FlowRegistryDoc::List(items) => items,
+    };
+    if entries.is_empty() {
+        bail!("flow registry '{}' has no entries", path.display());
+    }
+
+    let mut flow_ids = HashSet::new();
+    for item in &mut entries {
+        item.flow_id = item.flow_id.trim().to_string();
+        item.path = item.path.trim().to_string();
+        if item.flow_id.is_empty() {
+            bail!(
+                "flow registry '{}' has entry with empty flow_id",
+                path.display()
+            );
+        }
+        if item.path.is_empty() {
+            bail!(
+                "flow registry '{}' has entry '{}' with empty path",
+                path.display(),
+                item.flow_id
+            );
+        }
+        if !flow_ids.insert(item.flow_id.clone()) {
+            bail!(
+                "flow registry '{}' has duplicate flow_id '{}'",
+                path.display(),
+                item.flow_id
+            );
+        }
+    }
+    Ok(entries)
+}
+
+fn resolve_registry_workflow_path(plays_dir: &FsPath, raw_path: &str) -> PathBuf {
+    let path = PathBuf::from(raw_path.trim());
+    if path.is_absolute() {
+        path
+    } else {
+        plays_dir.join(path)
+    }
+}
+
+async fn find_workflow_entries_with_registry(
+    root: &FsPath,
+    registry_file: Option<&FsPath>,
+) -> Result<Vec<WorkflowEntry>> {
+    if let Some(registry_path) = registry_file {
+        let registry_entries = load_flow_registry(registry_path).await?;
+        let mut out = Vec::new();
+        for spec in registry_entries {
+            let path = resolve_registry_workflow_path(root, &spec.path);
+            let wf = Workflow::load(&path).with_context(|| {
+                format!(
+                    "flow registry '{}' entry '{}' points to invalid workflow '{}'",
+                    registry_path.display(),
+                    spec.flow_id,
+                    path.display()
+                )
+            })?;
+            let file_name = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .map(|s| s.to_string())
+                .ok_or_else(|| {
+                    anyhow::anyhow!("invalid workflow filename in '{}'", path.display())
+                })?;
+            let _ = (
+                &spec.tags,
+                &spec.required_capabilities,
+                &spec.owner,
+                &spec.version,
+            );
+            out.push(WorkflowEntry {
+                file_name,
+                flow_id: Some(spec.flow_id),
+                workflow_name: wf.name,
+                path,
+                trigger_webhook: wf.trigger.webhook,
+                trigger_watch: wf.trigger.watch,
+                trigger_cron: wf.trigger.cron,
+                trigger_interval: wf.trigger.interval,
+                workflow_workdir: wf.workdir,
+            });
+        }
+        return Ok(out);
+    }
+
     let mut out = Vec::new();
     let mut dir = tokio::fs::read_dir(root).await?;
     while let Some(entry) = dir.next_entry().await? {
@@ -1235,6 +1391,7 @@ async fn find_workflow_entries(root: &FsPath) -> Result<Vec<WorkflowEntry>> {
         };
         out.push(WorkflowEntry {
             file_name,
+            flow_id: None,
             workflow_name: wf.name,
             path,
             trigger_webhook: wf.trigger.webhook,
@@ -1247,11 +1404,18 @@ async fn find_workflow_entries(root: &FsPath) -> Result<Vec<WorkflowEntry>> {
     Ok(out)
 }
 
-async fn resolve_registered_workflow_path(root: &FsPath, name: &str) -> Result<Option<PathBuf>> {
+async fn resolve_registered_workflow_path_with_registry(
+    root: &FsPath,
+    registry_file: Option<&FsPath>,
+    name: &str,
+) -> Result<Option<PathBuf>> {
     let normalized = name.trim();
-    let entries = find_workflow_entries(root).await?;
+    let entries = find_workflow_entries_with_registry(root, registry_file).await?;
     for entry in &entries {
-        if entry.file_name == normalized || entry.workflow_name == normalized {
+        if entry.file_name == normalized
+            || entry.workflow_name == normalized
+            || entry.flow_id.as_deref() == Some(normalized)
+        {
             return Ok(Some(entry.path.clone()));
         }
     }
@@ -1370,9 +1534,10 @@ async fn launch_workflow(state: &AppState, workflow: Workflow) -> Result<String>
 mod tests {
     use super::{
         DaemonHitl, DaemonStateSnapshot, HitlPending, SessionInfo, collect_watch_snapshot,
-        find_workflow_entries, is_authorized, load_daemon_state, prune_hitl_in_place,
-        prune_sessions_in_place, resolve_registered_workflow_path, resolve_watch_pattern,
-        status_matches, temp_state_path,
+        find_workflow_entries_with_registry, is_authorized, load_daemon_state, load_flow_registry,
+        prune_hitl_in_place, prune_sessions_in_place,
+        resolve_registered_workflow_path_with_registry, resolve_watch_pattern, status_matches,
+        temp_state_path,
     };
     use crate::executor::{HitlHandler, HitlRequest};
     use axum::http::{HeaderMap, HeaderValue};
@@ -1399,20 +1564,104 @@ mod tests {
         .await
         .expect("write workflow");
 
-        let by_file = resolve_registered_workflow_path(&dir, "demo.anna")
+        let by_file = resolve_registered_workflow_path_with_registry(&dir, None, "demo.anna")
             .await
             .expect("resolve by file");
         assert_eq!(by_file.as_deref(), Some(file.as_path()));
 
-        let by_name = resolve_registered_workflow_path(&dir, "demo-workflow")
+        let by_name = resolve_registered_workflow_path_with_registry(&dir, None, "demo-workflow")
             .await
             .expect("resolve by workflow name");
         assert_eq!(by_name.as_deref(), Some(file.as_path()));
 
-        let by_stem = resolve_registered_workflow_path(&dir, "demo")
+        let by_stem = resolve_registered_workflow_path_with_registry(&dir, None, "demo")
             .await
             .expect("resolve by stem");
         assert_eq!(by_stem.as_deref(), Some(file.as_path()));
+    }
+
+    #[tokio::test]
+    async fn loads_flow_registry_and_rejects_duplicates() {
+        let dir = std::env::temp_dir().join(format!(
+            "anna-daemon-flow-reg-{}-{}",
+            std::process::id(),
+            rand::random::<u32>()
+        ));
+        tokio::fs::create_dir_all(&dir)
+            .await
+            .expect("create temp dir");
+
+        let valid = dir.join("registry.yml");
+        tokio::fs::write(
+            &valid,
+            "flows:\n  - flow_id: alpha\n    path: a.anna\n  - flow_id: beta\n    path: b.anna\n",
+        )
+        .await
+        .expect("write valid registry");
+        let parsed = load_flow_registry(&valid)
+            .await
+            .expect("parse valid registry");
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0].flow_id, "alpha");
+
+        let duplicate = dir.join("registry-dup.yml");
+        tokio::fs::write(
+            &duplicate,
+            "flows:\n  - flow_id: same\n    path: a.anna\n  - flow_id: same\n    path: b.anna\n",
+        )
+        .await
+        .expect("write duplicate registry");
+        let err = load_flow_registry(&duplicate)
+            .await
+            .expect_err("duplicate flow_id should fail");
+        assert!(err.to_string().contains("duplicate flow_id"));
+    }
+
+    #[tokio::test]
+    async fn registry_entries_filter_directory_scan_and_support_flow_id() {
+        let dir = std::env::temp_dir().join(format!(
+            "anna-daemon-registry-entries-{}-{}",
+            std::process::id(),
+            rand::random::<u32>()
+        ));
+        tokio::fs::create_dir_all(&dir)
+            .await
+            .expect("create temp dir");
+
+        let included = dir.join("included.anna");
+        tokio::fs::write(
+            &included,
+            "name: included-flow\nstages:\n  - id: hello\n    exec: \"echo hi\"\n",
+        )
+        .await
+        .expect("write included workflow");
+        tokio::fs::write(
+            dir.join("not-listed.anna"),
+            "name: hidden-flow\nstages:\n  - id: hello\n    exec: \"echo hidden\"\n",
+        )
+        .await
+        .expect("write non-listed workflow");
+
+        let registry = dir.join("flows.yml");
+        tokio::fs::write(
+            &registry,
+            "flows:\n  - flow_id: prod-deploy\n    path: included.anna\n",
+        )
+        .await
+        .expect("write registry");
+
+        let entries = find_workflow_entries_with_registry(&dir, Some(&registry))
+            .await
+            .expect("load registry-based entries");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].workflow_name, "included-flow");
+        assert_eq!(entries[0].flow_id.as_deref(), Some("prod-deploy"));
+
+        let by_flow_id =
+            resolve_registered_workflow_path_with_registry(&dir, Some(&registry), "prod-deploy")
+                .await
+                .expect("resolve by flow_id");
+        assert_eq!(by_flow_id.as_deref(), Some(included.as_path()));
     }
 
     #[tokio::test]
@@ -1432,7 +1681,9 @@ mod tests {
         .await
         .expect("write workflow");
 
-        let entries = find_workflow_entries(&dir).await.expect("find entries");
+        let entries = find_workflow_entries_with_registry(&dir, None)
+            .await
+            .expect("find entries");
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].workflow_name, "hooked");
         assert_eq!(entries[0].trigger_webhook.as_deref(), Some("/deploy"));
@@ -1455,7 +1706,9 @@ mod tests {
         .await
         .expect("write workflow");
 
-        let entries = find_workflow_entries(&dir).await.expect("find entries");
+        let entries = find_workflow_entries_with_registry(&dir, None)
+            .await
+            .expect("find entries");
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].workflow_name, "trig");
         assert_eq!(entries[0].trigger_interval.as_deref(), Some("15s"));
