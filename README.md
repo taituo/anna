@@ -38,6 +38,9 @@ stages:
 anna validate
 anna run workflow.anna
 anna daemon
+anna submit workflow.anna
+anna status <request_id>
+anna hitl list
 ```
 
 ## Rust Runtime (MVP)
