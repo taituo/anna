@@ -47,6 +47,18 @@ struct StartWorkflowResponse {
     status: String,
 }
 
+#[derive(Debug, Serialize)]
+struct HookTriggerResponse {
+    hook: String,
+    launched: Vec<HookLaunchedWorkflow>,
+}
+
+#[derive(Debug, Serialize)]
+struct HookLaunchedWorkflow {
+    workflow: String,
+    session_id: String,
+}
+
 #[derive(Debug, Deserialize)]
 struct WsQuery {
     id: String,
@@ -76,8 +88,10 @@ pub async fn run_daemon(bind: &str, plays_dir: PathBuf) -> Result<()> {
         .route("/health", get(health))
         .route("/workflows", get(list_workflows))
         .route("/workflow", post(start_workflow))
+        .route("/workflow/{name}/run", post(run_registered_workflow))
         .route("/workflow/{id}", get(workflow_status).delete(stop_workflow))
         .route("/workflow/{id}/logs", get(workflow_logs))
+        .route("/hook/{name}", post(trigger_hook))
         .route("/ws", get(ws_logs))
         .with_state(state);
 
@@ -125,58 +139,67 @@ async fn start_workflow(State(state): State<AppState>, body: String) -> impl Int
         workflow.workdir = Some(state.plays_dir.display().to_string());
     }
 
-    let req_id = crate::session::gen_session_id();
-    let runtime_session_id = crate::session::gen_session_id();
-    state.sessions.write().await.insert(
-        req_id.clone(),
-        SessionInfo {
-            id: req_id.clone(),
-            status: "running".to_string(),
-            workflow: workflow.name.clone(),
-            runtime_session_id: Some(runtime_session_id.clone()),
-            outputs: HashMap::new(),
-            errors: Vec::new(),
-        },
-    );
-
-    let state_for_task = state.clone();
-    let req_id_for_task = req_id.clone();
-    let handle = tokio::spawn(async move {
-        let run = state_for_task
-            .executor
-            .run(
-                &workflow,
-                RunConfig {
-                    max_iterations: None,
-                    session_id_override: Some(runtime_session_id.clone()),
-                },
+    let req_id = match launch_workflow(&state, workflow).await {
+        Ok(v) => v,
+        Err(err) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("failed to start workflow: {}", err),
             )
-            .await;
-
-        let mut sessions = state_for_task.sessions.write().await;
-        if let Some(info) = sessions.get_mut(&req_id_for_task) {
-            match run {
-                Ok(result) => {
-                    info.status = "done".to_string();
-                    info.runtime_session_id = Some(result.session_id);
-                    info.outputs = result.outputs;
-                    info.errors = result.errors;
-                }
-                Err(err) => {
-                    info.status = "failed".to_string();
-                    info.errors.push(err.to_string());
-                }
-            }
+                .into_response();
         }
-        drop(sessions);
-        state_for_task
-            .handles
-            .write()
-            .await
-            .remove(&req_id_for_task);
-    });
+    };
+    (
+        StatusCode::ACCEPTED,
+        Json(StartWorkflowResponse {
+            id: req_id,
+            status: "running".to_string(),
+        }),
+    )
+        .into_response()
+}
 
-    state.handles.write().await.insert(req_id.clone(), handle);
+async fn run_registered_workflow(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+) -> impl IntoResponse {
+    let path = match resolve_registered_workflow_path(&state.plays_dir, &name).await {
+        Ok(Some(v)) => v,
+        Ok(None) => return (StatusCode::NOT_FOUND, "workflow not found").into_response(),
+        Err(err) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("failed resolving workflow: {}", err),
+            )
+                .into_response();
+        }
+    };
+
+    let mut workflow = match Workflow::load(&path) {
+        Ok(v) => v,
+        Err(err) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                format!("invalid workflow '{}': {}", path.display(), err),
+            )
+                .into_response();
+        }
+    };
+    if workflow.workdir.is_none() {
+        workflow.workdir = Some(state.plays_dir.display().to_string());
+    }
+
+    let req_id = match launch_workflow(&state, workflow).await {
+        Ok(v) => v,
+        Err(err) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("failed to start workflow: {}", err),
+            )
+                .into_response();
+        }
+    };
+
     (
         StatusCode::ACCEPTED,
         Json(StartWorkflowResponse {
@@ -217,6 +240,56 @@ async fn stop_workflow(State(state): State<AppState>, Path(id): Path<String>) ->
     (StatusCode::NOT_FOUND, "session not found").into_response()
 }
 
+async fn trigger_hook(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+) -> impl IntoResponse {
+    let hook_path = format!("/{}", name.trim_matches('/'));
+    let entries = match find_workflow_entries(&state.plays_dir).await {
+        Ok(v) => v,
+        Err(err) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("failed scanning workflows: {}", err),
+            )
+                .into_response();
+        }
+    };
+
+    let mut launched = Vec::new();
+    for entry in entries {
+        if let Some(webhook) = entry.trigger_webhook.as_deref()
+            && webhook.trim() == hook_path
+        {
+            let mut wf = match Workflow::load(&entry.path) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            if wf.workdir.is_none() {
+                wf.workdir = Some(state.plays_dir.display().to_string());
+            }
+            if let Ok(session_id) = launch_workflow(&state, wf).await {
+                launched.push(HookLaunchedWorkflow {
+                    workflow: entry.workflow_name,
+                    session_id,
+                });
+            }
+        }
+    }
+
+    if launched.is_empty() {
+        return (StatusCode::NOT_FOUND, "no workflows for hook").into_response();
+    }
+    (
+        StatusCode::ACCEPTED,
+        Json(HookTriggerResponse {
+            hook: hook_path,
+            launched,
+        }),
+    )
+        .into_response()
+}
+
 async fn workflow_logs(State(state): State<AppState>, Path(id): Path<String>) -> impl IntoResponse {
     let sessions = state.sessions.read().await;
     let Some(info) = sessions.get(&id) else {
@@ -246,21 +319,11 @@ async fn ws_logs(
 }
 
 async fn find_workflows(root: &FsPath) -> Result<Vec<String>> {
-    let mut out = Vec::new();
-    let mut dir = tokio::fs::read_dir(root).await?;
-    while let Some(entry) = dir.next_entry().await? {
-        let path = entry.path();
-        if path.is_file()
-            && path
-                .extension()
-                .and_then(|e| e.to_str())
-                .map(|e| e == "anna")
-                .unwrap_or(false)
-            && let Some(name) = path.file_name().and_then(|n| n.to_str())
-        {
-            out.push(name.to_string());
-        }
-    }
+    let mut out = find_workflow_entries(root)
+        .await?
+        .into_iter()
+        .map(|v| v.file_name)
+        .collect::<Vec<_>>();
     out.sort();
     Ok(out)
 }
@@ -344,4 +407,187 @@ fn to_json(frame: WsLogFrame) -> String {
     serde_json::to_string(&frame).unwrap_or_else(|_| {
         "{\"status\":\"error\",\"errors\":[\"serialization error\"]}".to_string()
     })
+}
+
+#[derive(Debug, Clone)]
+struct WorkflowEntry {
+    file_name: String,
+    workflow_name: String,
+    path: PathBuf,
+    trigger_webhook: Option<String>,
+}
+
+async fn find_workflow_entries(root: &FsPath) -> Result<Vec<WorkflowEntry>> {
+    let mut out = Vec::new();
+    let mut dir = tokio::fs::read_dir(root).await?;
+    while let Some(entry) = dir.next_entry().await? {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        if !path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e == "anna")
+            .unwrap_or(false)
+        {
+            continue;
+        }
+        let Some(file_name) = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(|s| s.to_string())
+        else {
+            continue;
+        };
+
+        let wf = match Workflow::load(&path) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        out.push(WorkflowEntry {
+            file_name,
+            workflow_name: wf.name,
+            path,
+            trigger_webhook: wf.trigger.webhook,
+        });
+    }
+    Ok(out)
+}
+
+async fn resolve_registered_workflow_path(root: &FsPath, name: &str) -> Result<Option<PathBuf>> {
+    let normalized = name.trim();
+    let entries = find_workflow_entries(root).await?;
+    for entry in &entries {
+        if entry.file_name == normalized || entry.workflow_name == normalized {
+            return Ok(Some(entry.path.clone()));
+        }
+    }
+
+    if !normalized.ends_with(".anna") {
+        let candidate = format!("{}.anna", normalized);
+        for entry in &entries {
+            if entry.file_name == candidate {
+                return Ok(Some(entry.path.clone()));
+            }
+        }
+    }
+    Ok(None)
+}
+
+async fn launch_workflow(state: &AppState, workflow: Workflow) -> Result<String> {
+    let req_id = crate::session::gen_session_id();
+    let runtime_session_id = crate::session::gen_session_id();
+    state.sessions.write().await.insert(
+        req_id.clone(),
+        SessionInfo {
+            id: req_id.clone(),
+            status: "running".to_string(),
+            workflow: workflow.name.clone(),
+            runtime_session_id: Some(runtime_session_id.clone()),
+            outputs: HashMap::new(),
+            errors: Vec::new(),
+        },
+    );
+
+    let state_for_task = state.clone();
+    let req_id_for_task = req_id.clone();
+    let handle = tokio::spawn(async move {
+        let run = state_for_task
+            .executor
+            .run(
+                &workflow,
+                RunConfig {
+                    max_iterations: None,
+                    session_id_override: Some(runtime_session_id.clone()),
+                },
+            )
+            .await;
+
+        let mut sessions = state_for_task.sessions.write().await;
+        if let Some(info) = sessions.get_mut(&req_id_for_task) {
+            match run {
+                Ok(result) => {
+                    info.status = "done".to_string();
+                    info.runtime_session_id = Some(result.session_id);
+                    info.outputs = result.outputs;
+                    info.errors = result.errors;
+                }
+                Err(err) => {
+                    info.status = "failed".to_string();
+                    info.errors.push(err.to_string());
+                }
+            }
+        }
+        drop(sessions);
+        state_for_task
+            .handles
+            .write()
+            .await
+            .remove(&req_id_for_task);
+    });
+    state.handles.write().await.insert(req_id.clone(), handle);
+    Ok(req_id)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{find_workflow_entries, resolve_registered_workflow_path};
+
+    #[tokio::test]
+    async fn resolves_workflow_by_file_and_name() {
+        let dir = std::env::temp_dir().join(format!(
+            "anna-daemon-reg-{}-{}",
+            std::process::id(),
+            rand::random::<u32>()
+        ));
+        tokio::fs::create_dir_all(&dir)
+            .await
+            .expect("create temp dir");
+        let file = dir.join("demo.anna");
+        tokio::fs::write(
+            &file,
+            "name: demo-workflow\nstages:\n  - id: hello\n    exec: \"echo hi\"\n",
+        )
+        .await
+        .expect("write workflow");
+
+        let by_file = resolve_registered_workflow_path(&dir, "demo.anna")
+            .await
+            .expect("resolve by file");
+        assert_eq!(by_file.as_deref(), Some(file.as_path()));
+
+        let by_name = resolve_registered_workflow_path(&dir, "demo-workflow")
+            .await
+            .expect("resolve by workflow name");
+        assert_eq!(by_name.as_deref(), Some(file.as_path()));
+
+        let by_stem = resolve_registered_workflow_path(&dir, "demo")
+            .await
+            .expect("resolve by stem");
+        assert_eq!(by_stem.as_deref(), Some(file.as_path()));
+    }
+
+    #[tokio::test]
+    async fn finds_webhook_metadata() {
+        let dir = std::env::temp_dir().join(format!(
+            "anna-daemon-hook-{}-{}",
+            std::process::id(),
+            rand::random::<u32>()
+        ));
+        tokio::fs::create_dir_all(&dir)
+            .await
+            .expect("create temp dir");
+        tokio::fs::write(
+            dir.join("hooked.anna"),
+            "name: hooked\ntrigger:\n  webhook: /deploy\nstages:\n  - id: hello\n    exec: \"echo hi\"\n",
+        )
+        .await
+        .expect("write workflow");
+
+        let entries = find_workflow_entries(&dir).await.expect("find entries");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].workflow_name, "hooked");
+        assert_eq!(entries[0].trigger_webhook.as_deref(), Some("/deploy"));
+    }
 }
