@@ -105,6 +105,14 @@ enum Commands {
         #[arg(long)]
         max_iterations: Option<u32>,
     },
+    /// Check whether a registered workflow can run right now
+    CanRun {
+        /// Workflow name, file name, flow_id, or file stem
+        name: String,
+        /// Daemon base URL
+        #[arg(long, default_value = "http://127.0.0.1:8080")]
+        daemon: String,
+    },
     /// Check daemon workflow status by request id
     Status {
         /// Request id
@@ -348,6 +356,18 @@ async fn main() -> Result<()> {
                 .send()
                 .await
                 .with_context(|| format!("failed launching workflow '{}' at {}", name, daemon))?;
+            print_response(response).await
+        }
+        Commands::CanRun { name, daemon } => {
+            let daemon = normalize_daemon_url(&daemon);
+            let client = Client::new();
+            let response =
+                with_daemon_auth(client.get(format!("{}/workflow/{}/check", daemon, name)))
+                    .send()
+                    .await
+                    .with_context(|| {
+                        format!("failed checking workflow '{}' at {}", name, daemon)
+                    })?;
             print_response(response).await
         }
         Commands::Status { id, daemon } => {

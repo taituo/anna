@@ -130,6 +130,21 @@ struct WorkflowMetaResponse {
     trigger_interval: Option<String>,
 }
 
+#[derive(Debug, Serialize)]
+struct FlowCheckResponse {
+    id: String,
+    workflow: String,
+    file: String,
+    path: String,
+    can_run: bool,
+    running: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_concurrency: Option<u32>,
+    concurrency_blocked: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    missing_capabilities: Vec<String>,
+}
+
 #[derive(Debug, Deserialize)]
 struct WsQuery {
     id: String,
@@ -337,6 +352,7 @@ pub async fn run_daemon(bind: &str, plays_dir: PathBuf) -> Result<()> {
         .route("/workflows", get(list_workflows))
         .route("/workflows/meta", get(list_workflows_meta))
         .route("/workflow", post(start_workflow))
+        .route("/workflow/{name}/check", get(check_registered_workflow))
         .route("/workflow/{name}/run", post(run_registered_workflow))
         .route("/workflow/{id}", get(workflow_status).delete(stop_workflow))
         .route("/workflow/{id}/logs", get(workflow_logs))
@@ -579,30 +595,30 @@ async fn run_registered_workflow(
                 .into_response();
         }
     };
-    let missing_capabilities = missing_required_capabilities(&entry, &state.node_capabilities);
-    if !missing_capabilities.is_empty() {
+    let running = running_workflow_count(&state, &entry.workflow_name).await;
+    let readiness = evaluate_flow_readiness(&entry, &state.node_capabilities, running, None);
+    if !readiness.missing_capabilities.is_empty() {
         return (
             StatusCode::FORBIDDEN,
             format!(
                 "workflow '{}' requires missing capabilities: {}",
                 name,
-                missing_capabilities.join(", ")
+                readiness.missing_capabilities.join(", ")
             ),
         )
             .into_response();
     }
-    if let Some(max_concurrency) = normalize_max_concurrency(entry.max_concurrency) {
-        let running = running_workflow_count(&state, &entry.workflow_name).await;
-        if running >= max_concurrency {
-            return (
-                StatusCode::TOO_MANY_REQUESTS,
-                format!(
-                    "workflow '{}' concurrency limit reached: running={} max_concurrency={}",
-                    name, running, max_concurrency
-                ),
-            )
-                .into_response();
-        }
+    if readiness.concurrency_blocked {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            format!(
+                "workflow '{}' concurrency limit reached: running={} max_concurrency={}",
+                name,
+                readiness.running,
+                readiness.max_concurrency.unwrap_or(0)
+            ),
+        )
+            .into_response();
     }
 
     let mut workflow = match Workflow::load(&entry.path) {
@@ -636,6 +652,52 @@ async fn run_registered_workflow(
         Json(StartWorkflowResponse {
             id: req_id,
             status: "running".to_string(),
+        }),
+    )
+        .into_response()
+}
+
+async fn check_registered_workflow(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(name): Path<String>,
+) -> impl IntoResponse {
+    if let Some(resp) = ensure_authorized(&state, &headers) {
+        return resp;
+    }
+
+    let entry = match resolve_registered_workflow_entry_with_registry(
+        &state.plays_dir,
+        state.registry_file.as_deref(),
+        &name,
+    )
+    .await
+    {
+        Ok(Some(v)) => v,
+        Ok(None) => return (StatusCode::NOT_FOUND, "workflow not found").into_response(),
+        Err(err) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("failed resolving workflow: {}", err),
+            )
+                .into_response();
+        }
+    };
+
+    let running = running_workflow_count(&state, &entry.workflow_name).await;
+    let readiness = evaluate_flow_readiness(&entry, &state.node_capabilities, running, None);
+    (
+        StatusCode::OK,
+        Json(FlowCheckResponse {
+            id: workflow_public_id(&entry),
+            workflow: entry.workflow_name,
+            file: entry.file_name,
+            path: entry.path.display().to_string(),
+            can_run: readiness.can_run(),
+            running: readiness.running,
+            max_concurrency: readiness.max_concurrency.map(|v| v as u32),
+            concurrency_blocked: readiness.concurrency_blocked,
+            missing_capabilities: readiness.missing_capabilities,
         }),
     )
         .into_response()
@@ -1185,8 +1247,22 @@ fn normalize_max_concurrency(raw: Option<u32>) -> Option<usize> {
     raw.map(|v| v as usize).filter(|v| *v >= 1)
 }
 
-fn trigger_max_concurrency(entry: &WorkflowEntry) -> usize {
-    normalize_max_concurrency(entry.max_concurrency).unwrap_or(1)
+fn evaluate_flow_readiness(
+    entry: &WorkflowEntry,
+    node_capabilities: &HashSet<String>,
+    running: usize,
+    default_max_concurrency: Option<usize>,
+) -> FlowReadiness {
+    let missing_capabilities = missing_required_capabilities(entry, node_capabilities);
+    let max_concurrency = normalize_max_concurrency(entry.max_concurrency)
+        .or(default_max_concurrency.filter(|v| *v >= 1));
+    let concurrency_blocked = max_concurrency.map(|max| running >= max).unwrap_or(false);
+    FlowReadiness {
+        missing_capabilities,
+        max_concurrency,
+        running,
+        concurrency_blocked,
+    }
 }
 
 fn collect_watch_snapshot(pattern: &str) -> Result<HashMap<String, u64>> {
@@ -1631,6 +1707,19 @@ struct WorkflowEntry {
     workflow_workdir: Option<String>,
 }
 
+struct FlowReadiness {
+    missing_capabilities: Vec<String>,
+    max_concurrency: Option<usize>,
+    running: usize,
+    concurrency_blocked: bool,
+}
+
+impl FlowReadiness {
+    fn can_run(&self) -> bool {
+        self.missing_capabilities.is_empty() && !self.concurrency_blocked
+    }
+}
+
 enum TriggerLaunchOutcome {
     Launched(String),
     SkippedRunning,
@@ -1823,22 +1912,22 @@ async fn launch_workflow_from_entry(
     entry: &WorkflowEntry,
     trigger_source: &str,
 ) -> Result<TriggerLaunchOutcome> {
-    let missing_capabilities = missing_required_capabilities(entry, &state.node_capabilities);
-    if !missing_capabilities.is_empty() {
+    let running = running_workflow_count(state, &entry.workflow_name).await;
+    let readiness = evaluate_flow_readiness(entry, &state.node_capabilities, running, Some(1));
+    if !readiness.missing_capabilities.is_empty() {
         println!(
             "anna-rs daemon trigger={} workflow='{}' skipped: missing capabilities [{}]",
             trigger_source,
             entry.workflow_name,
-            missing_capabilities.join(", ")
+            readiness.missing_capabilities.join(", ")
         );
         return Ok(TriggerLaunchOutcome::SkippedCapability(
-            missing_capabilities,
+            readiness.missing_capabilities,
         ));
     }
 
-    let running = running_workflow_count(state, &entry.workflow_name).await;
-    let max_concurrency = trigger_max_concurrency(entry);
-    if running >= max_concurrency {
+    if readiness.concurrency_blocked {
+        let max_concurrency = readiness.max_concurrency.unwrap_or(1);
         if max_concurrency == 1 {
             println!(
                 "anna-rs daemon trigger={} workflow='{}' skipped: already running",
@@ -1848,10 +1937,10 @@ async fn launch_workflow_from_entry(
         }
         println!(
             "anna-rs daemon trigger={} workflow='{}' skipped: concurrency limit running={} max={}",
-            trigger_source, entry.workflow_name, running, max_concurrency
+            trigger_source, entry.workflow_name, readiness.running, max_concurrency
         );
         return Ok(TriggerLaunchOutcome::SkippedConcurrency {
-            running,
+            running: readiness.running,
             max_concurrency,
         });
     }
@@ -1960,11 +2049,12 @@ async fn launch_workflow(
 mod tests {
     use super::{
         DaemonHitl, DaemonStateSnapshot, HitlPending, SessionInfo, WorkflowEntry,
-        WorkflowMetaResponse, collect_watch_snapshot, find_workflow_entries_with_registry,
-        is_authorized, load_daemon_state, load_flow_registry, matches_workflow_meta_filters,
-        missing_required_capabilities, parse_run_registered_options, prune_hitl_in_place,
-        prune_sessions_in_place, resolve_registered_workflow_entry_with_registry,
-        resolve_watch_pattern, status_matches, temp_state_path,
+        WorkflowMetaResponse, collect_watch_snapshot, evaluate_flow_readiness,
+        find_workflow_entries_with_registry, is_authorized, load_daemon_state, load_flow_registry,
+        matches_workflow_meta_filters, missing_required_capabilities, parse_run_registered_options,
+        prune_hitl_in_place, prune_sessions_in_place,
+        resolve_registered_workflow_entry_with_registry, resolve_watch_pattern, status_matches,
+        temp_state_path,
     };
     use crate::executor::{HitlHandler, HitlRequest};
     use axum::http::{HeaderMap, HeaderValue};
@@ -2142,6 +2232,70 @@ mod tests {
         let wildcard = std::collections::HashSet::from(["*".to_string()]);
         let missing = missing_required_capabilities(&entry, &wildcard);
         assert!(missing.is_empty());
+    }
+
+    #[test]
+    fn evaluate_flow_readiness_checks_concurrency_and_capabilities() {
+        let entry = WorkflowEntry {
+            file_name: "x.anna".to_string(),
+            flow_id: Some("x".to_string()),
+            workflow_name: "x".to_string(),
+            path: std::path::PathBuf::from("/tmp/x.anna"),
+            tags: vec![],
+            required_capabilities: vec!["k8s".to_string()],
+            owner: None,
+            version: None,
+            max_concurrency: Some(2),
+            trigger_webhook: None,
+            trigger_watch: None,
+            trigger_cron: None,
+            trigger_interval: None,
+            workflow_workdir: None,
+        };
+
+        let caps = std::collections::HashSet::from(["k8s".to_string()]);
+        let ok = evaluate_flow_readiness(&entry, &caps, 1, None);
+        assert!(ok.can_run());
+        assert!(!ok.concurrency_blocked);
+
+        let blocked = evaluate_flow_readiness(&entry, &caps, 2, None);
+        assert!(!blocked.can_run());
+        assert!(blocked.concurrency_blocked);
+
+        let missing_caps = std::collections::HashSet::from(["shell".to_string()]);
+        let missing = evaluate_flow_readiness(&entry, &missing_caps, 0, None);
+        assert!(!missing.can_run());
+        assert_eq!(missing.missing_capabilities, vec!["k8s".to_string()]);
+    }
+
+    #[test]
+    fn evaluate_flow_readiness_uses_default_concurrency_when_requested() {
+        let entry = WorkflowEntry {
+            file_name: "x.anna".to_string(),
+            flow_id: Some("x".to_string()),
+            workflow_name: "x".to_string(),
+            path: std::path::PathBuf::from("/tmp/x.anna"),
+            tags: vec![],
+            required_capabilities: vec![],
+            owner: None,
+            version: None,
+            max_concurrency: None,
+            trigger_webhook: None,
+            trigger_watch: None,
+            trigger_cron: None,
+            trigger_interval: None,
+            workflow_workdir: None,
+        };
+        let caps = std::collections::HashSet::new();
+
+        let manual = evaluate_flow_readiness(&entry, &caps, 100, None);
+        assert!(manual.can_run());
+        assert_eq!(manual.max_concurrency, None);
+
+        let trigger_default = evaluate_flow_readiness(&entry, &caps, 1, Some(1));
+        assert!(!trigger_default.can_run());
+        assert!(trigger_default.concurrency_blocked);
+        assert_eq!(trigger_default.max_concurrency, Some(1));
     }
 
     #[test]

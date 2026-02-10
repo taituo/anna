@@ -43,6 +43,7 @@ anna submit workflow.anna
 anna workflows
 anna workflows-meta
 anna workflows-meta --available true --capability k8s
+anna can-run prod-deploy
 anna run-named prod-deploy --var ENV=prod --max-iterations 1
 anna hook deploy
 anna status <request_id>
@@ -142,9 +143,9 @@ Current MVP intentionally leaves some advanced features for next steps (multi-no
 
 ## Access Channels
 
-- CLI (`anna run`, `anna submit`, `anna status`)
-- HTTP control API (`/workflow`, `/workflow/{name}/run`, `/workflows`, `/workflows/meta`, `/hook/*`, `/hitl`, `/hitl/{id}/resolve`, `/ws`)
-- MCP stdio server (`anna mcp`) with tools: `list_flows`, `list_flows_meta`, `run_flow`, `session_status`, `tail_logs`, `stop_flow`, `list_sessions`, `stats`, `trigger_hook`, `list_hitl`, `resolve_hitl`
+- CLI (`anna run`, `anna submit`, `anna can-run`, `anna status`)
+- HTTP control API (`/workflow`, `/workflow/{name}/check`, `/workflow/{name}/run`, `/workflows`, `/workflows/meta`, `/hook/*`, `/hitl`, `/hitl/{id}/resolve`, `/ws`)
+- MCP stdio server (`anna mcp`) with tools: `list_flows`, `list_flows_meta`, `run_flow`, `can_run_flow`, `session_status`, `tail_logs`, `stop_flow`, `list_sessions`, `stats`, `trigger_hook`, `list_hitl`, `resolve_hitl`
 - Chat gateway (maps chat intents to approved flow runs)
 
 Minimal MCP smoke test:
