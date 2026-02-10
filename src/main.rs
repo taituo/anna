@@ -6,6 +6,8 @@ use reqwest::Client;
 use serde_json::json;
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
+use tokio::time::sleep;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -77,6 +79,32 @@ enum Commands {
         /// Daemon base URL
         #[arg(long, default_value = "http://127.0.0.1:8080")]
         daemon: String,
+    },
+    /// List daemon sessions
+    Sessions {
+        /// Daemon base URL
+        #[arg(long, default_value = "http://127.0.0.1:8080")]
+        daemon: String,
+        /// Optional status filter, e.g. running|done|failed
+        #[arg(long)]
+        status: Option<String>,
+        /// Optional max rows
+        #[arg(long)]
+        limit: Option<usize>,
+    },
+    /// Wait until workflow reaches terminal state
+    Wait {
+        /// Request id
+        id: String,
+        /// Daemon base URL
+        #[arg(long, default_value = "http://127.0.0.1:8080")]
+        daemon: String,
+        /// Poll interval in milliseconds
+        #[arg(long, default_value_t = 1000)]
+        poll_ms: u64,
+        /// Optional timeout in seconds
+        #[arg(long)]
+        timeout_sec: Option<u64>,
     },
     /// Stop daemon workflow by request id
     Stop {
@@ -230,6 +258,35 @@ async fn main() -> Result<()> {
                 .with_context(|| format!("failed querying workflow '{}' at {}", id, daemon))?;
             print_response(response).await
         }
+        Commands::Sessions {
+            daemon,
+            status,
+            limit,
+        } => {
+            let daemon = normalize_daemon_url(&daemon);
+            let client = Client::new();
+            let mut req = with_daemon_auth(client.get(format!("{}/sessions", daemon)));
+            if let Some(status) = status {
+                req = req.query(&[("status", status)]);
+            }
+            if let Some(limit) = limit {
+                req = req.query(&[("limit", limit)]);
+            }
+            let response = req
+                .send()
+                .await
+                .with_context(|| format!("failed querying sessions at {}", daemon))?;
+            print_response(response).await
+        }
+        Commands::Wait {
+            id,
+            daemon,
+            poll_ms,
+            timeout_sec,
+        } => {
+            let daemon = normalize_daemon_url(&daemon);
+            wait_for_workflow(&daemon, &id, poll_ms.max(50), timeout_sec).await
+        }
         Commands::Stop { id, daemon } => {
             let daemon = normalize_daemon_url(&daemon);
             let client = Client::new();
@@ -344,5 +401,103 @@ async fn print_response(response: reqwest::Response) -> Result<()> {
         Err(anyhow!("request failed with status {}", status))
     } else {
         Err(anyhow!("request failed with status {}: {}", status, body))
+    }
+}
+
+async fn wait_for_workflow(
+    daemon: &str,
+    id: &str,
+    poll_ms: u64,
+    timeout_sec: Option<u64>,
+) -> Result<()> {
+    let client = Client::new();
+    let daemon = normalize_daemon_url(daemon);
+    let started = Instant::now();
+    let timeout = timeout_sec.map(Duration::from_secs);
+    let mut previous_status = String::new();
+
+    loop {
+        if let Some(limit) = timeout
+            && started.elapsed() >= limit
+        {
+            return Err(anyhow!(
+                "timeout waiting for workflow '{}' after {}s",
+                id,
+                limit.as_secs()
+            ));
+        }
+
+        let response = with_daemon_auth(client.get(format!("{}/workflow/{}", daemon, id)))
+            .send()
+            .await
+            .with_context(|| format!("failed querying workflow '{}' at {}", id, daemon))?;
+        let status_code = response.status();
+        let body = response
+            .text()
+            .await
+            .context("failed reading workflow status response")?;
+        if !status_code.is_success() {
+            if body.trim().is_empty() {
+                return Err(anyhow!(
+                    "request failed with status {} while waiting for '{}'",
+                    status_code,
+                    id
+                ));
+            }
+            return Err(anyhow!(
+                "request failed with status {} while waiting for '{}': {}",
+                status_code,
+                id,
+                body
+            ));
+        }
+
+        let parsed: serde_json::Value =
+            serde_json::from_str(&body).context("daemon returned non-json workflow status")?;
+        let status = parsed
+            .get("status")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown")
+            .to_string();
+
+        if status != previous_status {
+            println!("status={}", status);
+            previous_status = status.clone();
+        }
+
+        if is_terminal_status(&status) {
+            println!("{}", serde_json::to_string_pretty(&parsed)?);
+            if status == "done" {
+                return Ok(());
+            }
+            return Err(anyhow!(
+                "workflow '{}' finished with non-success status '{}'",
+                id,
+                status
+            ));
+        }
+
+        sleep(Duration::from_millis(poll_ms)).await;
+    }
+}
+
+fn is_terminal_status(status: &str) -> bool {
+    matches!(
+        status.trim().to_ascii_lowercase().as_str(),
+        "done" | "failed" | "stopped" | "not_running"
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_terminal_status;
+
+    #[test]
+    fn terminal_statuses_match_expected_values() {
+        assert!(is_terminal_status("done"));
+        assert!(is_terminal_status("FAILED"));
+        assert!(is_terminal_status("stopped"));
+        assert!(is_terminal_status("not_running"));
+        assert!(!is_terminal_status("running"));
     }
 }

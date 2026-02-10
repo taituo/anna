@@ -38,6 +38,8 @@ struct SessionInfo {
     id: String,
     status: String,
     workflow: String,
+    created_at: u64,
+    updated_at: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     runtime_session_id: Option<String>,
     #[serde(skip_serializing_if = "HashMap::is_empty", default)]
@@ -106,6 +108,12 @@ struct HitlResolveBody {
     decision: String,
 }
 
+#[derive(Debug, Deserialize, Default)]
+struct SessionsQuery {
+    status: Option<String>,
+    limit: Option<usize>,
+}
+
 #[derive(Debug, Default)]
 struct TriggerScheduler {
     interval_next: HashMap<String, Instant>,
@@ -167,6 +175,7 @@ pub async fn run_daemon(bind: &str, plays_dir: PathBuf) -> Result<()> {
 
     let app = Router::new()
         .route("/health", get(health))
+        .route("/sessions", get(list_sessions))
         .route("/workflows", get(list_workflows))
         .route("/workflow", post(start_workflow))
         .route("/workflow/{name}/run", post(run_registered_workflow))
@@ -200,6 +209,32 @@ async fn list_workflows(State(state): State<AppState>, headers: HeaderMap) -> im
         )
             .into_response(),
     }
+}
+
+async fn list_sessions(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<SessionsQuery>,
+) -> impl IntoResponse {
+    if let Some(resp) = ensure_authorized(&state, &headers) {
+        return resp;
+    }
+
+    let mut items = state
+        .sessions
+        .read()
+        .await
+        .values()
+        .cloned()
+        .collect::<Vec<_>>();
+    if let Some(filter) = query.status.as_deref() {
+        items.retain(|v| status_matches(&v.status, filter));
+    }
+    items.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+    if let Some(limit) = query.limit {
+        items.truncate(limit);
+    }
+    Json(items).into_response()
 }
 
 async fn start_workflow(
@@ -342,6 +377,7 @@ async fn stop_workflow(
     let mut sessions = state.sessions.write().await;
     if let Some(info) = sessions.get_mut(&id) {
         info.status = if stopped { "stopped" } else { "not_running" }.to_string();
+        info.updated_at = now_unix_secs();
         return (StatusCode::OK, Json(info.clone())).into_response();
     }
 
@@ -773,6 +809,10 @@ fn is_authorized(headers: &HeaderMap, expected: &str) -> bool {
         .unwrap_or(false)
 }
 
+fn status_matches(status: &str, filter: &str) -> bool {
+    status.eq_ignore_ascii_case(filter.trim())
+}
+
 async fn find_workflows(root: &FsPath) -> Result<Vec<String>> {
     let mut out = find_workflow_entries(root)
         .await?
@@ -958,12 +998,15 @@ async fn launch_workflow_from_entry(
 async fn launch_workflow(state: &AppState, workflow: Workflow) -> Result<String> {
     let req_id = crate::session::gen_session_id();
     let runtime_session_id = crate::session::gen_session_id();
+    let now = now_unix_secs();
     state.sessions.write().await.insert(
         req_id.clone(),
         SessionInfo {
             id: req_id.clone(),
             status: "running".to_string(),
             workflow: workflow.name.clone(),
+            created_at: now,
+            updated_at: now,
             runtime_session_id: Some(runtime_session_id.clone()),
             outputs: HashMap::new(),
             errors: Vec::new(),
@@ -989,12 +1032,14 @@ async fn launch_workflow(state: &AppState, workflow: Workflow) -> Result<String>
             match run {
                 Ok(result) => {
                     info.status = "done".to_string();
+                    info.updated_at = now_unix_secs();
                     info.runtime_session_id = Some(result.session_id);
                     info.outputs = result.outputs;
                     info.errors = result.errors;
                 }
                 Err(err) => {
                     info.status = "failed".to_string();
+                    info.updated_at = now_unix_secs();
                     info.errors.push(err.to_string());
                 }
             }
@@ -1199,5 +1244,12 @@ mod tests {
             HeaderValue::from_static("Bearer wrong-token"),
         );
         assert!(!is_authorized(&wrong, "secret-token"));
+    }
+
+    #[test]
+    fn status_filter_is_case_insensitive_exact_match() {
+        assert!(super::status_matches("running", "RUNNING"));
+        assert!(super::status_matches("failed", " failed "));
+        assert!(!super::status_matches("running", "run"));
     }
 }

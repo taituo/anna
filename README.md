@@ -42,6 +42,8 @@ anna submit workflow.anna
 anna workflows
 anna hook deploy
 anna status <request_id>
+anna sessions --status running
+anna wait <request_id> --timeout-sec 300
 anna hitl list
 ```
 
