@@ -145,6 +145,12 @@ enum Commands {
         #[arg(long, default_value = "http://127.0.0.1:8080")]
         daemon: String,
     },
+    /// Show daemon policy/capability configuration summary
+    Policy {
+        /// Daemon base URL
+        #[arg(long, default_value = "http://127.0.0.1:8080")]
+        daemon: String,
+    },
     /// Wait until workflow reaches terminal state
     Wait {
         /// Request id
@@ -420,6 +426,15 @@ async fn main() -> Result<()> {
                 .send()
                 .await
                 .with_context(|| format!("failed querying stats at {}", daemon))?;
+            print_response(response).await
+        }
+        Commands::Policy { daemon } => {
+            let daemon = normalize_daemon_url(&daemon);
+            let client = Client::new();
+            let response = with_daemon_auth(client.get(format!("{}/policy", daemon)))
+                .send()
+                .await
+                .with_context(|| format!("failed querying policy at {}", daemon))?;
             print_response(response).await
         }
         Commands::Wait {

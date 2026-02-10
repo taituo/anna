@@ -71,6 +71,24 @@ struct StatsResponse {
 }
 
 #[derive(Debug, Serialize)]
+struct PolicyResponse {
+    registry_enabled: bool,
+    auth_enabled: bool,
+    node_capabilities: Vec<String>,
+    owner_limits: Vec<OwnerLimitEntry>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    owner_default_limit: Option<usize>,
+    retention_max_sessions: usize,
+    retention_max_hitl: usize,
+}
+
+#[derive(Debug, Serialize)]
+struct OwnerLimitEntry {
+    owner: String,
+    max_concurrency: usize,
+}
+
+#[derive(Debug, Serialize)]
 struct StartWorkflowResponse {
     id: String,
     status: String,
@@ -384,6 +402,7 @@ pub async fn run_daemon(bind: &str, plays_dir: PathBuf) -> Result<()> {
 
     let app = Router::new()
         .route("/health", get(health))
+        .route("/policy", get(policy))
         .route("/stats", get(stats))
         .route("/sessions", get(list_sessions))
         .route("/workflows", get(list_workflows))
@@ -407,6 +426,36 @@ pub async fn run_daemon(bind: &str, plays_dir: PathBuf) -> Result<()> {
 
 async fn health() -> Json<HealthResponse> {
     Json(HealthResponse { ok: true })
+}
+
+async fn policy(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
+    if let Some(resp) = ensure_authorized(&state, &headers) {
+        return resp;
+    }
+
+    let mut node_capabilities = state.node_capabilities.iter().cloned().collect::<Vec<_>>();
+    node_capabilities.sort();
+    let mut owner_limits = state
+        .owner_policy
+        .per_owner
+        .iter()
+        .map(|(owner, max_concurrency)| OwnerLimitEntry {
+            owner: owner.clone(),
+            max_concurrency: *max_concurrency,
+        })
+        .collect::<Vec<_>>();
+    owner_limits.sort_by(|a, b| a.owner.cmp(&b.owner));
+
+    Json(PolicyResponse {
+        registry_enabled: state.registry_file.is_some(),
+        auth_enabled: state.auth_token.is_some(),
+        node_capabilities,
+        owner_limits,
+        owner_default_limit: state.owner_policy.default_limit,
+        retention_max_sessions: state.retention.max_sessions,
+        retention_max_hitl: state.retention.max_hitl,
+    })
+    .into_response()
 }
 
 async fn stats(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {

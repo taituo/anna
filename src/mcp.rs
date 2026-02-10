@@ -224,6 +224,11 @@ fn tool_specs() -> Vec<Value> {
             "inputSchema": { "type": "object", "additionalProperties": false }
         }),
         json!({
+            "name": "policy",
+            "description": "Get daemon policy and capability configuration summary",
+            "inputSchema": { "type": "object", "additionalProperties": false }
+        }),
+        json!({
             "name": "trigger_hook",
             "description": "Trigger daemon webhook hook by name",
             "inputSchema": {
@@ -422,6 +427,14 @@ async fn handle_tools_call(client: &Client, config: &McpConfig, params: &Value) 
             .await?;
             Ok(body)
         }
+        "policy" => {
+            let body = send(authed(
+                client.get(format!("{}/policy", daemon)),
+                &config.daemon_token,
+            ))
+            .await?;
+            Ok(body)
+        }
         "trigger_hook" => {
             let name = arg_required_string(&args, "name")?;
             let body = send(authed(
@@ -590,6 +603,7 @@ mod tests {
         assert!(names.contains(&"tail_logs"));
         assert!(names.contains(&"stop_flow"));
         assert!(names.contains(&"stats"));
+        assert!(names.contains(&"policy"));
     }
 
     #[test]
