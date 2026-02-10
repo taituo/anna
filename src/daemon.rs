@@ -105,6 +105,7 @@ struct HookTriggerResponse {
     launched: Vec<HookLaunchedWorkflow>,
     skipped_running: Vec<String>,
     skipped_capability: Vec<HookSkippedCapability>,
+    skipped_provider: Vec<HookSkippedProvider>,
     skipped_concurrency: Vec<HookSkippedConcurrency>,
 }
 
@@ -118,6 +119,12 @@ struct HookLaunchedWorkflow {
 struct HookSkippedCapability {
     workflow: String,
     missing_capabilities: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct HookSkippedProvider {
+    workflow: String,
+    missing_providers: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -137,6 +144,8 @@ struct WorkflowMetaResponse {
     tags: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     required_capabilities: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    required_providers: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     owner: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -152,6 +161,8 @@ struct WorkflowMetaResponse {
     available: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     missing_capabilities: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    missing_providers: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     trigger_webhook: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -181,6 +192,8 @@ struct FlowCheckResponse {
     owner_concurrency_blocked: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     missing_capabilities: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    missing_providers: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -606,6 +619,7 @@ async fn list_workflows_meta(
             let readiness = evaluate_flow_readiness(
                 &entry,
                 &state.node_capabilities,
+                state.allowed_providers.as_ref(),
                 running,
                 None,
                 owner_running,
@@ -618,6 +632,7 @@ async fn list_workflows_meta(
                 path: entry.path.display().to_string(),
                 tags: entry.tags,
                 required_capabilities: entry.required_capabilities,
+                required_providers: entry.required_providers,
                 owner: entry.owner,
                 version: entry.version,
                 max_concurrency: entry.max_concurrency,
@@ -628,6 +643,7 @@ async fn list_workflows_meta(
                 owner_concurrency_blocked: readiness.owner_concurrency_blocked,
                 available: readiness.can_run(),
                 missing_capabilities: readiness.missing_capabilities,
+                missing_providers: readiness.missing_providers,
                 trigger_webhook: entry.trigger_webhook,
                 trigger_watch: entry.trigger_watch,
                 trigger_cron: entry.trigger_cron,
@@ -775,6 +791,7 @@ async fn run_registered_workflow(
     let readiness = evaluate_flow_readiness(
         &entry,
         &state.node_capabilities,
+        state.allowed_providers.as_ref(),
         running,
         None,
         owner_running,
@@ -787,6 +804,17 @@ async fn run_registered_workflow(
                 "workflow '{}' requires missing capabilities: {}",
                 name,
                 readiness.missing_capabilities.join(", ")
+            ),
+        )
+            .into_response();
+    }
+    if !readiness.missing_providers.is_empty() {
+        return (
+            StatusCode::FORBIDDEN,
+            format!(
+                "workflow '{}' requires blocked providers: {}",
+                name,
+                readiness.missing_providers.join(", ")
             ),
         )
             .into_response();
@@ -886,6 +914,7 @@ async fn check_registered_workflow(
     let readiness = evaluate_flow_readiness(
         &entry,
         &state.node_capabilities,
+        state.allowed_providers.as_ref(),
         running,
         None,
         owner_running,
@@ -907,6 +936,7 @@ async fn check_registered_workflow(
             owner_max_concurrency: readiness.owner_max_concurrency.map(|v| v as u32),
             owner_concurrency_blocked: readiness.owner_concurrency_blocked,
             missing_capabilities: readiness.missing_capabilities,
+            missing_providers: readiness.missing_providers,
         }),
     )
         .into_response()
@@ -987,6 +1017,7 @@ async fn trigger_hook(
     let mut launched = Vec::new();
     let mut skipped_running = Vec::new();
     let mut skipped_capability = Vec::new();
+    let mut skipped_provider = Vec::new();
     let mut skipped_concurrency = Vec::new();
     for entry in entries {
         if let Some(webhook) = entry.trigger_webhook.as_deref()
@@ -1008,6 +1039,12 @@ async fn trigger_hook(
                         missing_capabilities,
                     });
                 }
+                Ok(TriggerLaunchOutcome::SkippedProvider(missing_providers)) => {
+                    skipped_provider.push(HookSkippedProvider {
+                        workflow: entry.workflow_name,
+                        missing_providers,
+                    });
+                }
                 Ok(TriggerLaunchOutcome::SkippedConcurrency {
                     running,
                     max_concurrency,
@@ -1026,6 +1063,7 @@ async fn trigger_hook(
     if launched.is_empty()
         && skipped_running.is_empty()
         && skipped_capability.is_empty()
+        && skipped_provider.is_empty()
         && skipped_concurrency.is_empty()
     {
         return (StatusCode::NOT_FOUND, "no workflows for hook").into_response();
@@ -1037,6 +1075,7 @@ async fn trigger_hook(
             launched,
             skipped_running,
             skipped_capability,
+            skipped_provider,
             skipped_concurrency,
         }),
     )
@@ -1213,6 +1252,13 @@ async fn run_interval_triggers(
                         missing.join(", ")
                     );
                 }
+                Ok(TriggerLaunchOutcome::SkippedProvider(missing)) => {
+                    eprintln!(
+                        "anna-rs scheduler: skipped interval trigger '{}' due to blocked providers: {}",
+                        entry.workflow_name,
+                        missing.join(", ")
+                    );
+                }
                 Ok(TriggerLaunchOutcome::SkippedConcurrency {
                     running,
                     max_concurrency,
@@ -1282,6 +1328,13 @@ async fn run_cron_triggers(
                 Ok(TriggerLaunchOutcome::SkippedCapability(missing)) => {
                     eprintln!(
                         "anna-rs scheduler: skipped cron trigger '{}' due to missing capabilities: {}",
+                        entry.workflow_name,
+                        missing.join(", ")
+                    );
+                }
+                Ok(TriggerLaunchOutcome::SkippedProvider(missing)) => {
+                    eprintln!(
+                        "anna-rs scheduler: skipped cron trigger '{}' due to blocked providers: {}",
                         entry.workflow_name,
                         missing.join(", ")
                     );
@@ -1362,6 +1415,13 @@ async fn run_watch_triggers(
                 Ok(TriggerLaunchOutcome::SkippedCapability(missing)) => {
                     eprintln!(
                         "anna-rs scheduler: skipped watch trigger '{}' due to missing capabilities: {}",
+                        entry.workflow_name,
+                        missing.join(", ")
+                    );
+                }
+                Ok(TriggerLaunchOutcome::SkippedProvider(missing)) => {
+                    eprintln!(
+                        "anna-rs scheduler: skipped watch trigger '{}' due to blocked providers: {}",
                         entry.workflow_name,
                         missing.join(", ")
                     );
@@ -1452,6 +1512,62 @@ fn missing_required_capabilities(
     missing
 }
 
+fn collect_required_providers(workflow: &Workflow) -> Vec<String> {
+    let mut providers = HashSet::new();
+    for stage in &workflow.stages {
+        if stage.workflow.is_none() {
+            providers.insert(stage.provider_name().trim().to_ascii_lowercase());
+        }
+        if stage.vote.is_some() {
+            providers.insert("llm".to_string());
+        }
+        if stage
+            .before
+            .as_deref()
+            .map(|v| !v.trim().is_empty())
+            .unwrap_or(false)
+            || stage
+                .after
+                .as_deref()
+                .map(|v| !v.trim().is_empty())
+                .unwrap_or(false)
+            || stage
+                .on_error
+                .as_deref()
+                .map(|v| !v.trim().is_empty())
+                .unwrap_or(false)
+        {
+            providers.insert("shell".to_string());
+        }
+    }
+    let mut out = providers
+        .into_iter()
+        .filter(|v| !v.trim().is_empty())
+        .collect::<Vec<_>>();
+    out.sort();
+    out
+}
+
+fn missing_required_providers(
+    entry: &WorkflowEntry,
+    allowed_providers: Option<&HashSet<String>>,
+) -> Vec<String> {
+    let Some(allowed) = allowed_providers else {
+        return Vec::new();
+    };
+
+    let mut missing = entry
+        .required_providers
+        .iter()
+        .map(|provider| provider.trim().to_ascii_lowercase())
+        .filter(|provider| !provider.is_empty())
+        .filter(|provider| !allowed.contains(provider))
+        .collect::<Vec<_>>();
+    missing.sort();
+    missing.dedup();
+    missing
+}
+
 fn normalize_max_concurrency(raw: Option<u32>) -> Option<usize> {
     raw.map(|v| v as usize).filter(|v| *v >= 1)
 }
@@ -1459,12 +1575,14 @@ fn normalize_max_concurrency(raw: Option<u32>) -> Option<usize> {
 fn evaluate_flow_readiness(
     entry: &WorkflowEntry,
     node_capabilities: &HashSet<String>,
+    allowed_providers: Option<&HashSet<String>>,
     running: usize,
     default_max_concurrency: Option<usize>,
     owner_running: usize,
     owner_max_concurrency: Option<usize>,
 ) -> FlowReadiness {
     let missing_capabilities = missing_required_capabilities(entry, node_capabilities);
+    let missing_providers = missing_required_providers(entry, allowed_providers);
     let max_concurrency = normalize_max_concurrency(entry.max_concurrency)
         .or(default_max_concurrency.filter(|v| *v >= 1));
     let concurrency_blocked = max_concurrency.map(|max| running >= max).unwrap_or(false);
@@ -1473,6 +1591,7 @@ fn evaluate_flow_readiness(
         .unwrap_or(false);
     FlowReadiness {
         missing_capabilities,
+        missing_providers,
         max_concurrency,
         running,
         concurrency_blocked,
@@ -1983,6 +2102,7 @@ struct WorkflowEntry {
     path: PathBuf,
     tags: Vec<String>,
     required_capabilities: Vec<String>,
+    required_providers: Vec<String>,
     owner: Option<String>,
     version: Option<String>,
     max_concurrency: Option<u32>,
@@ -1995,6 +2115,7 @@ struct WorkflowEntry {
 
 struct FlowReadiness {
     missing_capabilities: Vec<String>,
+    missing_providers: Vec<String>,
     max_concurrency: Option<usize>,
     running: usize,
     concurrency_blocked: bool,
@@ -2006,6 +2127,7 @@ struct FlowReadiness {
 impl FlowReadiness {
     fn can_run(&self) -> bool {
         self.missing_capabilities.is_empty()
+            && self.missing_providers.is_empty()
             && !self.concurrency_blocked
             && !self.owner_concurrency_blocked
     }
@@ -2015,6 +2137,7 @@ enum TriggerLaunchOutcome {
     Launched(String),
     SkippedRunning,
     SkippedCapability(Vec<String>),
+    SkippedProvider(Vec<String>),
     SkippedConcurrency {
         running: usize,
         max_concurrency: usize,
@@ -2114,6 +2237,7 @@ async fn find_workflow_entries_with_registry(
                 .ok_or_else(|| {
                     anyhow::anyhow!("invalid workflow filename in '{}'", path.display())
                 })?;
+            let required_providers = collect_required_providers(&wf);
             out.push(WorkflowEntry {
                 file_name,
                 flow_id: Some(spec.flow_id),
@@ -2121,6 +2245,7 @@ async fn find_workflow_entries_with_registry(
                 path,
                 tags: spec.tags,
                 required_capabilities: spec.required_capabilities,
+                required_providers,
                 owner: spec.owner,
                 version: spec.version,
                 max_concurrency: spec.max_concurrency,
@@ -2161,6 +2286,7 @@ async fn find_workflow_entries_with_registry(
             Ok(v) => v,
             Err(_) => continue,
         };
+        let required_providers = collect_required_providers(&wf);
         out.push(WorkflowEntry {
             file_name,
             flow_id: None,
@@ -2168,6 +2294,7 @@ async fn find_workflow_entries_with_registry(
             path,
             tags: vec![],
             required_capabilities: vec![],
+            required_providers,
             owner: None,
             version: None,
             max_concurrency: None,
@@ -2218,6 +2345,7 @@ async fn launch_workflow_from_entry(
     let readiness = evaluate_flow_readiness(
         entry,
         &state.node_capabilities,
+        state.allowed_providers.as_ref(),
         running,
         Some(1),
         owner_running,
@@ -2232,6 +2360,17 @@ async fn launch_workflow_from_entry(
         );
         return Ok(TriggerLaunchOutcome::SkippedCapability(
             readiness.missing_capabilities,
+        ));
+    }
+    if !readiness.missing_providers.is_empty() {
+        println!(
+            "anna-rs daemon trigger={} workflow='{}' skipped: blocked providers [{}]",
+            trigger_source,
+            entry.workflow_name,
+            readiness.missing_providers.join(", ")
+        );
+        return Ok(TriggerLaunchOutcome::SkippedProvider(
+            readiness.missing_providers,
         ));
     }
 
@@ -2382,14 +2521,15 @@ async fn launch_workflow(
 mod tests {
     use super::{
         DaemonHitl, DaemonStateSnapshot, HitlPending, SessionInfo, WorkflowEntry,
-        WorkflowMetaResponse, collect_watch_snapshot, evaluate_flow_readiness,
-        find_workflow_entries_with_registry, is_authorized, load_daemon_state, load_flow_registry,
-        matches_workflow_meta_filters, missing_required_capabilities, parse_run_registered_options,
-        prune_hitl_in_place, prune_sessions_in_place,
-        resolve_registered_workflow_entry_with_registry, resolve_watch_pattern, status_matches,
-        temp_state_path,
+        WorkflowMetaResponse, collect_required_providers, collect_watch_snapshot,
+        evaluate_flow_readiness, find_workflow_entries_with_registry, is_authorized,
+        load_daemon_state, load_flow_registry, matches_workflow_meta_filters,
+        missing_required_capabilities, parse_run_registered_options, prune_hitl_in_place,
+        prune_sessions_in_place, resolve_registered_workflow_entry_with_registry,
+        resolve_watch_pattern, status_matches, temp_state_path,
     };
     use crate::executor::{HitlHandler, HitlRequest};
+    use crate::workflow::{Stage, Workflow};
     use axum::http::{HeaderMap, HeaderValue};
     use std::collections::HashMap;
     use std::sync::Arc;
@@ -2540,6 +2680,7 @@ mod tests {
             path: std::path::PathBuf::from("/tmp/x.anna"),
             tags: vec![],
             required_capabilities: vec!["K8S".to_string(), "vault".to_string()],
+            required_providers: vec![],
             owner: None,
             version: None,
             max_concurrency: Some(2),
@@ -2576,6 +2717,7 @@ mod tests {
             path: std::path::PathBuf::from("/tmp/x.anna"),
             tags: vec![],
             required_capabilities: vec!["k8s".to_string()],
+            required_providers: vec![],
             owner: None,
             version: None,
             max_concurrency: Some(2),
@@ -2587,19 +2729,87 @@ mod tests {
         };
 
         let caps = std::collections::HashSet::from(["k8s".to_string()]);
-        let ok = evaluate_flow_readiness(&entry, &caps, 1, None, 0, None);
+        let ok = evaluate_flow_readiness(&entry, &caps, None, 1, None, 0, None);
         assert!(ok.can_run());
         assert!(!ok.concurrency_blocked);
         assert!(!ok.owner_concurrency_blocked);
 
-        let blocked = evaluate_flow_readiness(&entry, &caps, 2, None, 0, None);
+        let blocked = evaluate_flow_readiness(&entry, &caps, None, 2, None, 0, None);
         assert!(!blocked.can_run());
         assert!(blocked.concurrency_blocked);
 
         let missing_caps = std::collections::HashSet::from(["shell".to_string()]);
-        let missing = evaluate_flow_readiness(&entry, &missing_caps, 0, None, 0, None);
+        let missing = evaluate_flow_readiness(&entry, &missing_caps, None, 0, None, 0, None);
         assert!(!missing.can_run());
         assert_eq!(missing.missing_capabilities, vec!["k8s".to_string()]);
+    }
+
+    #[test]
+    fn evaluate_flow_readiness_blocks_missing_provider() {
+        let entry = WorkflowEntry {
+            file_name: "x.anna".to_string(),
+            flow_id: Some("x".to_string()),
+            workflow_name: "x".to_string(),
+            path: std::path::PathBuf::from("/tmp/x.anna"),
+            tags: vec![],
+            required_capabilities: vec![],
+            required_providers: vec!["shell".to_string(), "cli".to_string()],
+            owner: None,
+            version: None,
+            max_concurrency: None,
+            trigger_webhook: None,
+            trigger_watch: None,
+            trigger_cron: None,
+            trigger_interval: None,
+            workflow_workdir: None,
+        };
+
+        let caps = std::collections::HashSet::new();
+        let allowed = std::collections::HashSet::from(["shell".to_string()]);
+        let readiness = evaluate_flow_readiness(&entry, &caps, Some(&allowed), 0, None, 0, None);
+        assert!(!readiness.can_run());
+        assert_eq!(readiness.missing_providers, vec!["cli".to_string()]);
+    }
+
+    #[test]
+    fn collect_required_providers_detects_hooks_vote_and_stage_provider() {
+        let workflow = Workflow {
+            name: "providers-test".to_string(),
+            mode: "once".to_string(),
+            memory: false,
+            tags: vec![],
+            vars: HashMap::new(),
+            env: HashMap::new(),
+            workdir: None,
+            trigger: Default::default(),
+            stages: vec![
+                Stage {
+                    id: "build".to_string(),
+                    provider: "cli".to_string(),
+                    exec: Some("echo hi".to_string()),
+                    ..Default::default()
+                },
+                Stage {
+                    id: "judge".to_string(),
+                    vote: Some("pick best".to_string()),
+                    each: vec!["a".to_string(), "b".to_string()],
+                    ..Default::default()
+                },
+                Stage {
+                    id: "hooks".to_string(),
+                    workflow: Some("child.anna".to_string()),
+                    before: Some("echo before".to_string()),
+                    ..Default::default()
+                },
+            ],
+            source_path: None,
+        };
+
+        let providers = collect_required_providers(&workflow);
+        assert_eq!(
+            providers,
+            vec!["cli".to_string(), "llm".to_string(), "shell".to_string()]
+        );
     }
 
     #[test]
@@ -2611,6 +2821,7 @@ mod tests {
             path: std::path::PathBuf::from("/tmp/x.anna"),
             tags: vec![],
             required_capabilities: vec![],
+            required_providers: vec![],
             owner: None,
             version: None,
             max_concurrency: None,
@@ -2622,11 +2833,11 @@ mod tests {
         };
         let caps = std::collections::HashSet::new();
 
-        let manual = evaluate_flow_readiness(&entry, &caps, 100, None, 0, None);
+        let manual = evaluate_flow_readiness(&entry, &caps, None, 100, None, 0, None);
         assert!(manual.can_run());
         assert_eq!(manual.max_concurrency, None);
 
-        let trigger_default = evaluate_flow_readiness(&entry, &caps, 1, Some(1), 0, None);
+        let trigger_default = evaluate_flow_readiness(&entry, &caps, None, 1, Some(1), 0, None);
         assert!(!trigger_default.can_run());
         assert!(trigger_default.concurrency_blocked);
         assert_eq!(trigger_default.max_concurrency, Some(1));
@@ -2641,6 +2852,7 @@ mod tests {
             path: std::path::PathBuf::from("/tmp/x.anna"),
             tags: vec![],
             required_capabilities: vec![],
+            required_providers: vec![],
             owner: Some("platform".to_string()),
             version: None,
             max_concurrency: Some(10),
@@ -2651,7 +2863,7 @@ mod tests {
             workflow_workdir: None,
         };
         let caps = std::collections::HashSet::new();
-        let readiness = evaluate_flow_readiness(&entry, &caps, 0, None, 3, Some(3));
+        let readiness = evaluate_flow_readiness(&entry, &caps, None, 0, None, 3, Some(3));
         assert!(!readiness.can_run());
         assert!(readiness.owner_concurrency_blocked);
         assert_eq!(readiness.owner_running, 3);
@@ -2753,6 +2965,7 @@ mod tests {
             path: "/tmp/deploy.anna".to_string(),
             tags: vec!["prod".to_string(), "deploy".to_string()],
             required_capabilities: vec!["k8s".to_string(), "vault".to_string()],
+            required_providers: vec!["shell".to_string(), "k8s".to_string()],
             owner: Some("platform".to_string()),
             version: Some("v1".to_string()),
             max_concurrency: Some(2),
@@ -2763,6 +2976,7 @@ mod tests {
             owner_concurrency_blocked: false,
             available: false,
             missing_capabilities: vec!["vault".to_string()],
+            missing_providers: vec![],
             trigger_webhook: Some("/deploy".to_string()),
             trigger_watch: None,
             trigger_cron: None,

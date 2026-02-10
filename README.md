@@ -154,6 +154,7 @@ When registry is enabled:
 - `anna run-named` accepts optional runtime options (`vars`, `max_iterations`, `--precheck`)
 - hook/cron/watch/interval trigger scans are limited to registry entries
 - flows with missing `required_capabilities` are skipped/blocked with explicit reason
+- flows with blocked `required_providers` (from `ANNA_ALLOWED_PROVIDERS`) are skipped/blocked with explicit reason
 - optional `max_concurrency` caps simultaneous runs for named/manual runs and trigger launches
 - optional owner policy (`ANNA_OWNER_MAX_CONCURRENCY`) caps total running sessions per owner
 
