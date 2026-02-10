@@ -91,6 +91,15 @@ Current MVP intentionally leaves some advanced features for next steps (multi-no
 - MCP stdio server (`anna mcp`) with tools: `list_flows`, `run_flow`, `session_status`, `tail_logs`, `stop_flow`, `list_sessions`, `trigger_hook`, `list_hitl`, `resolve_hitl`
 - Chat gateway (maps chat intents to approved flow runs)
 
+Minimal MCP smoke test:
+
+```bash
+printf '%s\n' \
+  '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}' \
+  '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}' \
+  | anna mcp
+```
+
 For complete syntax and advanced examples, read `anna.md` first, then `anna_language.md`.
 For runtime/control-plane design, read `architecture_modes.md`.
 
