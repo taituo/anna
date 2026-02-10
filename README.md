@@ -38,6 +38,7 @@ stages:
 anna validate
 anna run workflow.anna
 anna daemon
+anna mcp
 anna submit workflow.anna
 anna workflows
 anna hook deploy
@@ -87,7 +88,7 @@ Current MVP intentionally leaves some advanced features for next steps (multi-no
 
 - CLI (`anna run`, `anna submit`, `anna status`)
 - HTTP control API (`/workflow`, `/hook/*`, `/hitl`, `/hitl/{id}/resolve`, `/ws`)
-- MCP tools (`list_flows`, `run_flow`, `session_status`, `tail_logs`, `stop_flow`)
+- MCP stdio server (`anna mcp`) with tools: `list_flows`, `run_flow`, `session_status`, `tail_logs`, `stop_flow`, `list_sessions`, `trigger_hook`, `list_hitl`, `resolve_hitl`
 - Chat gateway (maps chat intents to approved flow runs)
 
 For complete syntax and advanced examples, read `anna.md` first, then `anna_language.md`.

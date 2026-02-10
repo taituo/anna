@@ -50,6 +50,12 @@ enum Commands {
         #[arg(long)]
         plays_dir: Option<PathBuf>,
     },
+    /// Run MCP stdio tool server
+    Mcp {
+        /// Daemon base URL used by MCP tools
+        #[arg(long, default_value = "http://127.0.0.1:8080")]
+        daemon: String,
+    },
     /// Submit workflow YAML file to daemon
     Submit {
         /// Path to .anna workflow file
@@ -226,6 +232,13 @@ async fn main() -> Result<()> {
             };
             anna_rs::daemon::run_daemon(&bind, root).await?;
             Ok(())
+        }
+        Commands::Mcp { daemon } => {
+            anna_rs::mcp::run_stdio_server(anna_rs::mcp::McpConfig {
+                daemon_url: normalize_daemon_url(&daemon),
+                daemon_token: daemon_auth_token(),
+            })
+            .await
         }
         Commands::Submit { workflow, daemon } => {
             let daemon = normalize_daemon_url(&daemon);
