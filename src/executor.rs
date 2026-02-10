@@ -118,56 +118,97 @@ impl Executor {
             .await?;
 
         let stage_result = async {
-            if let Some(before) = &runtime_stage.before {
-                let _ = self
-                    .run_hook(workflow, &runtime_stage, before, result)
-                    .await;
-            }
-
-            let output = match self.execute_stage(workflow, &runtime_stage, result).await {
-                Ok(v) => v,
-                Err(err) => {
-                    let error_message = err.to_string();
-                    write_stage_log(&result.session_id, &runtime_stage.id, &error_message).await?;
-                    result.set_error(&runtime_stage.id, error_message.clone());
-
-                    if let Some(on_error) = &runtime_stage.on_error {
-                        let _ = self
-                            .run_hook(workflow, &runtime_stage, on_error, result)
-                            .await;
-                    }
-                    if let Some(after) = &runtime_stage.after {
-                        let _ = self.run_hook(workflow, &runtime_stage, after, result).await;
-                    }
-                    return Err(anyhow!(error_message));
-                }
+            let mut iteration = 0_u32;
+            let loop_sleep = if runtime_stage.loop_stage {
+                Some(runtime_stage.loop_interval_duration().map_err(|err| {
+                    anyhow!(
+                        "stage '{}' has invalid loop interval: {}",
+                        runtime_stage.id,
+                        err
+                    )
+                })?)
+            } else {
+                None
             };
 
-            write_stage_log(&result.session_id, &runtime_stage.id, &output).await?;
-            result.set_success(&runtime_stage.id, output.clone());
-
-            if let Some(path) = &runtime_stage.output {
-                self.write_output_file(workflow, &runtime_stage, path, &output)
-                    .await?;
-            }
-            if let Some(after) = &runtime_stage.after {
-                let _ = self.run_hook(workflow, &runtime_stage, after, result).await;
-            }
-            if runtime_stage.hitl {
-                result
-                    .outputs
-                    .insert(format!("{}.hitl", runtime_stage.id), "skipped".into());
-            }
-
-            let broken = match &runtime_stage.break_when {
-                Some(expr) => {
-                    let rendered = subst(expr, &workflow.vars, &result.outputs);
-                    output.contains(&rendered)
+            loop {
+                iteration += 1;
+                if let Some(before) = &runtime_stage.before {
+                    let _ = self
+                        .run_hook(workflow, &runtime_stage, before, result)
+                        .await;
                 }
-                None => false,
-            };
 
-            Ok(broken)
+                let output = match self.execute_stage(workflow, &runtime_stage, result).await {
+                    Ok(v) => v,
+                    Err(err) => {
+                        let error_message = err.to_string();
+                        write_stage_log(&result.session_id, &runtime_stage.id, &error_message)
+                            .await?;
+                        result.set_error(&runtime_stage.id, error_message.clone());
+
+                        if let Some(on_error) = &runtime_stage.on_error {
+                            let _ = self
+                                .run_hook(workflow, &runtime_stage, on_error, result)
+                                .await;
+                        }
+                        if let Some(after) = &runtime_stage.after {
+                            let _ = self.run_hook(workflow, &runtime_stage, after, result).await;
+                        }
+                        return Err(anyhow!(error_message));
+                    }
+                };
+
+                write_stage_log(&result.session_id, &runtime_stage.id, &output).await?;
+                result.set_success(&runtime_stage.id, output.clone());
+
+                if let Some(path) = &runtime_stage.output {
+                    self.write_output_file(workflow, &runtime_stage, path, &output)
+                        .await?;
+                }
+                if let Some(after) = &runtime_stage.after {
+                    let _ = self.run_hook(workflow, &runtime_stage, after, result).await;
+                }
+                if runtime_stage.hitl {
+                    result
+                        .outputs
+                        .insert(format!("{}.hitl", runtime_stage.id), "skipped".into());
+                }
+
+                let broken = match &runtime_stage.break_when {
+                    Some(expr) => {
+                        let rendered = subst(expr, &workflow.vars, &result.outputs);
+                        output.contains(&rendered)
+                    }
+                    None => false,
+                };
+                if broken {
+                    if runtime_stage.loop_stage {
+                        result.outputs.insert(
+                            format!("{}.iterations", runtime_stage.id),
+                            iteration.to_string(),
+                        );
+                    }
+                    return Ok(true);
+                }
+
+                if !runtime_stage.loop_stage {
+                    return Ok(false);
+                }
+                if let Some(max) = runtime_stage.max_iterations
+                    && iteration >= max.max(1)
+                {
+                    result.outputs.insert(
+                        format!("{}.iterations", runtime_stage.id),
+                        iteration.to_string(),
+                    );
+                    return Ok(false);
+                }
+
+                if let Some(delay) = loop_sleep {
+                    sleep(delay).await;
+                }
+            }
         }
         .await;
 
@@ -1095,5 +1136,119 @@ mod tests {
             "worktree path should be cleaned up: {}",
             worktree_path.display()
         );
+    }
+
+    #[tokio::test]
+    async fn stage_loop_respects_max_iterations() {
+        let wd = std::env::temp_dir().join(format!(
+            "anna-stage-loop-{}-{}",
+            std::process::id(),
+            rand::random::<u32>()
+        ));
+        tokio::fs::create_dir_all(&wd)
+            .await
+            .expect("create temp workdir");
+
+        let wf = Workflow {
+            name: "stage-loop-max".into(),
+            mode: "once".into(),
+            memory: false,
+            tags: vec![],
+            vars: Default::default(),
+            env: Default::default(),
+            workdir: Some(wd.display().to_string()),
+            trigger: Default::default(),
+            stages: vec![Stage {
+                id: "looped".into(),
+                provider: "shell".into(),
+                exec: Some(
+                    "n=$(cat loop-counter.txt 2>/dev/null || echo 0); n=$((n+1)); echo \"$n\" > loop-counter.txt; echo \"$n\""
+                        .into(),
+                ),
+                loop_stage: true,
+                interval: Some("1ms".into()),
+                max_iterations: Some(3),
+                ..Default::default()
+            }],
+            source_path: None,
+        };
+
+        let res = Executor::new()
+            .run(
+                &wf,
+                RunConfig {
+                    max_iterations: Some(1),
+                    session_id_override: None,
+                },
+            )
+            .await
+            .expect("workflow should run");
+
+        assert_eq!(res.success.get("looped"), Some(&true));
+        assert_eq!(res.outputs.get("looped"), Some(&"3".to_string()));
+        assert_eq!(res.outputs.get("looped.iterations"), Some(&"3".to_string()));
+    }
+
+    #[tokio::test]
+    async fn stage_loop_break_when_stops_workflow_progress() {
+        let wd = std::env::temp_dir().join(format!(
+            "anna-stage-break-{}-{}",
+            std::process::id(),
+            rand::random::<u32>()
+        ));
+        tokio::fs::create_dir_all(&wd)
+            .await
+            .expect("create temp workdir");
+
+        let wf = Workflow {
+            name: "stage-loop-break".into(),
+            mode: "once".into(),
+            memory: false,
+            tags: vec![],
+            vars: Default::default(),
+            env: Default::default(),
+            workdir: Some(wd.display().to_string()),
+            trigger: Default::default(),
+            stages: vec![
+                Stage {
+                    id: "test".into(),
+                    provider: "shell".into(),
+                    exec: Some(
+                        "n=$(cat break-counter.txt 2>/dev/null || echo 0); n=$((n+1)); echo \"$n\" > break-counter.txt; echo \"RUN-$n\""
+                            .into(),
+                    ),
+                    loop_stage: true,
+                    interval: Some("1ms".into()),
+                    max_iterations: Some(10),
+                    break_when: Some("RUN-2".into()),
+                    ..Default::default()
+                },
+                Stage {
+                    id: "after".into(),
+                    provider: "shell".into(),
+                    exec: Some("echo SHOULD_NOT_RUN".into()),
+                    needs: vec!["test".into()],
+                    ..Default::default()
+                },
+            ],
+            source_path: None,
+        };
+
+        let res = Executor::new()
+            .run(
+                &wf,
+                RunConfig {
+                    max_iterations: Some(1),
+                    session_id_override: None,
+                },
+            )
+            .await
+            .expect("workflow should run");
+
+        assert_eq!(res.success.get("test"), Some(&true));
+        assert_eq!(res.outputs.get("test"), Some(&"RUN-2".to_string()));
+        assert_eq!(res.outputs.get("test.iterations"), Some(&"2".to_string()));
+        assert_eq!(res.success.get("after"), None);
+        assert_eq!(res.outputs.get("after"), None);
     }
 }

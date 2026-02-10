@@ -121,6 +121,14 @@ impl Stage {
             None => Ok(Duration::from_secs(1)),
         }
     }
+
+    pub fn loop_interval_duration(&self) -> Result<Duration> {
+        match self.interval.as_deref() {
+            Some(s) => parse_duration(s)
+                .with_context(|| format!("invalid interval for stage '{}': {}", self.id, s)),
+            None => Ok(Duration::from_secs(1)),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -213,7 +221,7 @@ impl Workflow {
     }
 
     pub fn is_continuous(&self) -> bool {
-        self.mode == "continuous" || self.has_loop()
+        self.mode == "continuous"
     }
 
     pub fn interval(&self) -> Duration {
@@ -242,6 +250,7 @@ pub fn parse_optional_duration(raw: Option<&str>) -> Result<Option<Duration>> {
 mod tests {
     use super::{Stage, Workflow};
     use std::collections::HashMap;
+    use std::time::Duration;
 
     fn base_workflow(stages: Vec<Stage>) -> Workflow {
         Workflow {
@@ -293,5 +302,32 @@ mod tests {
         ]);
         let err = wf.validate().expect_err("workflow should fail validation");
         assert!(err.to_string().contains("must reference an earlier stage"));
+    }
+
+    #[test]
+    fn loop_stage_does_not_implicitly_make_workflow_continuous() {
+        let wf = base_workflow(vec![Stage {
+            id: "looped".to_string(),
+            loop_stage: true,
+            exec: Some("echo hi".to_string()),
+            ..Default::default()
+        }]);
+        assert!(!wf.is_continuous());
+        assert!(wf.has_loop());
+    }
+
+    #[test]
+    fn stage_loop_interval_uses_default_when_missing() {
+        let stage = Stage {
+            id: "looped".to_string(),
+            loop_stage: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            stage
+                .loop_interval_duration()
+                .expect("default loop interval should parse"),
+            Duration::from_secs(1)
+        );
     }
 }
