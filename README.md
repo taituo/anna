@@ -18,7 +18,7 @@ This repository contains the language docs:
 - Secret injection (`stage.secrets`) with env/file resolution
 - Dependencies and conditions (`needs`, `when`)
 - Triggers in daemon mode (`webhook`, `watch`, `cron`, `interval`)
-- Parallel execution (`forks`, `each`, `each_from`) with optional `vote`
+- Parallel execution (`forks`, `each`, `each_from`) with optional `vote` (concurrent runtime)
 - Human-in-the-loop approvals (`hitl`)
 - Sub-workflows (`workflow`)
 - Persistent workflow memory (`memory: true`)

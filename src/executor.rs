@@ -9,6 +9,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use tokio::process::Command;
+use tokio::task::JoinSet;
 use tokio::time::sleep;
 
 #[derive(Debug, Clone, Default)]
@@ -401,8 +402,8 @@ impl Executor {
         }
 
         let outputs_snapshot = result.outputs.clone();
-        let mut fork_outputs = Vec::with_capacity(forks as usize);
-
+        let mut join_set = JoinSet::new();
+        let workflow_snapshot = workflow.clone();
         for i in 0..forks {
             let mut fork_stage = stage.clone();
             fork_stage.forks = None;
@@ -410,12 +411,61 @@ impl Executor {
             if !stage.models.is_empty() {
                 fork_stage.model = Some(stage.models[(i as usize) % stage.models.len()].clone());
             }
+            let worker = self.clone();
+            let workflow_for_task = workflow_snapshot.clone();
+            let vars_for_task = workflow.vars.clone();
+            let outputs_for_task = outputs_snapshot.clone();
+            join_set.spawn(async move {
+                let out = worker
+                    .execute_with_retry(
+                        &workflow_for_task,
+                        &fork_stage,
+                        &vars_for_task,
+                        &outputs_for_task,
+                    )
+                    .await;
+                (i, out)
+            });
+        }
 
-            let out = self
-                .execute_with_retry(workflow, &fork_stage, &workflow.vars, &outputs_snapshot)
-                .await?;
+        let mut slots: Vec<Option<String>> = vec![None; forks as usize];
+        let mut first_error: Option<ProviderError> = None;
+        while let Some(joined) = join_set.join_next().await {
+            match joined {
+                Ok((idx, Ok(out))) => {
+                    slots[idx as usize] = Some(out);
+                }
+                Ok((_, Err(err))) => {
+                    if first_error.is_none() {
+                        first_error = Some(err);
+                    }
+                    join_set.abort_all();
+                }
+                Err(err) => {
+                    if first_error.is_none() {
+                        first_error = Some(ProviderError::new(
+                            "provider_exec_failed",
+                            format!("fork task failed in stage '{}': {}", stage.id, err),
+                        ));
+                    }
+                    join_set.abort_all();
+                }
+            }
+        }
 
-            let key = format!("{}.{}", stage.id, i);
+        if let Some(err) = first_error {
+            return Err(err);
+        }
+
+        let mut fork_outputs = Vec::with_capacity(forks as usize);
+        for (idx, value) in slots.into_iter().enumerate() {
+            let out = value.ok_or_else(|| {
+                ProviderError::new(
+                    "provider_exec_failed",
+                    format!("fork {} produced no output in stage '{}'", idx, stage.id),
+                )
+            })?;
+            let key = format!("{}.{}", stage.id, idx);
             result.outputs.insert(key.clone(), out.clone());
             result.success.insert(key.clone(), true);
             let _ = write_stage_log(&result.session_id, &key, &out).await;
@@ -464,8 +514,8 @@ impl Executor {
         };
 
         let outputs_snapshot = result.outputs.clone();
-        let mut each_outputs = Vec::with_capacity(items.len());
-
+        let mut join_set = JoinSet::new();
+        let workflow_snapshot = workflow.clone();
         for (idx, item) in items.iter().enumerate() {
             let mut each_stage = stage.clone();
             each_stage.each.clear();
@@ -474,11 +524,55 @@ impl Executor {
 
             let mut vars = workflow.vars.clone();
             vars.insert("each".to_string(), item.clone());
+            let worker = self.clone();
+            let workflow_for_task = workflow_snapshot.clone();
+            let outputs_for_task = outputs_snapshot.clone();
+            join_set.spawn(async move {
+                let out = worker
+                    .execute_with_retry(&workflow_for_task, &each_stage, &vars, &outputs_for_task)
+                    .await;
+                (idx, out)
+            });
+        }
 
-            let out = self
-                .execute_with_retry(workflow, &each_stage, &vars, &outputs_snapshot)
-                .await?;
+        let mut slots: Vec<Option<String>> = vec![None; items.len()];
+        let mut first_error: Option<ProviderError> = None;
+        while let Some(joined) = join_set.join_next().await {
+            match joined {
+                Ok((idx, Ok(out))) => slots[idx] = Some(out),
+                Ok((_, Err(err))) => {
+                    if first_error.is_none() {
+                        first_error = Some(err);
+                    }
+                    join_set.abort_all();
+                }
+                Err(err) => {
+                    if first_error.is_none() {
+                        first_error = Some(ProviderError::new(
+                            "provider_exec_failed",
+                            format!("each task failed in stage '{}': {}", stage.id, err),
+                        ));
+                    }
+                    join_set.abort_all();
+                }
+            }
+        }
 
+        if let Some(err) = first_error {
+            return Err(err);
+        }
+
+        let mut each_outputs = Vec::with_capacity(items.len());
+        for (idx, value) in slots.into_iter().enumerate() {
+            let out = value.ok_or_else(|| {
+                ProviderError::new(
+                    "provider_exec_failed",
+                    format!(
+                        "each item {} produced no output in stage '{}'",
+                        idx, stage.id
+                    ),
+                )
+            })?;
             let key = format!("{}.{}", stage.id, idx);
             result.outputs.insert(key.clone(), out.clone());
             result.success.insert(key.clone(), true);
@@ -826,6 +920,7 @@ mod tests {
     use crate::memory::MemoryStore;
     use crate::session::session_dir;
     use crate::workflow::{Stage, Workflow};
+    use std::time::{Duration, Instant};
 
     #[tokio::test]
     async fn forks_populate_indexed_outputs() {
@@ -911,6 +1006,99 @@ mod tests {
         assert!(res.outputs.contains_key("process.0"));
         assert!(res.outputs.contains_key("process.1"));
         assert!(res.outputs.contains_key("process.all"));
+    }
+
+    #[tokio::test]
+    async fn forks_run_concurrently() {
+        let wf = Workflow {
+            name: "forks-concurrent".into(),
+            mode: "once".into(),
+            memory: false,
+            tags: vec![],
+            vars: Default::default(),
+            env: Default::default(),
+            workdir: None,
+            trigger: Default::default(),
+            stages: vec![Stage {
+                id: "review".into(),
+                provider: "shell".into(),
+                exec: Some("sleep 0.4; echo done".into()),
+                forks: Some(5),
+                ..Default::default()
+            }],
+            source_path: None,
+        };
+
+        let started = Instant::now();
+        let res = Executor::new()
+            .run(
+                &wf,
+                RunConfig {
+                    max_iterations: Some(1),
+                    session_id_override: None,
+                },
+            )
+            .await
+            .expect("workflow should run");
+        let elapsed = started.elapsed();
+
+        assert_eq!(res.success.get("review"), Some(&true));
+        assert!(
+            elapsed < Duration::from_millis(1600),
+            "forks should run concurrently; elapsed={:?}",
+            elapsed
+        );
+    }
+
+    #[tokio::test]
+    async fn each_runs_concurrently() {
+        let wf = Workflow {
+            name: "each-concurrent".into(),
+            mode: "once".into(),
+            memory: false,
+            tags: vec![],
+            vars: Default::default(),
+            env: Default::default(),
+            workdir: None,
+            trigger: Default::default(),
+            stages: vec![
+                Stage {
+                    id: "list".into(),
+                    provider: "shell".into(),
+                    exec: Some("printf 'a\\nb\\nc\\nd\\ne\\n'".into()),
+                    ..Default::default()
+                },
+                Stage {
+                    id: "process".into(),
+                    provider: "shell".into(),
+                    exec: Some("sleep 0.4; echo $each".into()),
+                    each_from: Some("list".into()),
+                    needs: vec!["list".into()],
+                    ..Default::default()
+                },
+            ],
+            source_path: None,
+        };
+
+        let started = Instant::now();
+        let res = Executor::new()
+            .run(
+                &wf,
+                RunConfig {
+                    max_iterations: Some(1),
+                    session_id_override: None,
+                },
+            )
+            .await
+            .expect("workflow should run");
+        let elapsed = started.elapsed();
+
+        assert_eq!(res.success.get("process"), Some(&true));
+        assert!(
+            elapsed < Duration::from_millis(1600),
+            "each should run concurrently; elapsed={:?}",
+            elapsed
+        );
     }
 
     #[tokio::test]
