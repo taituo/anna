@@ -179,8 +179,7 @@ async fn main() -> Result<()> {
                 .await
                 .with_context(|| format!("failed reading '{}'", workflow.display()))?;
             let client = Client::new();
-            let response = client
-                .post(format!("{}/workflow", daemon))
+            let response = with_daemon_auth(client.post(format!("{}/workflow", daemon)))
                 .body(body)
                 .send()
                 .await
@@ -190,18 +189,19 @@ async fn main() -> Result<()> {
         Commands::RunNamed { name, daemon } => {
             let daemon = normalize_daemon_url(&daemon);
             let client = Client::new();
-            let response = client
-                .post(format!("{}/workflow/{}/run", daemon, name))
-                .send()
-                .await
-                .with_context(|| format!("failed launching workflow '{}' at {}", name, daemon))?;
+            let response =
+                with_daemon_auth(client.post(format!("{}/workflow/{}/run", daemon, name)))
+                    .send()
+                    .await
+                    .with_context(|| {
+                        format!("failed launching workflow '{}' at {}", name, daemon)
+                    })?;
             print_response(response).await
         }
         Commands::Status { id, daemon } => {
             let daemon = normalize_daemon_url(&daemon);
             let client = Client::new();
-            let response = client
-                .get(format!("{}/workflow/{}", daemon, id))
+            let response = with_daemon_auth(client.get(format!("{}/workflow/{}", daemon, id)))
                 .send()
                 .await
                 .with_context(|| format!("failed querying workflow '{}' at {}", id, daemon))?;
@@ -210,8 +210,7 @@ async fn main() -> Result<()> {
         Commands::Stop { id, daemon } => {
             let daemon = normalize_daemon_url(&daemon);
             let client = Client::new();
-            let response = client
-                .delete(format!("{}/workflow/{}", daemon, id))
+            let response = with_daemon_auth(client.delete(format!("{}/workflow/{}", daemon, id)))
                 .send()
                 .await
                 .with_context(|| format!("failed stopping workflow '{}' at {}", id, daemon))?;
@@ -220,8 +219,7 @@ async fn main() -> Result<()> {
         Commands::Logs { id, daemon } => {
             let daemon = normalize_daemon_url(&daemon);
             let client = Client::new();
-            let response = client
-                .get(format!("{}/workflow/{}/logs", daemon, id))
+            let response = with_daemon_auth(client.get(format!("{}/workflow/{}/logs", daemon, id)))
                 .send()
                 .await
                 .with_context(|| format!("failed reading workflow logs '{}' at {}", id, daemon))?;
@@ -231,8 +229,7 @@ async fn main() -> Result<()> {
             HitlCommands::List { daemon } => {
                 let daemon = normalize_daemon_url(&daemon);
                 let client = Client::new();
-                let response = client
-                    .get(format!("{}/hitl", daemon))
+                let response = with_daemon_auth(client.get(format!("{}/hitl", daemon)))
                     .send()
                     .await
                     .with_context(|| format!("failed querying hitl at {}", daemon))?;
@@ -245,12 +242,12 @@ async fn main() -> Result<()> {
             } => {
                 let daemon = normalize_daemon_url(&daemon);
                 let client = Client::new();
-                let response = client
-                    .post(format!("{}/hitl/{}/resolve", daemon, id))
-                    .json(&json!({ "decision": decision }))
-                    .send()
-                    .await
-                    .with_context(|| format!("failed resolving hitl '{}' at {}", id, daemon))?;
+                let response =
+                    with_daemon_auth(client.post(format!("{}/hitl/{}/resolve", daemon, id)))
+                        .json(&json!({ "decision": decision }))
+                        .send()
+                        .await
+                        .with_context(|| format!("failed resolving hitl '{}' at {}", id, daemon))?;
                 print_response(response).await
             }
         },
@@ -273,6 +270,20 @@ fn parse_var_overrides(raw: Vec<String>) -> Result<HashMap<String, String>> {
 
 fn normalize_daemon_url(url: &str) -> String {
     url.trim_end_matches('/').to_string()
+}
+
+fn daemon_auth_token() -> Option<String> {
+    std::env::var("ANNA_DAEMON_TOKEN")
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+}
+
+fn with_daemon_auth(builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+    match daemon_auth_token() {
+        Some(token) => builder.bearer_auth(token),
+        None => builder,
+    }
 }
 
 async fn print_response(response: reqwest::Response) -> Result<()> {

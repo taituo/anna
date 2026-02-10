@@ -5,6 +5,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, Query, State};
+use axum::http::HeaderMap;
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
@@ -29,6 +30,7 @@ struct AppState {
     sessions: Arc<RwLock<HashMap<String, SessionInfo>>>,
     handles: Arc<RwLock<HashMap<String, JoinHandle<()>>>>,
     hitl: Arc<RwLock<HashMap<String, HitlPending>>>,
+    auth_token: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -159,6 +161,7 @@ pub async fn run_daemon(bind: &str, plays_dir: PathBuf) -> Result<()> {
         sessions: Arc::new(RwLock::new(HashMap::new())),
         handles: Arc::new(RwLock::new(HashMap::new())),
         hitl,
+        auth_token: daemon_auth_token(),
     };
     tokio::spawn(trigger_scheduler_loop(state.clone()));
 
@@ -185,7 +188,10 @@ async fn health() -> Json<HealthResponse> {
     Json(HealthResponse { ok: true })
 }
 
-async fn list_workflows(State(state): State<AppState>) -> impl IntoResponse {
+async fn list_workflows(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
+    if let Some(resp) = ensure_authorized(&state, &headers) {
+        return resp;
+    }
     match find_workflows(&state.plays_dir).await {
         Ok(list) => Json(list).into_response(),
         Err(err) => (
@@ -196,7 +202,14 @@ async fn list_workflows(State(state): State<AppState>) -> impl IntoResponse {
     }
 }
 
-async fn start_workflow(State(state): State<AppState>, body: String) -> impl IntoResponse {
+async fn start_workflow(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: String,
+) -> impl IntoResponse {
+    if let Some(resp) = ensure_authorized(&state, &headers) {
+        return resp;
+    }
     let mut workflow: Workflow = match serde_yaml::from_str(&body) {
         Ok(v) => v,
         Err(err) => {
@@ -241,8 +254,12 @@ async fn start_workflow(State(state): State<AppState>, body: String) -> impl Int
 
 async fn run_registered_workflow(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path(name): Path<String>,
 ) -> impl IntoResponse {
+    if let Some(resp) = ensure_authorized(&state, &headers) {
+        return resp;
+    }
     let path = match resolve_registered_workflow_path(&state.plays_dir, &name).await {
         Ok(Some(v)) => v,
         Ok(None) => return (StatusCode::NOT_FOUND, "workflow not found").into_response(),
@@ -292,8 +309,12 @@ async fn run_registered_workflow(
 
 async fn workflow_status(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
+    if let Some(resp) = ensure_authorized(&state, &headers) {
+        return resp;
+    }
     let sessions = state.sessions.read().await;
     match sessions.get(&id) {
         Some(info) => (StatusCode::OK, Json(info.clone())).into_response(),
@@ -301,7 +322,14 @@ async fn workflow_status(
     }
 }
 
-async fn stop_workflow(State(state): State<AppState>, Path(id): Path<String>) -> impl IntoResponse {
+async fn stop_workflow(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    if let Some(resp) = ensure_authorized(&state, &headers) {
+        return resp;
+    }
     let mut handles = state.handles.write().await;
     let stopped = if let Some(handle) = handles.remove(&id) {
         handle.abort();
@@ -322,8 +350,12 @@ async fn stop_workflow(State(state): State<AppState>, Path(id): Path<String>) ->
 
 async fn trigger_hook(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path(name): Path<String>,
 ) -> impl IntoResponse {
+    if let Some(resp) = ensure_authorized(&state, &headers) {
+        return resp;
+    }
     let hook_path = format!("/{}", name.trim_matches('/'));
     let entries = match find_workflow_entries(&state.plays_dir).await {
         Ok(v) => v,
@@ -363,7 +395,14 @@ async fn trigger_hook(
         .into_response()
 }
 
-async fn workflow_logs(State(state): State<AppState>, Path(id): Path<String>) -> impl IntoResponse {
+async fn workflow_logs(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    if let Some(resp) = ensure_authorized(&state, &headers) {
+        return resp;
+    }
     let sessions = state.sessions.read().await;
     let Some(info) = sessions.get(&id) else {
         return (StatusCode::NOT_FOUND, "session not found").into_response();
@@ -383,7 +422,10 @@ async fn workflow_logs(State(state): State<AppState>, Path(id): Path<String>) ->
     }
 }
 
-async fn list_hitl(State(state): State<AppState>) -> impl IntoResponse {
+async fn list_hitl(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
+    if let Some(resp) = ensure_authorized(&state, &headers) {
+        return resp;
+    }
     let mut out = state
         .hitl
         .read()
@@ -397,9 +439,13 @@ async fn list_hitl(State(state): State<AppState>) -> impl IntoResponse {
 
 async fn resolve_hitl(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path(id): Path<String>,
     Json(body): Json<HitlResolveBody>,
 ) -> impl IntoResponse {
+    if let Some(resp) = ensure_authorized(&state, &headers) {
+        return resp;
+    }
     let decision = body.decision.trim().to_string();
     if decision.is_empty() {
         return (StatusCode::BAD_REQUEST, "decision is required").into_response();
@@ -416,9 +462,13 @@ async fn resolve_hitl(
 
 async fn ws_logs(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Query(query): Query<WsQuery>,
     ws: WebSocketUpgrade,
 ) -> impl IntoResponse {
+    if let Some(resp) = ensure_authorized(&state, &headers) {
+        return resp;
+    }
     ws.on_upgrade(move |socket| stream_logs(socket, state, query.id))
 }
 
@@ -681,6 +731,48 @@ fn now_unix_secs() -> u64 {
         .unwrap_or(0)
 }
 
+fn daemon_auth_token() -> Option<String> {
+    std::env::var("ANNA_DAEMON_TOKEN")
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+}
+
+fn ensure_authorized(state: &AppState, headers: &HeaderMap) -> Option<axum::response::Response> {
+    let Some(expected) = state.auth_token.as_ref() else {
+        return None;
+    };
+
+    if is_authorized(headers, expected) {
+        None
+    } else {
+        Some((StatusCode::UNAUTHORIZED, "unauthorized").into_response())
+    }
+}
+
+fn is_authorized(headers: &HeaderMap, expected: &str) -> bool {
+    let auth_header = headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.trim().to_string());
+    if let Some(raw) = auth_header {
+        if let Some(token) = raw.strip_prefix("Bearer ") {
+            if token.trim() == expected {
+                return true;
+            }
+        }
+        if raw == expected {
+            return true;
+        }
+    }
+
+    headers
+        .get("x-anna-token")
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.trim() == expected)
+        .unwrap_or(false)
+}
+
 async fn find_workflows(root: &FsPath) -> Result<Vec<String>> {
     let mut out = find_workflow_entries(root)
         .await?
@@ -921,10 +1013,11 @@ async fn launch_workflow(state: &AppState, workflow: Workflow) -> Result<String>
 #[cfg(test)]
 mod tests {
     use super::{
-        DaemonHitl, HitlPending, collect_watch_snapshot, find_workflow_entries,
+        DaemonHitl, HitlPending, collect_watch_snapshot, find_workflow_entries, is_authorized,
         resolve_registered_workflow_path, resolve_watch_pattern,
     };
     use crate::executor::{HitlHandler, HitlRequest};
+    use axum::http::{HeaderMap, HeaderValue};
     use std::collections::HashMap;
     use std::sync::Arc;
     use std::time::Duration;
@@ -1075,5 +1168,36 @@ mod tests {
 
         let decision = waiter.await.expect("join waiter");
         assert_eq!(decision, "approve");
+    }
+
+    #[test]
+    fn auth_accepts_bearer_and_x_anna_token_headers() {
+        let mut bearer = HeaderMap::new();
+        bearer.insert(
+            "authorization",
+            HeaderValue::from_static("Bearer secret-token"),
+        );
+        assert!(is_authorized(&bearer, "secret-token"));
+
+        let mut raw_auth = HeaderMap::new();
+        raw_auth.insert("authorization", HeaderValue::from_static("secret-token"));
+        assert!(is_authorized(&raw_auth, "secret-token"));
+
+        let mut x_token = HeaderMap::new();
+        x_token.insert("x-anna-token", HeaderValue::from_static("secret-token"));
+        assert!(is_authorized(&x_token, "secret-token"));
+    }
+
+    #[test]
+    fn auth_rejects_missing_or_wrong_token() {
+        let empty = HeaderMap::new();
+        assert!(!is_authorized(&empty, "secret-token"));
+
+        let mut wrong = HeaderMap::new();
+        wrong.insert(
+            "authorization",
+            HeaderValue::from_static("Bearer wrong-token"),
+        );
+        assert!(!is_authorized(&wrong, "secret-token"));
     }
 }

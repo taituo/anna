@@ -43,6 +43,14 @@ anna status <request_id>
 anna hitl list
 ```
 
+Optional daemon auth:
+
+```bash
+export ANNA_DAEMON_TOKEN=your-token
+anna daemon
+anna status <request_id>  # CLI sends Bearer token automatically
+```
+
 ## Rust Runtime (MVP)
 
 This repository now includes a Rust runtime foundation in `src/`:
