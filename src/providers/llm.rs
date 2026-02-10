@@ -3,7 +3,7 @@ use crate::providers::cli::CliProvider;
 use crate::providers::{Provider, ProviderError, ProviderResult};
 use crate::workflow::{Stage, Workflow};
 use async_trait::async_trait;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::env;
 use std::path::PathBuf;
@@ -12,25 +12,31 @@ use std::time::Duration;
 #[derive(Debug, Default, Clone)]
 pub struct LlmProvider;
 
-#[derive(Debug, Clone, Deserialize, Default)]
-struct LlmAdapterCatalog {
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct LlmAdapterCatalog {
     #[serde(default)]
-    default: Option<String>,
+    pub default: Option<String>,
     #[serde(default)]
-    adapters: HashMap<String, LlmAdapterSpec>,
+    pub adapters: HashMap<String, LlmAdapterSpec>,
 }
 
-#[derive(Debug, Clone, Deserialize, Default)]
-struct LlmAdapterSpec {
-    exec: String,
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct LlmAdapterSpec {
+    pub exec: String,
     #[serde(default)]
-    args: Vec<String>,
+    pub args: Vec<String>,
     #[serde(default)]
-    env: HashMap<String, String>,
+    pub env: HashMap<String, String>,
     #[serde(default)]
-    model: Option<String>,
+    pub model: Option<String>,
     #[serde(default)]
-    parse: Option<String>,
+    pub parse: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct LoadedLlmAdapterCatalog {
+    pub path: String,
+    pub catalog: LlmAdapterCatalog,
 }
 
 #[async_trait]
@@ -44,8 +50,9 @@ impl Provider for LlmProvider {
         timeout: Option<Duration>,
     ) -> ProviderResult<String> {
         let prompt = build_prompt(stage, workflow, vars, outputs);
-        let catalog = load_adapter_catalog()?;
-        let cli_stage = build_cli_stage(stage, workflow, vars, outputs, &prompt, catalog.as_ref())?;
+        let loaded_catalog = load_llm_adapter_catalog_from_env()?;
+        let catalog = loaded_catalog.as_ref().map(|v| &v.catalog);
+        let cli_stage = build_cli_stage(stage, workflow, vars, outputs, &prompt, catalog)?;
 
         let cli = CliProvider;
         cli.run(&cli_stage, workflow, vars, outputs, timeout).await
@@ -192,13 +199,16 @@ fn select_adapter_name(stage: &Stage, catalog: Option<&LlmAdapterCatalog>) -> Op
         .as_ref()
         .filter(|v| !v.trim().is_empty())
         .cloned()
-        .or_else(|| non_empty_env("ANNA_LLM_ADAPTER"))
-        .or_else(|| {
-            catalog
-                .and_then(|c| c.default.as_ref())
-                .filter(|v| !v.trim().is_empty())
-                .cloned()
-        })
+        .or_else(|| active_llm_adapter_name(catalog))
+}
+
+pub fn active_llm_adapter_name(catalog: Option<&LlmAdapterCatalog>) -> Option<String> {
+    non_empty_env("ANNA_LLM_ADAPTER").or_else(|| {
+        catalog
+            .and_then(|c| c.default.as_ref())
+            .filter(|v| !v.trim().is_empty())
+            .cloned()
+    })
 }
 
 fn resolve_adapter(
@@ -248,7 +258,7 @@ fn adapter_catalog_path() -> Option<PathBuf> {
         .filter(|p| !p.as_os_str().is_empty())
 }
 
-fn load_adapter_catalog() -> ProviderResult<Option<LlmAdapterCatalog>> {
+pub fn load_llm_adapter_catalog_from_env() -> ProviderResult<Option<LoadedLlmAdapterCatalog>> {
     let Some(path) = adapter_catalog_path() else {
         return Ok(None);
     };
@@ -264,21 +274,31 @@ fn load_adapter_catalog() -> ProviderResult<Option<LlmAdapterCatalog>> {
         )
     })?;
 
-    let catalog = parse_adapter_catalog(&raw).map_err(|err| {
+    let catalog = parse_adapter_catalog(&raw).map_err(|message| {
         ProviderError::new(
             "provider_start_failed",
-            format!("invalid llm adapter catalog '{}': {}", path.display(), err),
+            format!(
+                "invalid llm adapter catalog '{}': {}",
+                path.display(),
+                message
+            ),
         )
     })?;
 
-    Ok(Some(catalog))
+    Ok(Some(LoadedLlmAdapterCatalog {
+        path: path.display().to_string(),
+        catalog,
+    }))
 }
 
-fn parse_adapter_catalog(raw: &str) -> Result<LlmAdapterCatalog, serde_yaml::Error> {
-    let mut catalog: LlmAdapterCatalog = serde_yaml::from_str(raw)?;
-    catalog
-        .adapters
-        .retain(|_, spec| !spec.exec.trim().is_empty());
+fn parse_adapter_catalog(raw: &str) -> Result<LlmAdapterCatalog, String> {
+    let catalog: LlmAdapterCatalog =
+        serde_yaml::from_str(raw).map_err(|err| format!("failed to parse yaml: {}", err))?;
+    for (name, spec) in &catalog.adapters {
+        if spec.exec.trim().is_empty() {
+            return Err(format!("adapter '{}' has empty exec", name));
+        }
+    }
     Ok(catalog)
 }
 
@@ -334,7 +354,7 @@ mod tests {
             system: Some("You are strict.".to_string()),
             ..Default::default()
         };
-        let mut wf = make_workflow();
+        let wf = make_workflow();
         let context_path = std::env::temp_dir().join(format!(
             "anna-llm-context-{}-{}",
             std::process::id(),
@@ -353,7 +373,6 @@ mod tests {
         assert!(prompt.contains("line1"));
 
         let _ = std::fs::remove_file(context_path);
-        wf.workdir = None;
     }
 
     #[test]
@@ -457,8 +476,8 @@ mod tests {
     }
 
     #[test]
-    fn parse_adapter_catalog_skips_empty_exec_entries() {
-        let parsed = parse_adapter_catalog(
+    fn parse_adapter_catalog_rejects_empty_exec_entries() {
+        let err = parse_adapter_catalog(
             r#"
 default: mock
 adapters:
@@ -468,9 +487,7 @@ adapters:
     exec: ""
 "#,
         )
-        .expect("catalog should parse");
-
-        assert!(parsed.adapters.contains_key("mock"));
-        assert!(!parsed.adapters.contains_key("bad"));
+        .expect_err("catalog should fail");
+        assert!(err.contains("adapter 'bad' has empty exec"));
     }
 }

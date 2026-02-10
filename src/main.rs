@@ -1,4 +1,5 @@
 use anna_rs::executor::{Executor, RunConfig};
+use anna_rs::providers::llm::{active_llm_adapter_name, load_llm_adapter_catalog_from_env};
 use anna_rs::workflow::Workflow;
 use anyhow::{Context, Result, anyhow};
 use clap::{Parser, Subcommand};
@@ -153,6 +154,12 @@ enum Commands {
         /// Daemon base URL
         #[arg(long, default_value = "http://127.0.0.1:8080")]
         daemon: String,
+    },
+    /// Show local LLM adapter catalog resolved from environment
+    LlmAdapters {
+        /// Print JSON instead of compact text table
+        #[arg(long, default_value_t = false)]
+        json: bool,
     },
     /// Wait until workflow reaches terminal state
     Wait {
@@ -482,6 +489,65 @@ async fn main() -> Result<()> {
                 .await
                 .with_context(|| format!("failed querying policy at {}", daemon))?;
             print_response(response).await
+        }
+        Commands::LlmAdapters { json } => {
+            let loaded = load_llm_adapter_catalog_from_env()?;
+            match loaded {
+                Some(loaded) => {
+                    let selected = active_llm_adapter_name(Some(&loaded.catalog));
+                    let mut names = loaded.catalog.adapters.keys().cloned().collect::<Vec<_>>();
+                    names.sort();
+                    if json {
+                        let payload = json!({
+                            "configured": true,
+                            "source": loaded.path,
+                            "selected": selected,
+                            "default": loaded.catalog.default,
+                            "adapters": loaded.catalog.adapters,
+                        });
+                        println!("{}", serde_json::to_string_pretty(&payload)?);
+                    } else {
+                        println!("source: {}", loaded.path);
+                        println!(
+                            "selected: {}",
+                            selected.unwrap_or_else(|| "<none>".to_string())
+                        );
+                        println!(
+                            "default: {}",
+                            loaded
+                                .catalog
+                                .default
+                                .unwrap_or_else(|| "<none>".to_string())
+                        );
+                        if names.is_empty() {
+                            println!("adapters: <none>");
+                        } else {
+                            println!("adapters:");
+                            for name in names {
+                                println!("  - {}", name);
+                            }
+                        }
+                    }
+                    Ok(())
+                }
+                None => {
+                    if json {
+                        let payload = json!({
+                            "configured": false,
+                            "source": null,
+                            "selected": null,
+                            "default": null,
+                            "adapters": {},
+                            "note": "set ANNA_LLM_ADAPTERS_FILE to enable adapter catalog"
+                        });
+                        println!("{}", serde_json::to_string_pretty(&payload)?);
+                    } else {
+                        println!("LLM adapter catalog not configured.");
+                        println!("Set ANNA_LLM_ADAPTERS_FILE to enable adapter routing.");
+                    }
+                    Ok(())
+                }
+            }
         }
         Commands::Wait {
             id,

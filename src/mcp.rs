@@ -1,3 +1,4 @@
+use crate::providers::llm::{active_llm_adapter_name, load_llm_adapter_catalog_from_env};
 use anyhow::{Context, Result, anyhow};
 use reqwest::Client;
 use serde_json::{Value, json};
@@ -227,6 +228,11 @@ fn tool_specs() -> Vec<Value> {
         json!({
             "name": "policy",
             "description": "Get daemon policy and capability configuration summary",
+            "inputSchema": { "type": "object", "additionalProperties": false }
+        }),
+        json!({
+            "name": "list_llm_adapters",
+            "description": "List local LLM adapter catalog loaded from ANNA_LLM_ADAPTERS_FILE",
             "inputSchema": { "type": "object", "additionalProperties": false }
         }),
         json!({
@@ -460,6 +466,27 @@ async fn handle_tools_call(client: &Client, config: &McpConfig, params: &Value) 
             .await?;
             Ok(body)
         }
+        "list_llm_adapters" => {
+            let loaded = load_llm_adapter_catalog_from_env()?;
+            let payload = match loaded {
+                Some(loaded) => json!({
+                    "configured": true,
+                    "source": loaded.path,
+                    "selected": active_llm_adapter_name(Some(&loaded.catalog)),
+                    "default": loaded.catalog.default,
+                    "adapters": loaded.catalog.adapters,
+                }),
+                None => json!({
+                    "configured": false,
+                    "source": Value::Null,
+                    "selected": Value::Null,
+                    "default": Value::Null,
+                    "adapters": {},
+                    "note": "set ANNA_LLM_ADAPTERS_FILE to enable adapter catalog"
+                }),
+            };
+            Ok(serde_json::to_string_pretty(&payload)?)
+        }
         "trigger_hook" => {
             let name = arg_required_string(&args, "name")?;
             let body = send(authed(
@@ -664,6 +691,7 @@ mod tests {
         assert!(names.contains(&"stop_flow"));
         assert!(names.contains(&"stats"));
         assert!(names.contains(&"policy"));
+        assert!(names.contains(&"list_llm_adapters"));
     }
 
     #[test]
