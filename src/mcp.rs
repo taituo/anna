@@ -157,7 +157,8 @@ fn tool_specs() -> Vec<Value> {
                         "type": "object",
                         "additionalProperties": { "type": "string" }
                     },
-                    "max_iterations": { "type": "integer", "minimum": 1 }
+                    "max_iterations": { "type": "integer", "minimum": 1 },
+                    "precheck": { "type": "boolean" }
                 },
                 "additionalProperties": false
             }
@@ -323,8 +324,29 @@ async fn handle_tools_call(client: &Client, config: &McpConfig, params: &Value) 
             let workflow_yaml = arg_string(&args, "workflow_yaml")?;
             let vars = arg_string_map(&args, "vars")?;
             let max_iterations = arg_u32(&args, "max_iterations")?;
+            let precheck = arg_bool(&args, "precheck")?.unwrap_or(false);
             match (workflow_name, workflow_yaml) {
                 (Some(name), _) => {
+                    if precheck {
+                        let parsed = check_named_flow_readiness(
+                            client,
+                            &daemon,
+                            &config.daemon_token,
+                            &name,
+                        )
+                        .await?;
+                        let can_run = parsed
+                            .get("can_run")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(false);
+                        if !can_run {
+                            return Err(anyhow!(
+                                "run_flow precheck blocked '{}': {}",
+                                name,
+                                serde_json::to_string_pretty(&parsed)?
+                            ));
+                        }
+                    }
                     let mut req = authed(
                         client.post(format!("{}/workflow/{}/run", daemon, name)),
                         &config.daemon_token,
@@ -339,6 +361,9 @@ async fn handle_tools_call(client: &Client, config: &McpConfig, params: &Value) 
                     Ok(body)
                 }
                 (None, Some(yaml)) => {
+                    if precheck {
+                        return Err(anyhow!("run_flow precheck requires named flow ('name')"));
+                    }
                     if !vars.is_empty() || max_iterations.is_some() {
                         return Err(anyhow!(
                             "run_flow with workflow_yaml does not support 'vars' or 'max_iterations'; use named flow"
@@ -577,6 +602,41 @@ async fn send(builder: reqwest::RequestBuilder) -> Result<String> {
         status,
         body
     ))
+}
+
+async fn check_named_flow_readiness(
+    client: &Client,
+    daemon: &str,
+    token: &Option<String>,
+    name: &str,
+) -> Result<Value> {
+    let response = authed(
+        client.get(format!("{}/workflow/{}/check", daemon, name)),
+        token,
+    )
+    .send()
+    .await
+    .context("daemon precheck request failed")?;
+    let status = response.status();
+    let body = response
+        .text()
+        .await
+        .context("failed reading daemon precheck response body")?;
+    if !status.is_success() {
+        if body.trim().is_empty() {
+            return Err(anyhow!(
+                "daemon precheck request failed with status {}",
+                status
+            ));
+        }
+        return Err(anyhow!(
+            "daemon precheck request failed with status {}: {}",
+            status,
+            body
+        ));
+    }
+
+    serde_json::from_str::<Value>(&body).context("daemon precheck response was not valid json")
 }
 
 fn normalize_daemon_url(url: &str) -> String {

@@ -104,6 +104,9 @@ enum Commands {
         /// Stop after N iterations in continuous mode
         #[arg(long)]
         max_iterations: Option<u32>,
+        /// Run precheck (/workflow/{name}/check) before launch
+        #[arg(long, default_value_t = false)]
+        precheck: bool,
     },
     /// Check whether a registered workflow can run right now
     CanRun {
@@ -352,9 +355,52 @@ async fn main() -> Result<()> {
             daemon,
             vars,
             max_iterations,
+            precheck,
         } => {
             let daemon = normalize_daemon_url(&daemon);
             let client = Client::new();
+            if precheck {
+                let response =
+                    with_daemon_auth(client.get(format!("{}/workflow/{}/check", daemon, name)))
+                        .send()
+                        .await
+                        .with_context(|| {
+                            format!(
+                                "failed running precheck for workflow '{}' at {}",
+                                name, daemon
+                            )
+                        })?;
+                let status = response.status();
+                let body = response
+                    .text()
+                    .await
+                    .context("failed reading precheck response body")?;
+                if !status.is_success() {
+                    if body.trim().is_empty() {
+                        return Err(anyhow!(
+                            "precheck request failed with status {} for '{}'",
+                            status,
+                            name
+                        ));
+                    }
+                    return Err(anyhow!(
+                        "precheck request failed with status {} for '{}': {}",
+                        status,
+                        name,
+                        body
+                    ));
+                }
+                let parsed: serde_json::Value = serde_json::from_str(&body)
+                    .context("daemon returned non-json precheck response")?;
+                let can_run = parsed
+                    .get("can_run")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                if !can_run {
+                    println!("{}", serde_json::to_string_pretty(&parsed)?);
+                    return Err(anyhow!("precheck blocked workflow '{}'", name));
+                }
+            }
             let overrides = parse_var_overrides(vars)?;
             let mut request =
                 with_daemon_auth(client.post(format!("{}/workflow/{}/run", daemon, name)));
