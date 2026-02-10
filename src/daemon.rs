@@ -172,6 +172,14 @@ struct SessionsQuery {
     limit: Option<usize>,
 }
 
+#[derive(Debug, Deserialize, Default)]
+struct RunRegisteredOptions {
+    #[serde(default)]
+    vars: HashMap<String, String>,
+    #[serde(default)]
+    max_iterations: Option<u32>,
+}
+
 #[derive(Debug, Default)]
 struct TriggerScheduler {
     interval_next: HashMap<String, Instant>,
@@ -475,7 +483,7 @@ async fn start_workflow(
         workflow.workdir = Some(state.plays_dir.display().to_string());
     }
 
-    let req_id = match launch_workflow(&state, workflow).await {
+    let req_id = match launch_workflow(&state, workflow, None).await {
         Ok(v) => v,
         Err(err) => {
             return (
@@ -499,10 +507,15 @@ async fn run_registered_workflow(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(name): Path<String>,
+    body: String,
 ) -> impl IntoResponse {
     if let Some(resp) = ensure_authorized(&state, &headers) {
         return resp;
     }
+    let options = match parse_run_registered_options(&body) {
+        Ok(v) => v,
+        Err(err) => return (StatusCode::BAD_REQUEST, err.to_string()).into_response(),
+    };
     let entry = match resolve_registered_workflow_entry_with_registry(
         &state.plays_dir,
         state.registry_file.as_deref(),
@@ -546,8 +559,9 @@ async fn run_registered_workflow(
     if workflow.workdir.is_none() {
         workflow.workdir = Some(state.plays_dir.display().to_string());
     }
+    workflow.vars.extend(options.vars);
 
-    let req_id = match launch_workflow(&state, workflow).await {
+    let req_id = match launch_workflow(&state, workflow, options.max_iterations).await {
         Ok(v) => v,
         Err(err) => {
             return (
@@ -1664,7 +1678,7 @@ async fn launch_workflow_from_entry(
     if wf.workdir.is_none() {
         wf.workdir = Some(state.plays_dir.display().to_string());
     }
-    let req_id = launch_workflow(state, wf).await?;
+    let req_id = launch_workflow(state, wf, None).await?;
     println!(
         "anna-rs daemon trigger={} workflow='{}' request_id={}",
         trigger_source, entry.workflow_name, req_id
@@ -1681,7 +1695,20 @@ async fn is_workflow_running(state: &AppState, workflow_name: &str) -> bool {
         .any(|s| s.workflow == workflow_name && s.status == "running")
 }
 
-async fn launch_workflow(state: &AppState, workflow: Workflow) -> Result<String> {
+fn parse_run_registered_options(body: &str) -> Result<RunRegisteredOptions> {
+    if body.trim().is_empty() {
+        return Ok(RunRegisteredOptions::default());
+    }
+    let parsed = serde_json::from_str::<RunRegisteredOptions>(body)
+        .context("invalid run options json body, expected {\"vars\":{...},\"max_iterations\":N}")?;
+    Ok(parsed)
+}
+
+async fn launch_workflow(
+    state: &AppState,
+    workflow: Workflow,
+    max_iterations: Option<u32>,
+) -> Result<String> {
     let req_id = crate::session::gen_session_id();
     let runtime_session_id = crate::session::gen_session_id();
     let now = now_unix_secs();
@@ -1711,7 +1738,7 @@ async fn launch_workflow(state: &AppState, workflow: Workflow) -> Result<String>
             .run(
                 &workflow,
                 RunConfig {
-                    max_iterations: None,
+                    max_iterations,
                     session_id_override: Some(runtime_session_id.clone()),
                 },
             )
@@ -1751,9 +1778,10 @@ mod tests {
     use super::{
         DaemonHitl, DaemonStateSnapshot, HitlPending, SessionInfo, WorkflowEntry,
         collect_watch_snapshot, find_workflow_entries_with_registry, is_authorized,
-        load_daemon_state, load_flow_registry, missing_required_capabilities, prune_hitl_in_place,
-        prune_sessions_in_place, resolve_registered_workflow_entry_with_registry,
-        resolve_watch_pattern, status_matches, temp_state_path,
+        load_daemon_state, load_flow_registry, missing_required_capabilities,
+        parse_run_registered_options, prune_hitl_in_place, prune_sessions_in_place,
+        resolve_registered_workflow_entry_with_registry, resolve_watch_pattern, status_matches,
+        temp_state_path,
     };
     use crate::executor::{HitlHandler, HitlRequest};
     use axum::http::{HeaderMap, HeaderValue};
@@ -1917,6 +1945,26 @@ mod tests {
         let wildcard = std::collections::HashSet::from(["*".to_string()]);
         let missing = missing_required_capabilities(&entry, &wildcard);
         assert!(missing.is_empty());
+    }
+
+    #[test]
+    fn parse_run_registered_options_supports_empty_and_json() {
+        let empty = parse_run_registered_options("  ").expect("empty body should be accepted");
+        assert!(empty.vars.is_empty());
+        assert_eq!(empty.max_iterations, None);
+
+        let parsed = parse_run_registered_options(
+            r#"{"vars":{"ENV":"prod","REGION":"eu"},"max_iterations":2}"#,
+        )
+        .expect("valid json body");
+        assert_eq!(
+            parsed.vars,
+            std::collections::HashMap::from([
+                (String::from("ENV"), String::from("prod")),
+                (String::from("REGION"), String::from("eu")),
+            ])
+        );
+        assert_eq!(parsed.max_iterations, Some(2));
     }
 
     #[tokio::test]

@@ -83,6 +83,12 @@ enum Commands {
         /// Daemon base URL
         #[arg(long, default_value = "http://127.0.0.1:8080")]
         daemon: String,
+        /// Override workflow vars (repeatable: --var KEY=VALUE)
+        #[arg(long = "var")]
+        vars: Vec<String>,
+        /// Stop after N iterations in continuous mode
+        #[arg(long)]
+        max_iterations: Option<u32>,
     },
     /// Check daemon workflow status by request id
     Status {
@@ -283,16 +289,27 @@ async fn main() -> Result<()> {
                 .with_context(|| format!("failed querying workflow metadata at {}", daemon))?;
             print_response(response).await
         }
-        Commands::RunNamed { name, daemon } => {
+        Commands::RunNamed {
+            name,
+            daemon,
+            vars,
+            max_iterations,
+        } => {
             let daemon = normalize_daemon_url(&daemon);
             let client = Client::new();
-            let response =
-                with_daemon_auth(client.post(format!("{}/workflow/{}/run", daemon, name)))
-                    .send()
-                    .await
-                    .with_context(|| {
-                        format!("failed launching workflow '{}' at {}", name, daemon)
-                    })?;
+            let overrides = parse_var_overrides(vars)?;
+            let mut request =
+                with_daemon_auth(client.post(format!("{}/workflow/{}/run", daemon, name)));
+            if !overrides.is_empty() || max_iterations.is_some() {
+                request = request.json(&json!({
+                    "vars": overrides,
+                    "max_iterations": max_iterations
+                }));
+            }
+            let response = request
+                .send()
+                .await
+                .with_context(|| format!("failed launching workflow '{}' at {}", name, daemon))?;
             print_response(response).await
         }
         Commands::Status { id, daemon } => {

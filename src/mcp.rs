@@ -142,7 +142,12 @@ fn tool_specs() -> Vec<Value> {
                 "type": "object",
                 "properties": {
                     "name": { "type": "string" },
-                    "workflow_yaml": { "type": "string" }
+                    "workflow_yaml": { "type": "string" },
+                    "vars": {
+                        "type": "object",
+                        "additionalProperties": { "type": "string" }
+                    },
+                    "max_iterations": { "type": "integer", "minimum": 1 }
                 },
                 "additionalProperties": false
             }
@@ -265,16 +270,29 @@ async fn handle_tools_call(client: &Client, config: &McpConfig, params: &Value) 
         "run_flow" => {
             let workflow_name = arg_string(&args, "name")?;
             let workflow_yaml = arg_string(&args, "workflow_yaml")?;
+            let vars = arg_string_map(&args, "vars")?;
+            let max_iterations = arg_u32(&args, "max_iterations")?;
             match (workflow_name, workflow_yaml) {
                 (Some(name), _) => {
-                    let body = send(authed(
+                    let mut req = authed(
                         client.post(format!("{}/workflow/{}/run", daemon, name)),
                         &config.daemon_token,
-                    ))
-                    .await?;
+                    );
+                    if !vars.is_empty() || max_iterations.is_some() {
+                        req = req.json(&json!({
+                            "vars": vars,
+                            "max_iterations": max_iterations,
+                        }));
+                    }
+                    let body = send(req).await?;
                     Ok(body)
                 }
                 (None, Some(yaml)) => {
+                    if !vars.is_empty() || max_iterations.is_some() {
+                        return Err(anyhow!(
+                            "run_flow with workflow_yaml does not support 'vars' or 'max_iterations'; use named flow"
+                        ));
+                    }
                     let body = send(
                         authed(
                             client.post(format!("{}/workflow", daemon)),
@@ -401,6 +419,27 @@ fn arg_required_string(args: &Value, key: &str) -> Result<String> {
     arg_string(args, key)?.ok_or_else(|| anyhow!("tool argument '{}' is required", key))
 }
 
+fn arg_string_map(args: &Value, key: &str) -> Result<std::collections::HashMap<String, String>> {
+    match args.get(key) {
+        Some(Value::Object(map)) => {
+            let mut out = std::collections::HashMap::new();
+            for (k, v) in map {
+                let Value::String(s) = v else {
+                    return Err(anyhow!(
+                        "tool argument '{}' values must be strings (key '{}')",
+                        key,
+                        k
+                    ));
+                };
+                out.insert(k.clone(), s.clone());
+            }
+            Ok(out)
+        }
+        Some(Value::Null) | None => Ok(std::collections::HashMap::new()),
+        Some(_) => Err(anyhow!("tool argument '{}' must be object", key)),
+    }
+}
+
 fn arg_u64(args: &Value, key: &str) -> Result<Option<u64>> {
     match args.get(key) {
         Some(Value::Number(n)) => n
@@ -412,6 +451,17 @@ fn arg_u64(args: &Value, key: &str) -> Result<Option<u64>> {
             "tool argument '{}' must be non-negative integer",
             key
         )),
+    }
+}
+
+fn arg_u32(args: &Value, key: &str) -> Result<Option<u32>> {
+    match arg_u64(args, key)? {
+        Some(v) => {
+            let value = u32::try_from(v)
+                .map_err(|_| anyhow!("tool argument '{}' is too large for u32", key))?;
+            Ok(Some(value))
+        }
+        None => Ok(None),
     }
 }
 
@@ -451,7 +501,7 @@ fn normalize_daemon_url(url: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{arg_string, arg_u64, tool_specs};
+    use super::{arg_string, arg_string_map, arg_u32, arg_u64, tool_specs};
     use serde_json::json;
 
     #[test]
@@ -472,12 +522,17 @@ mod tests {
 
     #[test]
     fn arg_helpers_parse_values() {
-        let args = json!({ "a": "x", "n": 3 });
+        let args = json!({ "a": "x", "n": 3, "vars": {"X": "1"} });
         assert_eq!(
             arg_string(&args, "a").expect("a should parse"),
             Some("x".to_string())
         );
         assert_eq!(arg_u64(&args, "n").expect("n should parse"), Some(3));
+        assert_eq!(arg_u32(&args, "n").expect("n should parse"), Some(3));
+        assert_eq!(
+            arg_string_map(&args, "vars").expect("vars should parse"),
+            std::collections::HashMap::from([(String::from("X"), String::from("1"))])
+        );
         assert_eq!(
             arg_string(&args, "missing").expect("missing should parse"),
             None
