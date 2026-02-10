@@ -168,12 +168,12 @@ impl Workflow {
             bail!("workflow must contain at least one stage");
         }
 
-        let mut seen = HashSet::new();
+        let mut known_stage_ids = HashSet::new();
         for stage in &self.stages {
             if stage.id.trim().is_empty() {
                 bail!("stage id is required");
             }
-            if !seen.insert(stage.id.clone()) {
+            if !known_stage_ids.insert(stage.id.clone()) {
                 bail!("duplicate stage id '{}'", stage.id);
             }
             if let Some(trust) = &stage.trust
@@ -185,16 +185,25 @@ impl Workflow {
             }
         }
 
+        let mut prior_stages = HashSet::new();
         for stage in &self.stages {
             for need in &stage.needs {
-                if !seen.contains(need) {
+                if !known_stage_ids.contains(need) {
                     bail!(
                         "stage '{}' references unknown dependency '{}'",
                         stage.id,
                         need
                     );
                 }
+                if !prior_stages.contains(need) {
+                    bail!(
+                        "stage '{}' dependency '{}' must reference an earlier stage",
+                        stage.id,
+                        need
+                    );
+                }
             }
+            prior_stages.insert(stage.id.clone());
         }
         Ok(())
     }
@@ -226,5 +235,63 @@ pub fn parse_optional_duration(raw: Option<&str>) -> Result<Option<Duration>> {
             parse_duration(v).with_context(|| format!("invalid duration '{}'", v))?,
         )),
         None => Ok(None),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Stage, Workflow};
+    use std::collections::HashMap;
+
+    fn base_workflow(stages: Vec<Stage>) -> Workflow {
+        Workflow {
+            name: "wf".to_string(),
+            mode: "once".to_string(),
+            memory: false,
+            tags: vec![],
+            vars: HashMap::new(),
+            env: HashMap::new(),
+            workdir: None,
+            trigger: Default::default(),
+            stages,
+            source_path: None,
+        }
+    }
+
+    #[test]
+    fn allows_dependency_on_prior_stage() {
+        let wf = base_workflow(vec![
+            Stage {
+                id: "a".to_string(),
+                exec: Some("echo a".to_string()),
+                ..Default::default()
+            },
+            Stage {
+                id: "b".to_string(),
+                needs: vec!["a".to_string()],
+                exec: Some("echo b".to_string()),
+                ..Default::default()
+            },
+        ]);
+        wf.validate().expect("workflow should validate");
+    }
+
+    #[test]
+    fn rejects_dependency_on_later_stage() {
+        let wf = base_workflow(vec![
+            Stage {
+                id: "b".to_string(),
+                needs: vec!["a".to_string()],
+                exec: Some("echo b".to_string()),
+                ..Default::default()
+            },
+            Stage {
+                id: "a".to_string(),
+                exec: Some("echo a".to_string()),
+                ..Default::default()
+            },
+        ]);
+        let err = wf.validate().expect_err("workflow should fail validation");
+        assert!(err.to_string().contains("must reference an earlier stage"));
     }
 }

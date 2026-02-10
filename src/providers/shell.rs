@@ -1,5 +1,5 @@
 use crate::expr::subst;
-use crate::providers::{Provider, ProviderError, ProviderResult};
+use crate::providers::{Provider, ProviderError, ProviderResult, runtime_env};
 use crate::workflow::{Stage, Workflow};
 use async_trait::async_trait;
 use std::collections::HashMap;
@@ -46,6 +46,9 @@ impl Provider for ShellProvider {
         }
         for (k, v) in &stage.env {
             command.env(k, subst(v, vars, outputs));
+        }
+        for (k, v) in runtime_env(stage, workflow, outputs) {
+            command.env(k, v);
         }
 
         let output = run_with_timeout(command, timeout).await?;

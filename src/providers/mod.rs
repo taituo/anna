@@ -7,6 +7,7 @@ use std::time::Duration;
 
 pub mod cli;
 pub mod http;
+pub mod k8s;
 pub mod llm;
 pub mod shell;
 
@@ -71,11 +72,32 @@ impl ProviderRegistry {
     }
 }
 
+pub fn runtime_env(
+    stage: &Stage,
+    workflow: &Workflow,
+    outputs: &HashMap<String, String>,
+) -> HashMap<String, String> {
+    let mut env = HashMap::new();
+    if let Some(session) = outputs.get("SESSION")
+        && !session.trim().is_empty()
+    {
+        env.insert("ANNA_SESSION".to_string(), session.clone());
+    }
+    env.insert("ANNA_WORKFLOW".to_string(), workflow.name.clone());
+    env.insert("ANNA_STAGE_ID".to_string(), stage.id.clone());
+    env.insert(
+        "ANNA_TRUST".to_string(),
+        stage.trust.clone().unwrap_or_else(|| "none".to_string()),
+    );
+    env
+}
+
 pub fn default_registry() -> ProviderRegistry {
     let mut reg = ProviderRegistry::new();
     reg.register("shell", shell::ShellProvider::default());
     reg.register("cli", cli::CliProvider::default());
     reg.register("http", http::HttpProvider::default());
     reg.register("llm", llm::LlmProvider::default());
+    reg.register("k8s", k8s::K8sProvider::default());
     reg
 }

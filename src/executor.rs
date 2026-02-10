@@ -2,7 +2,7 @@ use crate::expr::{eval_when, subst};
 use crate::memory::MemoryStore;
 use crate::providers::{ProviderError, ProviderRegistry, default_registry};
 use crate::result::RunResult;
-use crate::session::write_stage_log;
+use crate::session::{add_child_session, init_session_meta, write_stage_log};
 use crate::workflow::{Stage, Workflow};
 use anyhow::{Result, anyhow};
 use std::collections::HashMap;
@@ -53,6 +53,12 @@ impl Executor {
             result.outputs.insert("SESSION".to_string(), session_id);
         }
         result.parent_id = parent_id;
+        init_session_meta(
+            &result.session_id,
+            &workflow.name,
+            result.parent_id.as_deref(),
+        )
+        .await?;
         let mut iterations = 0_u32;
 
         loop {
@@ -222,6 +228,15 @@ impl Executor {
         {
             Ok(child_result) => {
                 result.add_child(child_result.session_id.clone());
+                if let Err(err) =
+                    add_child_session(&result.session_id, &child_result.session_id, &workflow.name)
+                        .await
+                {
+                    result.errors.push(format!(
+                        "session-meta: failed linking child '{}' -> '{}': {}",
+                        result.session_id, child_result.session_id, err
+                    ));
+                }
                 let mut output = String::new();
                 if let Some(last_stage) = child_wf.stages.last()
                     && let Some(v) = child_result.outputs.get(&last_stage.id)

@@ -48,11 +48,13 @@ ANNA_LLM_BACKEND_CMD=cat ./tools/anna-llm-provider --model local --prompt "ping"
 Input from Anna:
 - process args from `args`
 - stdin from `stdin` when provided
-- stage/workflow context via env (recommended):
+- stage/workflow context via env:
   - `ANNA_SESSION`
   - `ANNA_WORKFLOW`
   - `ANNA_STAGE_ID`
   - `ANNA_TRUST`
+
+Current Rust runtime injects these `ANNA_*` variables automatically for `provider: cli` and `provider: shell`.
 
 Output to Anna:
 - `parse: text` -> full stdout captured as stage output
