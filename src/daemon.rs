@@ -8,10 +8,15 @@ use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use chrono::{DateTime, Utc};
+use cron::Schedule;
+use humantime::parse_duration;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path as FsPath, PathBuf};
+use std::str::FromStr;
 use std::sync::Arc;
+use std::time::{Instant, UNIX_EPOCH};
 use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
 use tokio::time::{Duration, sleep};
@@ -76,6 +81,13 @@ struct WsLogFrame {
     errors: Vec<String>,
 }
 
+#[derive(Debug, Default)]
+struct TriggerScheduler {
+    interval_next: HashMap<String, Instant>,
+    cron_next: HashMap<String, DateTime<Utc>>,
+    watch_snapshots: HashMap<String, HashMap<String, u64>>,
+}
+
 pub async fn run_daemon(bind: &str, plays_dir: PathBuf) -> Result<()> {
     let state = AppState {
         executor: Executor::new(),
@@ -83,6 +95,7 @@ pub async fn run_daemon(bind: &str, plays_dir: PathBuf) -> Result<()> {
         sessions: Arc::new(RwLock::new(HashMap::new())),
         handles: Arc::new(RwLock::new(HashMap::new())),
     };
+    tokio::spawn(trigger_scheduler_loop(state.clone()));
 
     let app = Router::new()
         .route("/health", get(health))
@@ -261,14 +274,7 @@ async fn trigger_hook(
         if let Some(webhook) = entry.trigger_webhook.as_deref()
             && webhook.trim() == hook_path
         {
-            let mut wf = match Workflow::load(&entry.path) {
-                Ok(v) => v,
-                Err(_) => continue,
-            };
-            if wf.workdir.is_none() {
-                wf.workdir = Some(state.plays_dir.display().to_string());
-            }
-            if let Ok(session_id) = launch_workflow(&state, wf).await {
+            if let Ok(session_id) = launch_workflow_from_entry(&state, &entry, "webhook").await {
                 launched.push(HookLaunchedWorkflow {
                     workflow: entry.workflow_name,
                     session_id,
@@ -316,6 +322,258 @@ async fn ws_logs(
     ws: WebSocketUpgrade,
 ) -> impl IntoResponse {
     ws.on_upgrade(move |socket| stream_logs(socket, state, query.id))
+}
+
+async fn trigger_scheduler_loop(state: AppState) {
+    let mut scheduler = TriggerScheduler::default();
+    loop {
+        let entries = match find_workflow_entries(&state.plays_dir).await {
+            Ok(v) => v,
+            Err(err) => {
+                eprintln!("anna-rs scheduler: failed to scan workflows: {}", err);
+                sleep(Duration::from_secs(2)).await;
+                continue;
+            }
+        };
+
+        run_interval_triggers(&state, &entries, &mut scheduler).await;
+        run_cron_triggers(&state, &entries, &mut scheduler).await;
+        run_watch_triggers(&state, &entries, &mut scheduler).await;
+        sleep(Duration::from_secs(1)).await;
+    }
+}
+
+async fn run_interval_triggers(
+    state: &AppState,
+    entries: &[WorkflowEntry],
+    scheduler: &mut TriggerScheduler,
+) {
+    let mut seen = HashSet::new();
+    let now = Instant::now();
+
+    for entry in entries {
+        let Some(raw_interval) = entry.trigger_interval.as_deref() else {
+            continue;
+        };
+        if raw_interval.trim().is_empty() {
+            continue;
+        }
+        let interval = match parse_duration(raw_interval) {
+            Ok(v) => v,
+            Err(err) => {
+                eprintln!(
+                    "anna-rs scheduler: invalid trigger.interval '{}' in '{}': {}",
+                    raw_interval,
+                    entry.path.display(),
+                    err
+                );
+                continue;
+            }
+        };
+
+        let key = trigger_key(entry, "interval", raw_interval);
+        seen.insert(key.clone());
+        let next = scheduler
+            .interval_next
+            .entry(key)
+            .or_insert_with(|| now + interval);
+        if now >= *next {
+            if let Err(err) = launch_workflow_from_entry(state, entry, "interval").await {
+                eprintln!(
+                    "anna-rs scheduler: failed launching interval trigger for '{}': {}",
+                    entry.path.display(),
+                    err
+                );
+            }
+            *next = Instant::now() + interval;
+        }
+    }
+
+    scheduler.interval_next.retain(|k, _| seen.contains(k));
+}
+
+async fn run_cron_triggers(
+    state: &AppState,
+    entries: &[WorkflowEntry],
+    scheduler: &mut TriggerScheduler,
+) {
+    let mut seen = HashSet::new();
+    let now = Utc::now();
+
+    for entry in entries {
+        let Some(raw_cron) = entry.trigger_cron.as_deref() else {
+            continue;
+        };
+        if raw_cron.trim().is_empty() {
+            continue;
+        }
+
+        let schedule = match Schedule::from_str(raw_cron) {
+            Ok(v) => v,
+            Err(err) => {
+                eprintln!(
+                    "anna-rs scheduler: invalid trigger.cron '{}' in '{}': {}",
+                    raw_cron,
+                    entry.path.display(),
+                    err
+                );
+                continue;
+            }
+        };
+
+        let key = trigger_key(entry, "cron", raw_cron);
+        seen.insert(key.clone());
+        let next = scheduler.cron_next.entry(key).or_insert_with(|| {
+            schedule
+                .after(&now)
+                .next()
+                .unwrap_or_else(|| now + chrono::Duration::days(1))
+        });
+
+        if *next <= now {
+            if let Err(err) = launch_workflow_from_entry(state, entry, "cron").await {
+                eprintln!(
+                    "anna-rs scheduler: failed launching cron trigger for '{}': {}",
+                    entry.path.display(),
+                    err
+                );
+            }
+            *next = schedule
+                .after(&now)
+                .next()
+                .unwrap_or_else(|| now + chrono::Duration::days(1));
+        }
+    }
+
+    scheduler.cron_next.retain(|k, _| seen.contains(k));
+}
+
+async fn run_watch_triggers(
+    state: &AppState,
+    entries: &[WorkflowEntry],
+    scheduler: &mut TriggerScheduler,
+) {
+    let mut seen = HashSet::new();
+    for entry in entries {
+        let Some(raw_watch) = entry.trigger_watch.as_deref() else {
+            continue;
+        };
+        if raw_watch.trim().is_empty() {
+            continue;
+        }
+
+        let base_dir = watch_base_dir(&state.plays_dir, entry);
+        let pattern = resolve_watch_pattern(&base_dir, raw_watch);
+        if pattern.trim().is_empty() {
+            continue;
+        }
+
+        let key = trigger_key(entry, "watch", &pattern);
+        seen.insert(key.clone());
+
+        let snapshot = match collect_watch_snapshot(&pattern) {
+            Ok(v) => v,
+            Err(err) => {
+                eprintln!(
+                    "anna-rs scheduler: invalid trigger.watch '{}' in '{}': {}",
+                    raw_watch,
+                    entry.path.display(),
+                    err
+                );
+                continue;
+            }
+        };
+
+        let changed = match scheduler.watch_snapshots.get(&key) {
+            None => false,
+            Some(previous) => previous != &snapshot,
+        };
+        scheduler.watch_snapshots.insert(key, snapshot);
+
+        if changed && let Err(err) = launch_workflow_from_entry(state, entry, "watch").await {
+            eprintln!(
+                "anna-rs scheduler: failed launching watch trigger for '{}': {}",
+                entry.path.display(),
+                err
+            );
+        }
+    }
+
+    scheduler.watch_snapshots.retain(|k, _| seen.contains(k));
+}
+
+fn watch_base_dir(plays_dir: &FsPath, entry: &WorkflowEntry) -> PathBuf {
+    match entry.workflow_workdir.as_ref() {
+        Some(wd) => {
+            let wd_path = PathBuf::from(wd);
+            if wd_path.is_absolute() {
+                wd_path
+            } else {
+                plays_dir.join(wd_path)
+            }
+        }
+        None => entry
+            .path
+            .parent()
+            .map(ToOwned::to_owned)
+            .unwrap_or_else(|| plays_dir.to_path_buf()),
+    }
+}
+
+fn resolve_watch_pattern(base_dir: &FsPath, raw_pattern: &str) -> String {
+    let trimmed = raw_pattern.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+
+    let raw_path = PathBuf::from(trimmed);
+    if raw_path.is_absolute() {
+        return trimmed.to_string();
+    }
+    if trimmed.contains("**") || trimmed.contains('/') || trimmed.contains('\\') {
+        return base_dir.join(trimmed).to_string_lossy().into_owned();
+    }
+
+    base_dir
+        .join("**")
+        .join(trimmed)
+        .to_string_lossy()
+        .into_owned()
+}
+
+fn collect_watch_snapshot(pattern: &str) -> Result<HashMap<String, u64>> {
+    let mut snapshot = HashMap::new();
+    for item in glob::glob(pattern)? {
+        let path = match item {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        if !path.is_file() {
+            continue;
+        }
+        let metadata = match std::fs::metadata(&path) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let modified = metadata
+            .modified()
+            .ok()
+            .and_then(|v| v.duration_since(UNIX_EPOCH).ok())
+            .map(|v| v.as_nanos() as u64)
+            .unwrap_or(0);
+        let fingerprint = modified ^ metadata.len().rotate_left(13);
+        snapshot.insert(path.to_string_lossy().into_owned(), fingerprint);
+    }
+    Ok(snapshot)
+}
+
+fn trigger_key(entry: &WorkflowEntry, trigger_kind: &str, trigger_value: &str) -> String {
+    format!(
+        "{}::{}::{}",
+        entry.path.display(),
+        trigger_kind,
+        trigger_value.trim()
+    )
 }
 
 async fn find_workflows(root: &FsPath) -> Result<Vec<String>> {
@@ -415,6 +673,10 @@ struct WorkflowEntry {
     workflow_name: String,
     path: PathBuf,
     trigger_webhook: Option<String>,
+    trigger_watch: Option<String>,
+    trigger_cron: Option<String>,
+    trigger_interval: Option<String>,
+    workflow_workdir: Option<String>,
 }
 
 async fn find_workflow_entries(root: &FsPath) -> Result<Vec<WorkflowEntry>> {
@@ -450,6 +712,10 @@ async fn find_workflow_entries(root: &FsPath) -> Result<Vec<WorkflowEntry>> {
             workflow_name: wf.name,
             path,
             trigger_webhook: wf.trigger.webhook,
+            trigger_watch: wf.trigger.watch,
+            trigger_cron: wf.trigger.cron,
+            trigger_interval: wf.trigger.interval,
+            workflow_workdir: wf.workdir,
         });
     }
     Ok(out)
@@ -473,6 +739,23 @@ async fn resolve_registered_workflow_path(root: &FsPath, name: &str) -> Result<O
         }
     }
     Ok(None)
+}
+
+async fn launch_workflow_from_entry(
+    state: &AppState,
+    entry: &WorkflowEntry,
+    trigger_source: &str,
+) -> Result<String> {
+    let mut wf = Workflow::load(&entry.path)?;
+    if wf.workdir.is_none() {
+        wf.workdir = Some(state.plays_dir.display().to_string());
+    }
+    let req_id = launch_workflow(state, wf).await?;
+    println!(
+        "anna-rs daemon trigger={} workflow='{}' request_id={}",
+        trigger_source, entry.workflow_name, req_id
+    );
+    Ok(req_id)
 }
 
 async fn launch_workflow(state: &AppState, workflow: Workflow) -> Result<String> {
@@ -532,7 +815,10 @@ async fn launch_workflow(state: &AppState, workflow: Workflow) -> Result<String>
 
 #[cfg(test)]
 mod tests {
-    use super::{find_workflow_entries, resolve_registered_workflow_path};
+    use super::{
+        collect_watch_snapshot, find_workflow_entries, resolve_registered_workflow_path,
+        resolve_watch_pattern,
+    };
 
     #[tokio::test]
     async fn resolves_workflow_by_file_and_name() {
@@ -589,5 +875,56 @@ mod tests {
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].workflow_name, "hooked");
         assert_eq!(entries[0].trigger_webhook.as_deref(), Some("/deploy"));
+    }
+
+    #[tokio::test]
+    async fn finds_trigger_metadata() {
+        let dir = std::env::temp_dir().join(format!(
+            "anna-daemon-triggers-{}-{}",
+            std::process::id(),
+            rand::random::<u32>()
+        ));
+        tokio::fs::create_dir_all(&dir)
+            .await
+            .expect("create temp dir");
+        tokio::fs::write(
+            dir.join("triggered.anna"),
+            "name: trig\ntrigger:\n  interval: 15s\n  cron: \"0/30 * * * * * *\"\n  watch: \"*.rs\"\nstages:\n  - id: hello\n    exec: \"echo hi\"\n",
+        )
+        .await
+        .expect("write workflow");
+
+        let entries = find_workflow_entries(&dir).await.expect("find entries");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].workflow_name, "trig");
+        assert_eq!(entries[0].trigger_interval.as_deref(), Some("15s"));
+        assert_eq!(entries[0].trigger_cron.as_deref(), Some("0/30 * * * * * *"));
+        assert_eq!(entries[0].trigger_watch.as_deref(), Some("*.rs"));
+    }
+
+    #[test]
+    fn resolve_watch_pattern_defaults_recursive_filename_glob() {
+        let root = std::path::PathBuf::from("/tmp/anna-watch");
+        let pattern = resolve_watch_pattern(&root, "*.go");
+        assert_eq!(pattern, "/tmp/anna-watch/**/*.go");
+    }
+
+    #[test]
+    fn collect_watch_snapshot_changes_when_file_updates() {
+        let dir = std::env::temp_dir().join(format!(
+            "anna-watch-snap-{}-{}",
+            std::process::id(),
+            rand::random::<u32>()
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let file = dir.join("x.txt");
+        std::fs::write(&file, "a").expect("write first content");
+
+        let pattern = format!("{}/**/*.txt", dir.display());
+        let before = collect_watch_snapshot(&pattern).expect("collect before snapshot");
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        std::fs::write(&file, "bbb").expect("write updated content");
+        let after = collect_watch_snapshot(&pattern).expect("collect after snapshot");
+        assert_ne!(before, after);
     }
 }

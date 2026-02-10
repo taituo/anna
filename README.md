@@ -48,7 +48,7 @@ This repository now includes a Rust runtime foundation in `src/`:
 - provider registry with `shell`, `cli`, `http`, `llm`, `k8s` (LLM and k8s via CLI adapters)
 - executor with `needs`, `when`, retry, timeout, hooks, and session logs
 - session metadata files (`/tmp/anna/<session>/_meta.json`) with parent/child linkage
-- daemon API scaffold (`health`, workflow submit/status/stop/logs, local workflow listing, basic `/ws?id=...` stream)
+- daemon API + trigger scheduler (`health`, workflow submit/status/stop/logs, `/hook/*`, `/ws`, plus `trigger.interval|cron|watch`)
 
 Run locally:
 
@@ -57,7 +57,7 @@ cargo run -- validate botbet.anna
 cargo run -- run botbet.anna --max-iterations 1
 ```
 
-Current MVP intentionally leaves some advanced features for next steps (richer daemon scheduling/HA and production-grade live log streaming semantics).
+Current MVP intentionally leaves some advanced features for next steps (multi-node HA coordination and production-grade live log streaming semantics).
 `forks`, `each/each_from`, `vote`, sub-workflows, and memory persistence are implemented in the Rust executor foundation.
 
 ## Runtime Profiles
