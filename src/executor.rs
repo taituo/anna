@@ -6,7 +6,7 @@ use crate::session::{add_child_session, init_session_meta, session_dir, write_st
 use crate::workflow::{Stage, Workflow};
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
@@ -37,6 +37,7 @@ pub trait HitlHandler: Send + Sync {
 #[derive(Clone, Default)]
 pub struct Executor {
     providers: ProviderRegistry,
+    allowed_providers: Option<HashSet<String>>,
     memory: MemoryStore,
     hitl: Option<Arc<dyn HitlHandler>>,
 }
@@ -45,6 +46,7 @@ impl Executor {
     pub fn new() -> Self {
         Self {
             providers: default_registry(),
+            allowed_providers: allowed_providers_from_env(),
             memory: MemoryStore::default(),
             hitl: None,
         }
@@ -53,9 +55,19 @@ impl Executor {
     pub fn with_memory_store(memory: MemoryStore) -> Self {
         Self {
             providers: default_registry(),
+            allowed_providers: allowed_providers_from_env(),
             memory,
             hitl: None,
         }
+    }
+
+    pub fn with_allowed_providers(mut self, providers: Option<HashSet<String>>) -> Self {
+        self.allowed_providers = normalize_allowed_provider_set(providers);
+        self
+    }
+
+    pub fn allowed_providers_set(&self) -> Option<HashSet<String>> {
+        self.allowed_providers.clone()
     }
 
     pub fn with_hitl_handler(mut self, hitl: Arc<dyn HitlHandler>) -> Self {
@@ -777,6 +789,21 @@ impl Executor {
         })?;
 
         let provider_name = stage.provider_name();
+        if !provider_allowed(provider_name, &self.allowed_providers) {
+            let allowed = self
+                .allowed_providers
+                .as_ref()
+                .map(allowed_providers_display)
+                .unwrap_or_else(|| "*".to_string());
+            return Err(ProviderError::new(
+                "provider_exec_failed",
+                format!(
+                    "provider '{}' is blocked in stage '{}' (allowed providers: {})",
+                    provider_name, stage.id, allowed
+                ),
+            ));
+        }
+
         let provider = self.providers.get(provider_name).ok_or_else(|| {
             ProviderError::new(
                 "provider_exec_failed",
@@ -1045,13 +1072,73 @@ fn resolve_subworkflow_path(workflow: &Workflow, stage: &Stage, target: &str) ->
     target_path
 }
 
+fn allowed_providers_from_env() -> Option<HashSet<String>> {
+    parse_allowed_providers(std::env::var("ANNA_ALLOWED_PROVIDERS").ok().as_deref())
+}
+
+fn normalize_allowed_provider_set(providers: Option<HashSet<String>>) -> Option<HashSet<String>> {
+    let Some(providers) = providers else {
+        return None;
+    };
+    let mut normalized = HashSet::new();
+    for raw in providers {
+        let provider = raw.trim().to_ascii_lowercase();
+        if provider.is_empty() {
+            continue;
+        }
+        if provider == "*" || provider == "all" {
+            return None;
+        }
+        normalized.insert(provider);
+    }
+    if normalized.is_empty() {
+        return None;
+    }
+    Some(normalized)
+}
+
+fn parse_allowed_providers(raw: Option<&str>) -> Option<HashSet<String>> {
+    let raw = raw.map(str::trim).filter(|v| !v.is_empty())?;
+    let mut allowed = HashSet::new();
+    for token in raw.split(',') {
+        let provider = token.trim().to_ascii_lowercase();
+        if provider.is_empty() {
+            continue;
+        }
+        if provider == "*" || provider == "all" {
+            return None;
+        }
+        allowed.insert(provider);
+    }
+    if allowed.is_empty() {
+        return None;
+    }
+    Some(allowed)
+}
+
+fn provider_allowed(provider_name: &str, allowed: &Option<HashSet<String>>) -> bool {
+    match allowed {
+        None => true,
+        Some(set) => set.contains(&provider_name.to_ascii_lowercase()),
+    }
+}
+
+fn allowed_providers_display(allowed: &HashSet<String>) -> String {
+    let mut names = allowed.iter().cloned().collect::<Vec<_>>();
+    names.sort();
+    names.join(",")
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{Executor, HitlHandler, HitlRequest, RunConfig, sanitize_token};
+    use super::{
+        Executor, HitlHandler, HitlRequest, RunConfig, parse_allowed_providers, sanitize_token,
+    };
     use crate::memory::MemoryStore;
     use crate::session::session_dir;
     use crate::workflow::{Stage, Workflow};
     use async_trait::async_trait;
+    use std::collections::HashSet;
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
@@ -1764,5 +1851,55 @@ mod tests {
         assert_eq!(res.outputs.get("test.iterations"), Some(&"2".to_string()));
         assert_eq!(res.success.get("after"), None);
         assert_eq!(res.outputs.get("after"), None);
+    }
+
+    #[test]
+    fn parse_allowed_providers_handles_case_and_wildcards() {
+        let parsed =
+            parse_allowed_providers(Some(" shell,HTTP , cli,shell ")).expect("policy should parse");
+        assert!(parsed.contains("shell"));
+        assert!(parsed.contains("http"));
+        assert!(parsed.contains("cli"));
+        assert_eq!(parsed.len(), 3);
+
+        assert!(parse_allowed_providers(Some("*")).is_none());
+        assert!(parse_allowed_providers(Some("all,http")).is_none());
+    }
+
+    #[tokio::test]
+    async fn blocked_provider_fails_stage() {
+        let wf = Workflow {
+            name: "blocked-provider".into(),
+            mode: "once".into(),
+            memory: false,
+            tags: vec![],
+            vars: Default::default(),
+            env: Default::default(),
+            workdir: None,
+            trigger: Default::default(),
+            stages: vec![Stage {
+                id: "s1".into(),
+                provider: "shell".into(),
+                exec: Some("echo hi".into()),
+                ..Default::default()
+            }],
+            source_path: None,
+        };
+
+        let exec = Executor::new()
+            .with_allowed_providers(Some(HashSet::from(["http".to_string(), "cli".to_string()])));
+        let err = exec
+            .run(
+                &wf,
+                RunConfig {
+                    max_iterations: Some(1),
+                    session_id_override: None,
+                },
+            )
+            .await
+            .expect_err("blocked provider should fail");
+        let msg = err.to_string();
+        assert!(msg.contains("provider 'shell' is blocked"));
+        assert!(msg.contains("allowed providers: cli,http"));
     }
 }

@@ -29,6 +29,7 @@ struct AppState {
     plays_dir: PathBuf,
     registry_file: Option<PathBuf>,
     node_capabilities: HashSet<String>,
+    allowed_providers: Option<HashSet<String>>,
     owner_policy: OwnerConcurrencyPolicy,
     sessions: Arc<RwLock<HashMap<String, SessionInfo>>>,
     handles: Arc<RwLock<HashMap<String, JoinHandle<()>>>>,
@@ -75,6 +76,8 @@ struct PolicyResponse {
     registry_enabled: bool,
     auth_enabled: bool,
     node_capabilities: Vec<String>,
+    provider_restriction_enabled: bool,
+    allowed_providers: Vec<String>,
     owner_limits: Vec<OwnerLimitEntry>,
     #[serde(skip_serializing_if = "Option::is_none")]
     owner_default_limit: Option<usize>,
@@ -359,11 +362,13 @@ pub async fn run_daemon(bind: &str, plays_dir: PathBuf) -> Result<()> {
         pending: hitl.clone(),
         max_hitl: retention.max_hitl,
     }));
+    let allowed_providers = executor.allowed_providers_set();
     let state = AppState {
         executor,
         plays_dir,
         registry_file: registry_file.clone(),
         node_capabilities: node_capabilities.clone(),
+        allowed_providers: allowed_providers.clone(),
         owner_policy: owner_policy.clone(),
         sessions: Arc::new(RwLock::new(sessions_seed)),
         handles: Arc::new(RwLock::new(HashMap::new())),
@@ -386,6 +391,11 @@ pub async fn run_daemon(bind: &str, plays_dir: PathBuf) -> Result<()> {
         let mut capabilities = node_capabilities.iter().cloned().collect::<Vec<_>>();
         capabilities.sort();
         println!("anna-rs node capabilities: {}", capabilities.join(","));
+    }
+    if let Some(allowed) = allowed_providers {
+        let mut providers = allowed.into_iter().collect::<Vec<_>>();
+        providers.sort();
+        println!("anna-rs allowed providers policy: {}", providers.join(","));
     }
     if !owner_policy.per_owner.is_empty() || owner_policy.default_limit.is_some() {
         let mut entries = owner_policy
@@ -435,6 +445,12 @@ async fn policy(State(state): State<AppState>, headers: HeaderMap) -> impl IntoR
 
     let mut node_capabilities = state.node_capabilities.iter().cloned().collect::<Vec<_>>();
     node_capabilities.sort();
+    let mut allowed_providers = state
+        .allowed_providers
+        .as_ref()
+        .map(|set| set.iter().cloned().collect::<Vec<_>>())
+        .unwrap_or_default();
+    allowed_providers.sort();
     let mut owner_limits = state
         .owner_policy
         .per_owner
@@ -450,6 +466,8 @@ async fn policy(State(state): State<AppState>, headers: HeaderMap) -> impl IntoR
         registry_enabled: state.registry_file.is_some(),
         auth_enabled: state.auth_token.is_some(),
         node_capabilities,
+        provider_restriction_enabled: state.allowed_providers.is_some(),
+        allowed_providers,
         owner_limits,
         owner_default_limit: state.owner_policy.default_limit,
         retention_max_sessions: state.retention.max_sessions,

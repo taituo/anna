@@ -73,6 +73,9 @@ CLI providers must fail with explicit reason classes:
 
 No silent fallback is allowed. Errors must remain deterministic and auditable.
 
+Runtime guardrail:
+- if `ANNA_ALLOWED_PROVIDERS` is set and excludes `cli`, stages using `provider: cli` are blocked before execution.
+
 Exit codes:
 - `10` -> `provider_not_found`
 - `11` -> `provider_start_failed`

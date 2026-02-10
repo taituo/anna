@@ -99,6 +99,12 @@ Optional node capability ceiling (used against `required_capabilities`):
 ANNA_NODE_CAPABILITIES="shell,http,k8s,vault" anna daemon --plays-dir .
 ```
 
+Optional provider allowlist ceiling (applies to `run` and daemon-triggered runs):
+
+```bash
+ANNA_ALLOWED_PROVIDERS="shell,cli,http" anna daemon --plays-dir .
+```
+
 Optional owner concurrency policy (per `owner` in registry):
 
 ```bash
