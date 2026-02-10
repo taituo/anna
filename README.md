@@ -58,6 +58,17 @@ anna daemon
 anna status <request_id>  # CLI sends Bearer token automatically
 ```
 
+Daemon state persistence (sessions + HITL):
+
+```bash
+# default: ~/.anna/daemon-state.json
+anna daemon
+
+# custom path or disable
+ANNA_DAEMON_STATE_FILE=/var/lib/anna/state.json anna daemon
+ANNA_DAEMON_STATE_FILE=off anna daemon
+```
+
 ## Rust Runtime (MVP)
 
 This repository now includes a Rust runtime foundation in `src/`:

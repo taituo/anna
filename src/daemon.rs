@@ -1,7 +1,7 @@
 use crate::executor::{Executor, HitlHandler, HitlRequest, RunConfig};
 use crate::session::session_dir;
 use crate::workflow::Workflow;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use async_trait::async_trait;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, Query, State};
@@ -33,7 +33,7 @@ struct AppState {
     auth_token: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct SessionInfo {
     id: String,
     status: String,
@@ -100,7 +100,7 @@ struct WsLogFrame {
     errors: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct HitlPending {
     id: String,
     session_id: String,
@@ -142,6 +142,16 @@ struct TriggerScheduler {
     watch_snapshots: HashMap<String, HashMap<String, u64>>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct DaemonStateSnapshot {
+    #[serde(default)]
+    sessions: HashMap<String, SessionInfo>,
+    #[serde(default)]
+    hitl: HashMap<String, HitlPending>,
+    #[serde(default)]
+    saved_at: u64,
+}
+
 #[derive(Clone)]
 struct DaemonHitl {
     pending: Arc<RwLock<HashMap<String, HitlPending>>>,
@@ -180,19 +190,32 @@ impl HitlHandler for DaemonHitl {
 }
 
 pub async fn run_daemon(bind: &str, plays_dir: PathBuf) -> Result<()> {
-    let hitl = Arc::new(RwLock::new(HashMap::<String, HitlPending>::new()));
+    let state_file = daemon_state_file();
+    let (sessions_seed, hitl_seed) = match state_file.as_ref() {
+        Some(path) => load_daemon_state(path).await?,
+        None => (HashMap::new(), HashMap::new()),
+    };
+
+    let hitl = Arc::new(RwLock::new(hitl_seed));
     let executor = Executor::new().with_hitl_handler(Arc::new(DaemonHitl {
         pending: hitl.clone(),
     }));
     let state = AppState {
         executor,
         plays_dir,
-        sessions: Arc::new(RwLock::new(HashMap::new())),
+        sessions: Arc::new(RwLock::new(sessions_seed)),
         handles: Arc::new(RwLock::new(HashMap::new())),
-        hitl,
+        hitl: hitl.clone(),
         auth_token: daemon_auth_token(),
     };
     tokio::spawn(trigger_scheduler_loop(state.clone()));
+    if let Some(path) = state_file {
+        println!(
+            "anna-rs daemon state persistence enabled at {}",
+            path.display()
+        );
+        tokio::spawn(state_persist_loop(state.clone(), path));
+    }
 
     let app = Router::new()
         .route("/health", get(health))
@@ -849,6 +872,107 @@ fn daemon_auth_token() -> Option<String> {
         .filter(|v| !v.is_empty())
 }
 
+fn daemon_state_file() -> Option<PathBuf> {
+    if let Ok(raw) = std::env::var("ANNA_DAEMON_STATE_FILE") {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("off") {
+            return None;
+        }
+        return Some(PathBuf::from(trimmed));
+    }
+    std::env::var("HOME")
+        .ok()
+        .map(|home| PathBuf::from(home).join(".anna/daemon-state.json"))
+}
+
+async fn load_daemon_state(
+    path: &FsPath,
+) -> Result<(HashMap<String, SessionInfo>, HashMap<String, HitlPending>)> {
+    let raw = match tokio::fs::read_to_string(path).await {
+        Ok(v) => v,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Ok((HashMap::new(), HashMap::new()));
+        }
+        Err(err) => {
+            return Err(err)
+                .with_context(|| format!("failed reading daemon state file '{}'", path.display()));
+        }
+    };
+
+    let mut parsed: DaemonStateSnapshot = serde_json::from_str(&raw)
+        .with_context(|| format!("failed parsing daemon state file '{}'", path.display()))?;
+    let now = now_unix_secs();
+    for (id, session) in &mut parsed.sessions {
+        if session.id.trim().is_empty() {
+            session.id = id.clone();
+        }
+        if session.status == "running" {
+            session.status = "interrupted".to_string();
+            session.updated_at = now;
+            session
+                .errors
+                .push("daemon restarted while session was running".to_string());
+        }
+    }
+    for (id, hitl) in &mut parsed.hitl {
+        if hitl.id.trim().is_empty() {
+            hitl.id = id.clone();
+        }
+    }
+    Ok((parsed.sessions, parsed.hitl))
+}
+
+async fn state_persist_loop(state: AppState, path: PathBuf) {
+    loop {
+        if let Err(err) = persist_daemon_state(&state, &path).await {
+            eprintln!("anna-rs daemon: failed persisting state: {}", err);
+        }
+        sleep(Duration::from_secs(2)).await;
+    }
+}
+
+async fn persist_daemon_state(state: &AppState, path: &FsPath) -> Result<()> {
+    let sessions = state.sessions.read().await.clone();
+    let hitl = state.hitl.read().await.clone();
+    let snapshot = DaemonStateSnapshot {
+        sessions,
+        hitl,
+        saved_at: now_unix_secs(),
+    };
+    let raw = serde_json::to_string_pretty(&snapshot)?;
+
+    if let Some(parent) = path.parent() {
+        tokio::fs::create_dir_all(parent).await.with_context(|| {
+            format!(
+                "failed creating daemon state directory '{}'",
+                parent.display()
+            )
+        })?;
+    }
+
+    let tmp = temp_state_path(path);
+    tokio::fs::write(&tmp, raw)
+        .await
+        .with_context(|| format!("failed writing daemon state temp file '{}'", tmp.display()))?;
+    tokio::fs::rename(&tmp, path).await.with_context(|| {
+        format!(
+            "failed moving daemon state file '{}' -> '{}'",
+            tmp.display(),
+            path.display()
+        )
+    })?;
+    Ok(())
+}
+
+fn temp_state_path(path: &FsPath) -> PathBuf {
+    let mut tmp = path.to_path_buf();
+    if let Some(name) = path.file_name().and_then(|v| v.to_str()) {
+        tmp.set_file_name(format!("{}.tmp", name));
+        return tmp;
+    }
+    path.with_extension("tmp")
+}
+
 fn ensure_authorized(state: &AppState, headers: &HeaderMap) -> Option<axum::response::Response> {
     let Some(expected) = state.auth_token.as_ref() else {
         return None;
@@ -1150,8 +1274,9 @@ async fn launch_workflow(state: &AppState, workflow: Workflow) -> Result<String>
 #[cfg(test)]
 mod tests {
     use super::{
-        DaemonHitl, HitlPending, collect_watch_snapshot, find_workflow_entries, is_authorized,
-        resolve_registered_workflow_path, resolve_watch_pattern, status_matches,
+        DaemonHitl, DaemonStateSnapshot, HitlPending, SessionInfo, collect_watch_snapshot,
+        find_workflow_entries, is_authorized, load_daemon_state, resolve_registered_workflow_path,
+        resolve_watch_pattern, status_matches, temp_state_path,
     };
     use crate::executor::{HitlHandler, HitlRequest};
     use axum::http::{HeaderMap, HeaderValue};
@@ -1343,5 +1468,60 @@ mod tests {
         assert!(status_matches("running", "RUNNING"));
         assert!(status_matches("failed", " failed "));
         assert!(!status_matches("running", "run"));
+    }
+
+    #[tokio::test]
+    async fn load_state_marks_running_sessions_interrupted() {
+        let file = std::env::temp_dir().join(format!(
+            "anna-daemon-state-{}-{}.json",
+            std::process::id(),
+            rand::random::<u32>()
+        ));
+        let mut sessions = HashMap::new();
+        sessions.insert(
+            "a1".to_string(),
+            SessionInfo {
+                id: "a1".to_string(),
+                status: "running".to_string(),
+                workflow: "wf".to_string(),
+                created_at: 1,
+                updated_at: 1,
+                runtime_session_id: None,
+                outputs: HashMap::new(),
+                errors: vec![],
+            },
+        );
+        let snapshot = DaemonStateSnapshot {
+            sessions,
+            hitl: HashMap::new(),
+            saved_at: 1,
+        };
+        tokio::fs::write(
+            &file,
+            serde_json::to_string(&snapshot).expect("serialize snapshot"),
+        )
+        .await
+        .expect("write state file");
+
+        let (loaded_sessions, _hitl) = load_daemon_state(&file).await.expect("load state");
+        let loaded = loaded_sessions
+            .get("a1")
+            .expect("session should exist after load");
+        assert_eq!(loaded.status, "interrupted");
+        assert!(
+            loaded
+                .errors
+                .iter()
+                .any(|e| e.contains("daemon restarted while session was running"))
+        );
+    }
+
+    #[test]
+    fn temp_state_path_adds_tmp_suffix() {
+        let p = std::path::PathBuf::from("/tmp/anna-state.json");
+        assert_eq!(
+            temp_state_path(&p),
+            std::path::PathBuf::from("/tmp/anna-state.json.tmp")
+        );
     }
 }
