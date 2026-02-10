@@ -2,7 +2,7 @@ use anyhow::{Context, Result, bail};
 use humantime::parse_duration;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 fn default_mode() -> String {
@@ -142,14 +142,17 @@ pub struct Workflow {
     pub trigger: TriggerConfig,
     #[serde(default)]
     pub stages: Vec<Stage>,
+    #[serde(skip)]
+    pub source_path: Option<PathBuf>,
 }
 
 impl Workflow {
     pub fn load(path: &Path) -> Result<Self> {
         let raw = std::fs::read_to_string(path)
             .with_context(|| format!("failed to read workflow '{}'", path.display()))?;
-        let wf: Workflow = serde_yaml::from_str(&raw)
+        let mut wf: Workflow = serde_yaml::from_str(&raw)
             .with_context(|| format!("failed to parse yaml '{}'", path.display()))?;
+        wf.source_path = Some(path.to_path_buf());
         wf.validate()?;
         Ok(wf)
     }

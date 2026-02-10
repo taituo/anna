@@ -35,4 +35,8 @@ impl RunResult {
         self.success.insert(stage_id.to_string(), false);
         self.errors.push(format!("{}: {}", stage_id, err));
     }
+
+    pub fn add_child(&mut self, session_id: String) {
+        self.children.push(session_id);
+    }
 }

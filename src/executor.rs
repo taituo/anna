@@ -1,11 +1,12 @@
 use crate::expr::{eval_when, subst};
+use crate::memory::MemoryStore;
 use crate::providers::{ProviderError, ProviderRegistry, default_registry};
 use crate::result::RunResult;
 use crate::session::write_stage_log;
 use crate::workflow::{Stage, Workflow};
 use anyhow::{Result, anyhow};
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tokio::time::sleep;
 
 #[derive(Debug, Clone, Default)]
@@ -16,22 +17,50 @@ pub struct RunConfig {
 #[derive(Clone, Default)]
 pub struct Executor {
     providers: ProviderRegistry,
+    memory: MemoryStore,
 }
 
 impl Executor {
     pub fn new() -> Self {
         Self {
             providers: default_registry(),
+            memory: MemoryStore::default(),
+        }
+    }
+
+    pub fn with_memory_store(memory: MemoryStore) -> Self {
+        Self {
+            providers: default_registry(),
+            memory,
         }
     }
 
     pub async fn run(&self, workflow: &Workflow, config: RunConfig) -> Result<RunResult> {
+        self.run_internal(workflow, config, None).await
+    }
+
+    #[async_recursion::async_recursion]
+    async fn run_internal(
+        &self,
+        workflow: &Workflow,
+        config: RunConfig,
+        parent_id: Option<String>,
+    ) -> Result<RunResult> {
         let mut result = RunResult::new();
+        result.parent_id = parent_id;
         let mut iterations = 0_u32;
 
         loop {
             iterations += 1;
+            if workflow.memory {
+                self.memory
+                    .inject_last_vars(&workflow.name, &mut result.outputs)
+                    .await?;
+            }
             let broken = self.run_once(workflow, &mut result).await?;
+            if workflow.memory {
+                self.memory.save_snapshot(&workflow.name, &result).await?;
+            }
 
             if !workflow.is_continuous() || broken {
                 break;
@@ -55,12 +84,6 @@ impl Executor {
             }
             if !eval_when(stage.when.as_deref(), &result.outputs, &result.success) {
                 continue;
-            }
-            if stage.workflow.is_some() {
-                return Err(anyhow!(
-                    "stage '{}' uses feature not yet implemented in rust mvp (sub-workflow)",
-                    stage.id
-                ));
             }
 
             let broken = self.run_stage(workflow, stage, result).await?;
@@ -131,6 +154,9 @@ impl Executor {
         stage: &Stage,
         result: &mut RunResult,
     ) -> Result<String, ProviderError> {
+        if stage.workflow.is_some() {
+            return self.execute_subworkflow(workflow, stage, result).await;
+        }
         if stage.forks.unwrap_or(0) > 0 {
             return self.execute_forks(workflow, stage, result).await;
         }
@@ -140,6 +166,72 @@ impl Executor {
 
         self.execute_with_retry(workflow, stage, &workflow.vars, &result.outputs)
             .await
+    }
+
+    async fn execute_subworkflow(
+        &self,
+        workflow: &Workflow,
+        stage: &Stage,
+        result: &mut RunResult,
+    ) -> Result<String, ProviderError> {
+        let workflow_ref = stage.workflow.as_deref().ok_or_else(|| {
+            ProviderError::new(
+                "provider_exec_failed",
+                format!("stage '{}' missing workflow path", stage.id),
+            )
+        })?;
+        let rendered = subst(workflow_ref, &workflow.vars, &result.outputs);
+        let resolved_path = resolve_subworkflow_path(workflow, stage, &rendered);
+
+        let mut child_wf = match Workflow::load(&resolved_path) {
+            Ok(v) => v,
+            Err(err) => {
+                return Ok(format!(
+                    "SUBWORKFLOW_ERROR: failed to load '{}': {}",
+                    resolved_path.display(),
+                    err
+                ));
+            }
+        };
+
+        let mut child_vars = workflow.vars.clone();
+        child_vars.extend(child_wf.vars.clone());
+        for (k, v) in &stage.vars {
+            child_vars.insert(k.clone(), subst(v, &workflow.vars, &result.outputs));
+        }
+        child_wf.vars = child_vars;
+        if child_wf.workdir.is_none() {
+            child_wf.workdir = stage.workdir.clone().or_else(|| workflow.workdir.clone());
+        }
+
+        match self
+            .run_internal(
+                &child_wf,
+                RunConfig {
+                    max_iterations: Some(1),
+                },
+                Some(result.session_id.clone()),
+            )
+            .await
+        {
+            Ok(child_result) => {
+                result.add_child(child_result.session_id.clone());
+                let mut output = String::new();
+                if let Some(last_stage) = child_wf.stages.last()
+                    && let Some(v) = child_result.outputs.get(&last_stage.id)
+                {
+                    output = v.clone();
+                }
+                if output.is_empty() {
+                    output = format!("sub-workflow completed: {}", child_wf.name);
+                }
+                Ok(output)
+            }
+            Err(err) => Ok(format!(
+                "SUBWORKFLOW_ERROR: workflow '{}' failed: {}",
+                child_wf.name, err
+            )),
+        }
     }
 
     async fn execute_forks(
@@ -414,9 +506,30 @@ fn split_each_items(raw: &str) -> Vec<String> {
     }
 }
 
+fn resolve_subworkflow_path(workflow: &Workflow, stage: &Stage, target: &str) -> PathBuf {
+    let target_path = PathBuf::from(target);
+    if target_path.is_absolute() {
+        return target_path;
+    }
+
+    if let Some(stage_wd) = &stage.workdir {
+        return Path::new(stage_wd).join(target_path);
+    }
+    if let Some(wf_wd) = &workflow.workdir {
+        return Path::new(wf_wd).join(target_path);
+    }
+    if let Some(source) = &workflow.source_path
+        && let Some(parent) = source.parent()
+    {
+        return parent.join(target_path);
+    }
+    target_path
+}
+
 #[cfg(test)]
 mod tests {
     use super::{Executor, RunConfig};
+    use crate::memory::MemoryStore;
     use crate::workflow::{Stage, Workflow};
 
     #[tokio::test]
@@ -437,6 +550,7 @@ mod tests {
                 forks: Some(2),
                 ..Default::default()
             }],
+            source_path: None,
         };
 
         let res = Executor::new()
@@ -482,6 +596,7 @@ mod tests {
                     ..Default::default()
                 },
             ],
+            source_path: None,
         };
 
         let res = Executor::new()
@@ -499,5 +614,127 @@ mod tests {
         assert!(res.outputs.contains_key("process.0"));
         assert!(res.outputs.contains_key("process.1"));
         assert!(res.outputs.contains_key("process.all"));
+    }
+
+    #[tokio::test]
+    async fn subworkflow_uses_last_stage_output() {
+        let base = std::env::temp_dir().join(format!(
+            "anna-subwf-{}-{}",
+            std::process::id(),
+            rand::random::<u32>()
+        ));
+        tokio::fs::create_dir_all(&base)
+            .await
+            .expect("create temp dir");
+        let parent_path = base.join("parent.anna");
+        let child_path = base.join("child.anna");
+
+        tokio::fs::write(
+            &child_path,
+            "name: child\nstages:\n  - id: done\n    provider: shell\n    exec: \"echo child-ok\"\n",
+        )
+        .await
+        .expect("write child workflow");
+        tokio::fs::write(&parent_path, "name: parent\nstages: []\n")
+            .await
+            .expect("write parent placeholder");
+
+        let wf = Workflow {
+            name: "parent".into(),
+            mode: "once".into(),
+            memory: false,
+            tags: vec![],
+            vars: Default::default(),
+            env: Default::default(),
+            workdir: Some(base.display().to_string()),
+            trigger: Default::default(),
+            stages: vec![Stage {
+                id: "call".into(),
+                workflow: Some("child.anna".into()),
+                ..Default::default()
+            }],
+            source_path: Some(parent_path),
+        };
+
+        let res = Executor::new()
+            .run(
+                &wf,
+                RunConfig {
+                    max_iterations: Some(1),
+                },
+            )
+            .await
+            .expect("workflow should run");
+
+        assert_eq!(res.success.get("call"), Some(&true));
+        assert_eq!(res.outputs.get("call"), Some(&"child-ok".to_string()));
+        assert_eq!(res.children.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn memory_injects_previous_stage_output() {
+        let mem_root = std::env::temp_dir().join(format!(
+            "anna-mem-int-{}-{}",
+            std::process::id(),
+            rand::random::<u32>()
+        ));
+        let exec = Executor::with_memory_store(MemoryStore::new(mem_root, 10));
+
+        let wf1 = Workflow {
+            name: "memory-wf".into(),
+            mode: "once".into(),
+            memory: true,
+            tags: vec![],
+            vars: Default::default(),
+            env: Default::default(),
+            workdir: None,
+            trigger: Default::default(),
+            stages: vec![Stage {
+                id: "save".into(),
+                provider: "shell".into(),
+                exec: Some("echo first".into()),
+                ..Default::default()
+            }],
+            source_path: None,
+        };
+        let _ = exec
+            .run(
+                &wf1,
+                RunConfig {
+                    max_iterations: Some(1),
+                },
+            )
+            .await
+            .expect("first run should succeed");
+
+        let wf2 = Workflow {
+            name: "memory-wf".into(),
+            mode: "once".into(),
+            memory: true,
+            tags: vec![],
+            vars: Default::default(),
+            env: Default::default(),
+            workdir: None,
+            trigger: Default::default(),
+            stages: vec![Stage {
+                id: "use_mem".into(),
+                provider: "shell".into(),
+                exec: Some("echo prev:$memory.save".into()),
+                ..Default::default()
+            }],
+            source_path: None,
+        };
+        let res = exec
+            .run(
+                &wf2,
+                RunConfig {
+                    max_iterations: Some(1),
+                },
+            )
+            .await
+            .expect("second run should succeed");
+
+        assert_eq!(res.success.get("use_mem"), Some(&true));
+        assert_eq!(res.outputs.get("use_mem"), Some(&"prev:first".to_string()));
     }
 }

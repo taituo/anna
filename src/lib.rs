@@ -1,6 +1,7 @@
 pub mod daemon;
 pub mod executor;
 pub mod expr;
+pub mod memory;
 pub mod providers;
 pub mod result;
 pub mod session;

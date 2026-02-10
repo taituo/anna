@@ -1,4 +1,5 @@
 use crate::executor::{Executor, RunConfig};
+use crate::session::session_dir;
 use crate::workflow::Workflow;
 use anyhow::Result;
 use axum::extract::{Path, State};
@@ -28,6 +29,8 @@ struct SessionInfo {
     workflow: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     runtime_session_id: Option<String>,
+    #[serde(skip_serializing_if = "HashMap::is_empty", default)]
+    outputs: HashMap<String, String>,
     errors: Vec<String>,
 }
 
@@ -55,6 +58,7 @@ pub async fn run_daemon(bind: &str, plays_dir: PathBuf) -> Result<()> {
         .route("/workflows", get(list_workflows))
         .route("/workflow", post(start_workflow))
         .route("/workflow/{id}", get(workflow_status).delete(stop_workflow))
+        .route("/workflow/{id}/logs", get(workflow_logs))
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(bind).await?;
@@ -109,6 +113,7 @@ async fn start_workflow(State(state): State<AppState>, body: String) -> impl Int
             status: "running".to_string(),
             workflow: workflow.name.clone(),
             runtime_session_id: None,
+            outputs: HashMap::new(),
             errors: Vec::new(),
         },
     );
@@ -132,6 +137,7 @@ async fn start_workflow(State(state): State<AppState>, body: String) -> impl Int
                 Ok(result) => {
                     info.status = "done".to_string();
                     info.runtime_session_id = Some(result.session_id);
+                    info.outputs = result.outputs;
                     info.errors = result.errors;
                 }
                 Err(err) => {
@@ -189,6 +195,26 @@ async fn stop_workflow(State(state): State<AppState>, Path(id): Path<String>) ->
     (StatusCode::NOT_FOUND, "session not found").into_response()
 }
 
+async fn workflow_logs(State(state): State<AppState>, Path(id): Path<String>) -> impl IntoResponse {
+    let sessions = state.sessions.read().await;
+    let Some(info) = sessions.get(&id) else {
+        return (StatusCode::NOT_FOUND, "session not found").into_response();
+    };
+    let Some(runtime_id) = info.runtime_session_id.clone() else {
+        return (StatusCode::CONFLICT, "runtime session not available yet").into_response();
+    };
+    drop(sessions);
+
+    match read_session_logs(&runtime_id).await {
+        Ok(logs) => (StatusCode::OK, Json(logs)).into_response(),
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("failed to read logs: {}", err),
+        )
+            .into_response(),
+    }
+}
+
 async fn find_workflows(root: &FsPath) -> Result<Vec<String>> {
     let mut out = Vec::new();
     let mut dir = tokio::fs::read_dir(root).await?;
@@ -206,5 +232,29 @@ async fn find_workflows(root: &FsPath) -> Result<Vec<String>> {
         }
     }
     out.sort();
+    Ok(out)
+}
+
+async fn read_session_logs(runtime_session_id: &str) -> Result<HashMap<String, String>> {
+    let mut out = HashMap::new();
+    let dir_path = session_dir(runtime_session_id);
+    let mut dir = tokio::fs::read_dir(&dir_path).await?;
+    while let Some(entry) = dir.next_entry().await? {
+        let path = entry.path();
+        if path.is_file()
+            && path
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(|e| e == "log")
+                .unwrap_or(false)
+            && let Some(stage_id) = path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .map(|s| s.to_string())
+        {
+            let content = tokio::fs::read_to_string(&path).await.unwrap_or_default();
+            out.insert(stage_id, content);
+        }
+    }
     Ok(out)
 }
