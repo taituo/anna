@@ -28,6 +28,7 @@ struct AppState {
     executor: Executor,
     plays_dir: PathBuf,
     registry_file: Option<PathBuf>,
+    node_capabilities: HashSet<String>,
     sessions: Arc<RwLock<HashMap<String, SessionInfo>>>,
     handles: Arc<RwLock<HashMap<String, JoinHandle<()>>>>,
     hitl: Arc<RwLock<HashMap<String, HitlPending>>>,
@@ -77,12 +78,19 @@ struct HookTriggerResponse {
     hook: String,
     launched: Vec<HookLaunchedWorkflow>,
     skipped_running: Vec<String>,
+    skipped_capability: Vec<HookSkippedCapability>,
 }
 
 #[derive(Debug, Serialize)]
 struct HookLaunchedWorkflow {
     workflow: String,
     session_id: String,
+}
+
+#[derive(Debug, Serialize)]
+struct HookSkippedCapability {
+    workflow: String,
+    missing_capabilities: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -227,6 +235,7 @@ pub async fn run_daemon(bind: &str, plays_dir: PathBuf) -> Result<()> {
     let state_file = daemon_state_file();
     let registry_file = flow_registry_file();
     let retention = daemon_retention_config();
+    let node_capabilities = daemon_node_capabilities();
     let (sessions_seed, hitl_seed) = match state_file.as_ref() {
         Some(path) => load_daemon_state(path).await?,
         None => (HashMap::new(), HashMap::new()),
@@ -241,6 +250,7 @@ pub async fn run_daemon(bind: &str, plays_dir: PathBuf) -> Result<()> {
         executor,
         plays_dir,
         registry_file: registry_file.clone(),
+        node_capabilities: node_capabilities.clone(),
         sessions: Arc::new(RwLock::new(sessions_seed)),
         handles: Arc::new(RwLock::new(HashMap::new())),
         hitl: hitl.clone(),
@@ -257,6 +267,11 @@ pub async fn run_daemon(bind: &str, plays_dir: PathBuf) -> Result<()> {
     }
     if let Some(path) = registry_file {
         println!("anna-rs flow registry enabled at {}", path.display());
+    }
+    if !node_capabilities.is_empty() {
+        let mut capabilities = node_capabilities.iter().cloned().collect::<Vec<_>>();
+        capabilities.sort();
+        println!("anna-rs node capabilities: {}", capabilities.join(","));
     }
 
     let app = Router::new()
@@ -414,7 +429,7 @@ async fn run_registered_workflow(
     if let Some(resp) = ensure_authorized(&state, &headers) {
         return resp;
     }
-    let path = match resolve_registered_workflow_path_with_registry(
+    let entry = match resolve_registered_workflow_entry_with_registry(
         &state.plays_dir,
         state.registry_file.as_deref(),
         &name,
@@ -431,13 +446,25 @@ async fn run_registered_workflow(
                 .into_response();
         }
     };
+    let missing_capabilities = missing_required_capabilities(&entry, &state.node_capabilities);
+    if !missing_capabilities.is_empty() {
+        return (
+            StatusCode::FORBIDDEN,
+            format!(
+                "workflow '{}' requires missing capabilities: {}",
+                name,
+                missing_capabilities.join(", ")
+            ),
+        )
+            .into_response();
+    }
 
-    let mut workflow = match Workflow::load(&path) {
+    let mut workflow = match Workflow::load(&entry.path) {
         Ok(v) => v,
         Err(err) => {
             return (
                 StatusCode::BAD_REQUEST,
-                format!("invalid workflow '{}': {}", path.display(), err),
+                format!("invalid workflow '{}': {}", entry.path.display(), err),
             )
                 .into_response();
         }
@@ -541,22 +568,33 @@ async fn trigger_hook(
 
     let mut launched = Vec::new();
     let mut skipped_running = Vec::new();
+    let mut skipped_capability = Vec::new();
     for entry in entries {
         if let Some(webhook) = entry.trigger_webhook.as_deref()
             && webhook.trim() == hook_path
         {
             match launch_workflow_from_entry(&state, &entry, "webhook").await {
-                Ok(Some(session_id)) => launched.push(HookLaunchedWorkflow {
-                    workflow: entry.workflow_name,
-                    session_id,
-                }),
-                Ok(None) => skipped_running.push(entry.workflow_name),
+                Ok(TriggerLaunchOutcome::Launched(session_id)) => {
+                    launched.push(HookLaunchedWorkflow {
+                        workflow: entry.workflow_name,
+                        session_id,
+                    })
+                }
+                Ok(TriggerLaunchOutcome::SkippedRunning) => {
+                    skipped_running.push(entry.workflow_name)
+                }
+                Ok(TriggerLaunchOutcome::SkippedCapability(missing_capabilities)) => {
+                    skipped_capability.push(HookSkippedCapability {
+                        workflow: entry.workflow_name,
+                        missing_capabilities,
+                    });
+                }
                 Err(_) => {}
             }
         }
     }
 
-    if launched.is_empty() && skipped_running.is_empty() {
+    if launched.is_empty() && skipped_running.is_empty() && skipped_capability.is_empty() {
         return (StatusCode::NOT_FOUND, "no workflows for hook").into_response();
     }
     (
@@ -565,6 +603,7 @@ async fn trigger_hook(
             hook: hook_path,
             launched,
             skipped_running,
+            skipped_capability,
         }),
     )
         .into_response()
@@ -730,12 +769,23 @@ async fn run_interval_triggers(
             .entry(key)
             .or_insert_with(|| now + interval);
         if now >= *next {
-            if let Err(err) = launch_workflow_from_entry(state, entry, "interval").await {
-                eprintln!(
-                    "anna-rs scheduler: failed launching interval trigger for '{}': {}",
-                    entry.path.display(),
-                    err
-                );
+            match launch_workflow_from_entry(state, entry, "interval").await {
+                Ok(TriggerLaunchOutcome::Launched(_))
+                | Ok(TriggerLaunchOutcome::SkippedRunning) => {}
+                Ok(TriggerLaunchOutcome::SkippedCapability(missing)) => {
+                    eprintln!(
+                        "anna-rs scheduler: skipped interval trigger '{}' due to missing capabilities: {}",
+                        entry.workflow_name,
+                        missing.join(", ")
+                    );
+                }
+                Err(err) => {
+                    eprintln!(
+                        "anna-rs scheduler: failed launching interval trigger for '{}': {}",
+                        entry.path.display(),
+                        err
+                    );
+                }
             }
             *next = Instant::now() + interval;
         }
@@ -783,12 +833,23 @@ async fn run_cron_triggers(
         });
 
         if *next <= now {
-            if let Err(err) = launch_workflow_from_entry(state, entry, "cron").await {
-                eprintln!(
-                    "anna-rs scheduler: failed launching cron trigger for '{}': {}",
-                    entry.path.display(),
-                    err
-                );
+            match launch_workflow_from_entry(state, entry, "cron").await {
+                Ok(TriggerLaunchOutcome::Launched(_))
+                | Ok(TriggerLaunchOutcome::SkippedRunning) => {}
+                Ok(TriggerLaunchOutcome::SkippedCapability(missing)) => {
+                    eprintln!(
+                        "anna-rs scheduler: skipped cron trigger '{}' due to missing capabilities: {}",
+                        entry.workflow_name,
+                        missing.join(", ")
+                    );
+                }
+                Err(err) => {
+                    eprintln!(
+                        "anna-rs scheduler: failed launching cron trigger for '{}': {}",
+                        entry.path.display(),
+                        err
+                    );
+                }
             }
             *next = schedule
                 .after(&now)
@@ -842,12 +903,25 @@ async fn run_watch_triggers(
         };
         scheduler.watch_snapshots.insert(key, snapshot);
 
-        if changed && let Err(err) = launch_workflow_from_entry(state, entry, "watch").await {
-            eprintln!(
-                "anna-rs scheduler: failed launching watch trigger for '{}': {}",
-                entry.path.display(),
-                err
-            );
+        if changed {
+            match launch_workflow_from_entry(state, entry, "watch").await {
+                Ok(TriggerLaunchOutcome::Launched(_))
+                | Ok(TriggerLaunchOutcome::SkippedRunning) => {}
+                Ok(TriggerLaunchOutcome::SkippedCapability(missing)) => {
+                    eprintln!(
+                        "anna-rs scheduler: skipped watch trigger '{}' due to missing capabilities: {}",
+                        entry.workflow_name,
+                        missing.join(", ")
+                    );
+                }
+                Err(err) => {
+                    eprintln!(
+                        "anna-rs scheduler: failed launching watch trigger for '{}': {}",
+                        entry.path.display(),
+                        err
+                    );
+                }
+            }
         }
     }
 
@@ -891,6 +965,30 @@ fn resolve_watch_pattern(base_dir: &FsPath, raw_pattern: &str) -> String {
         .join(trimmed)
         .to_string_lossy()
         .into_owned()
+}
+
+fn missing_required_capabilities(
+    entry: &WorkflowEntry,
+    node_capabilities: &HashSet<String>,
+) -> Vec<String> {
+    if entry.required_capabilities.is_empty() {
+        return Vec::new();
+    }
+    if node_capabilities.contains("*") || node_capabilities.contains("all") {
+        return Vec::new();
+    }
+
+    let mut missing = entry
+        .required_capabilities
+        .iter()
+        .map(|v| v.trim())
+        .filter(|v| !v.is_empty())
+        .filter(|required| !node_capabilities.contains(&required.to_ascii_lowercase()))
+        .map(ToOwned::to_owned)
+        .collect::<Vec<_>>();
+    missing.sort();
+    missing.dedup();
+    missing
 }
 
 fn collect_watch_snapshot(pattern: &str) -> Result<HashMap<String, u64>> {
@@ -940,6 +1038,16 @@ fn daemon_auth_token() -> Option<String> {
         .ok()
         .map(|v| v.trim().to_string())
         .filter(|v| !v.is_empty())
+}
+
+fn daemon_node_capabilities() -> HashSet<String> {
+    let Ok(raw) = std::env::var("ANNA_NODE_CAPABILITIES") else {
+        return HashSet::new();
+    };
+    raw.split([',', ';', '\n', '\t', ' '])
+        .map(|v| v.trim().to_ascii_lowercase())
+        .filter(|v| !v.is_empty())
+        .collect::<HashSet<_>>()
 }
 
 fn daemon_retention_config() -> RetentionConfig {
@@ -1258,11 +1366,18 @@ struct WorkflowEntry {
     flow_id: Option<String>,
     workflow_name: String,
     path: PathBuf,
+    required_capabilities: Vec<String>,
     trigger_webhook: Option<String>,
     trigger_watch: Option<String>,
     trigger_cron: Option<String>,
     trigger_interval: Option<String>,
     workflow_workdir: Option<String>,
+}
+
+enum TriggerLaunchOutcome {
+    Launched(String),
+    SkippedRunning,
+    SkippedCapability(Vec<String>),
 }
 
 async fn load_flow_registry(path: &FsPath) -> Result<Vec<FlowRegistryEntry>> {
@@ -1341,17 +1456,13 @@ async fn find_workflow_entries_with_registry(
                 .ok_or_else(|| {
                     anyhow::anyhow!("invalid workflow filename in '{}'", path.display())
                 })?;
-            let _ = (
-                &spec.tags,
-                &spec.required_capabilities,
-                &spec.owner,
-                &spec.version,
-            );
+            let _ = (&spec.tags, &spec.owner, &spec.version);
             out.push(WorkflowEntry {
                 file_name,
                 flow_id: Some(spec.flow_id),
                 workflow_name: wf.name,
                 path,
+                required_capabilities: spec.required_capabilities,
                 trigger_webhook: wf.trigger.webhook,
                 trigger_watch: wf.trigger.watch,
                 trigger_cron: wf.trigger.cron,
@@ -1394,6 +1505,7 @@ async fn find_workflow_entries_with_registry(
             flow_id: None,
             workflow_name: wf.name,
             path,
+            required_capabilities: vec![],
             trigger_webhook: wf.trigger.webhook,
             trigger_watch: wf.trigger.watch,
             trigger_cron: wf.trigger.cron,
@@ -1404,11 +1516,11 @@ async fn find_workflow_entries_with_registry(
     Ok(out)
 }
 
-async fn resolve_registered_workflow_path_with_registry(
+async fn resolve_registered_workflow_entry_with_registry(
     root: &FsPath,
     registry_file: Option<&FsPath>,
     name: &str,
-) -> Result<Option<PathBuf>> {
+) -> Result<Option<WorkflowEntry>> {
     let normalized = name.trim();
     let entries = find_workflow_entries_with_registry(root, registry_file).await?;
     for entry in &entries {
@@ -1416,7 +1528,7 @@ async fn resolve_registered_workflow_path_with_registry(
             || entry.workflow_name == normalized
             || entry.flow_id.as_deref() == Some(normalized)
         {
-            return Ok(Some(entry.path.clone()));
+            return Ok(Some(entry.clone()));
         }
     }
 
@@ -1424,7 +1536,7 @@ async fn resolve_registered_workflow_path_with_registry(
         let candidate = format!("{}.anna", normalized);
         for entry in &entries {
             if entry.file_name == candidate {
-                return Ok(Some(entry.path.clone()));
+                return Ok(Some(entry.clone()));
             }
         }
     }
@@ -1435,13 +1547,26 @@ async fn launch_workflow_from_entry(
     state: &AppState,
     entry: &WorkflowEntry,
     trigger_source: &str,
-) -> Result<Option<String>> {
+) -> Result<TriggerLaunchOutcome> {
+    let missing_capabilities = missing_required_capabilities(entry, &state.node_capabilities);
+    if !missing_capabilities.is_empty() {
+        println!(
+            "anna-rs daemon trigger={} workflow='{}' skipped: missing capabilities [{}]",
+            trigger_source,
+            entry.workflow_name,
+            missing_capabilities.join(", ")
+        );
+        return Ok(TriggerLaunchOutcome::SkippedCapability(
+            missing_capabilities,
+        ));
+    }
+
     if is_workflow_running(state, &entry.workflow_name).await {
         println!(
             "anna-rs daemon trigger={} workflow='{}' skipped: already running",
             trigger_source, entry.workflow_name
         );
-        return Ok(None);
+        return Ok(TriggerLaunchOutcome::SkippedRunning);
     }
 
     let mut wf = Workflow::load(&entry.path)?;
@@ -1453,7 +1578,7 @@ async fn launch_workflow_from_entry(
         "anna-rs daemon trigger={} workflow='{}' request_id={}",
         trigger_source, entry.workflow_name, req_id
     );
-    Ok(Some(req_id))
+    Ok(TriggerLaunchOutcome::Launched(req_id))
 }
 
 async fn is_workflow_running(state: &AppState, workflow_name: &str) -> bool {
@@ -1533,11 +1658,11 @@ async fn launch_workflow(state: &AppState, workflow: Workflow) -> Result<String>
 #[cfg(test)]
 mod tests {
     use super::{
-        DaemonHitl, DaemonStateSnapshot, HitlPending, SessionInfo, collect_watch_snapshot,
-        find_workflow_entries_with_registry, is_authorized, load_daemon_state, load_flow_registry,
-        prune_hitl_in_place, prune_sessions_in_place,
-        resolve_registered_workflow_path_with_registry, resolve_watch_pattern, status_matches,
-        temp_state_path,
+        DaemonHitl, DaemonStateSnapshot, HitlPending, SessionInfo, WorkflowEntry,
+        collect_watch_snapshot, find_workflow_entries_with_registry, is_authorized,
+        load_daemon_state, load_flow_registry, missing_required_capabilities, prune_hitl_in_place,
+        prune_sessions_in_place, resolve_registered_workflow_entry_with_registry,
+        resolve_watch_pattern, status_matches, temp_state_path,
     };
     use crate::executor::{HitlHandler, HitlRequest};
     use axum::http::{HeaderMap, HeaderValue};
@@ -1564,19 +1689,22 @@ mod tests {
         .await
         .expect("write workflow");
 
-        let by_file = resolve_registered_workflow_path_with_registry(&dir, None, "demo.anna")
+        let by_file = resolve_registered_workflow_entry_with_registry(&dir, None, "demo.anna")
             .await
-            .expect("resolve by file");
+            .expect("resolve by file")
+            .map(|v| v.path);
         assert_eq!(by_file.as_deref(), Some(file.as_path()));
 
-        let by_name = resolve_registered_workflow_path_with_registry(&dir, None, "demo-workflow")
+        let by_name = resolve_registered_workflow_entry_with_registry(&dir, None, "demo-workflow")
             .await
-            .expect("resolve by workflow name");
+            .expect("resolve by workflow name")
+            .map(|v| v.path);
         assert_eq!(by_name.as_deref(), Some(file.as_path()));
 
-        let by_stem = resolve_registered_workflow_path_with_registry(&dir, None, "demo")
+        let by_stem = resolve_registered_workflow_entry_with_registry(&dir, None, "demo")
             .await
-            .expect("resolve by stem");
+            .expect("resolve by stem")
+            .map(|v| v.path);
         assert_eq!(by_stem.as_deref(), Some(file.as_path()));
     }
 
@@ -1658,10 +1786,43 @@ mod tests {
         assert_eq!(entries[0].flow_id.as_deref(), Some("prod-deploy"));
 
         let by_flow_id =
-            resolve_registered_workflow_path_with_registry(&dir, Some(&registry), "prod-deploy")
+            resolve_registered_workflow_entry_with_registry(&dir, Some(&registry), "prod-deploy")
                 .await
-                .expect("resolve by flow_id");
+                .expect("resolve by flow_id")
+                .map(|v| v.path);
         assert_eq!(by_flow_id.as_deref(), Some(included.as_path()));
+    }
+
+    #[test]
+    fn missing_capability_filter_works_with_wildcard_and_case() {
+        let entry = WorkflowEntry {
+            file_name: "x.anna".to_string(),
+            flow_id: Some("x".to_string()),
+            workflow_name: "x".to_string(),
+            path: std::path::PathBuf::from("/tmp/x.anna"),
+            required_capabilities: vec!["K8S".to_string(), "vault".to_string()],
+            trigger_webhook: None,
+            trigger_watch: None,
+            trigger_cron: None,
+            trigger_interval: None,
+            workflow_workdir: None,
+        };
+
+        let node = std::collections::HashSet::from([
+            "k8s".to_string(),
+            "http".to_string(),
+            "VaUlT".to_ascii_lowercase(),
+        ]);
+        let missing = missing_required_capabilities(&entry, &node);
+        assert!(missing.is_empty());
+
+        let restricted = std::collections::HashSet::from(["k8s".to_string()]);
+        let missing = missing_required_capabilities(&entry, &restricted);
+        assert_eq!(missing, vec!["vault".to_string()]);
+
+        let wildcard = std::collections::HashSet::from(["*".to_string()]);
+        let missing = missing_required_capabilities(&entry, &wildcard);
+        assert!(missing.is_empty());
     }
 
     #[tokio::test]

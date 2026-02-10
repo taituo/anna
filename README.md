@@ -82,6 +82,12 @@ Optional flow registry (restrict daemon-discoverable flows to approved list):
 ANNA_FLOW_REGISTRY_FILE=./flows.registry.yml anna daemon --plays-dir .
 ```
 
+Optional node capability ceiling (used against `required_capabilities`):
+
+```bash
+ANNA_NODE_CAPABILITIES="shell,http,k8s,vault" anna daemon --plays-dir .
+```
+
 Registry format:
 
 ```yaml
@@ -98,6 +104,7 @@ When registry is enabled:
 - `anna workflows` lists `flow_id` values
 - `anna run-named <name>` accepts `flow_id`, workflow name, or file name
 - hook/cron/watch/interval trigger scans are limited to registry entries
+- flows with missing `required_capabilities` are skipped/blocked with explicit reason
 
 ## Rust Runtime (MVP)
 
