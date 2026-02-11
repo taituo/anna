@@ -467,6 +467,9 @@ ANNA_AUDIT_LOG_FILE=/var/log/anna/audit.ndjson anna daemon
 
 # strict offline mode (deterministic provider ceiling: shell,cli,vault)
 ANNA_OFFLINE_MODE=true anna daemon
+
+# optional effective-policy snapshot persistence (JSON)
+ANNA_POLICY_SNAPSHOT_FILE=/var/lib/anna/policy.snapshot.json anna daemon
 ```
 
 When both are set, `ANNA_CHAT_INTENTS` overrides matching keys from `ANNA_CHAT_INTENTS_FILE`.

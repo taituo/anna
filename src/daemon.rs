@@ -545,6 +545,7 @@ impl HitlHandler for DaemonHitl {
 
 pub async fn run_daemon(bind: &str, plays_dir: PathBuf) -> Result<()> {
     let state_file = daemon_state_file();
+    let policy_snapshot_file = daemon_policy_snapshot_file();
     let registry_file = flow_registry_file();
     let node_id = daemon_node_id();
     let trigger_lease = trigger_lease_config(&node_id);
@@ -596,6 +597,13 @@ pub async fn run_daemon(bind: &str, plays_dir: PathBuf) -> Result<()> {
             path.display()
         );
         tokio::spawn(state_persist_loop(state.clone(), path));
+    }
+    if let Some(path) = policy_snapshot_file {
+        println!(
+            "anna-rs policy snapshot persistence enabled at {}",
+            path.display()
+        );
+        tokio::spawn(policy_snapshot_persist_loop(state.clone(), path));
     }
     if let Some(path) = registry_file {
         println!("anna-rs flow registry enabled at {}", path.display());
@@ -2934,6 +2942,20 @@ fn daemon_state_file() -> Option<PathBuf> {
         .map(|home| PathBuf::from(home).join(".anna/daemon-state.json"))
 }
 
+fn daemon_policy_snapshot_file() -> Option<PathBuf> {
+    let Ok(raw) = std::env::var("ANNA_POLICY_SNAPSHOT_FILE") else {
+        return None;
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty()
+        || trimmed.eq_ignore_ascii_case("off")
+        || trimmed.eq_ignore_ascii_case("false")
+    {
+        return None;
+    }
+    Some(PathBuf::from(trimmed))
+}
+
 async fn load_daemon_state(
     path: &FsPath,
 ) -> Result<(HashMap<String, SessionInfo>, HashMap<String, HitlPending>)> {
@@ -3037,6 +3059,97 @@ async fn persist_daemon_state(state: &AppState, path: &FsPath) -> Result<()> {
     tokio::fs::rename(&tmp, path).await.with_context(|| {
         format!(
             "failed moving daemon state file '{}' -> '{}'",
+            tmp.display(),
+            path.display()
+        )
+    })?;
+    Ok(())
+}
+
+async fn policy_snapshot_persist_loop(state: AppState, path: PathBuf) {
+    loop {
+        if let Err(err) = persist_policy_snapshot(&state, &path).await {
+            eprintln!("anna-rs daemon: failed persisting policy snapshot: {}", err);
+        }
+        sleep(Duration::from_secs(2)).await;
+    }
+}
+
+async fn persist_policy_snapshot(state: &AppState, path: &FsPath) -> Result<()> {
+    let trigger = state.trigger_leader_state.read().await.clone();
+    let chat_intents = state.chat_intents.read().await.clone();
+
+    let mut owner_limits = state
+        .owner_policy
+        .per_owner
+        .iter()
+        .map(|(owner, max_concurrency)| {
+            json!({
+                "owner": owner,
+                "max_concurrency": max_concurrency,
+            })
+        })
+        .collect::<Vec<_>>();
+    owner_limits.sort_by(|a, b| {
+        a.get("owner")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .cmp(b.get("owner").and_then(|v| v.as_str()).unwrap_or(""))
+    });
+
+    let mut chat_routes = chat_intents.into_iter().collect::<Vec<_>>();
+    chat_routes.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut chat_map = serde_json::Map::new();
+    for (intent, rule) in chat_routes {
+        chat_map.insert(
+            intent,
+            json!({
+                "workflow": rule.workflow,
+                "allowed_callers": rule.allowed_callers,
+                "allowed_owners": rule.allowed_owners,
+                "required_tags": rule.required_tags,
+                "max_iterations_cap": rule.max_iterations_cap,
+            }),
+        );
+    }
+
+    let snapshot = json!({
+        "saved_at": now_unix_secs(),
+        "registry_enabled": state.registry_file.is_some(),
+        "auth_enabled": state.auth_token.is_some(),
+        "offline_mode": state.offline_mode,
+        "node_capabilities": sorted_set_values(Some(&state.node_capabilities)),
+        "allowed_providers": sorted_set_values(state.allowed_providers.as_ref()),
+        "owner_limits": owner_limits,
+        "owner_default_limit": state.owner_policy.default_limit,
+        "chat_intents": chat_map,
+        "trigger_scheduler": {
+            "enabled": trigger.enabled,
+            "is_leader": trigger.is_leader,
+            "node_id": trigger.node_id,
+            "holder": trigger.holder,
+            "expires_at": trigger.expires_at,
+            "lease_file": trigger.lease_file,
+        },
+    });
+    let raw = serde_json::to_string_pretty(&snapshot).context("serialize policy snapshot json")?;
+
+    if let Some(parent) = path.parent() {
+        tokio::fs::create_dir_all(parent).await.with_context(|| {
+            format!(
+                "failed creating policy snapshot directory '{}'",
+                parent.display()
+            )
+        })?;
+    }
+
+    let tmp = temp_state_path(path);
+    tokio::fs::write(&tmp, raw)
+        .await
+        .with_context(|| format!("failed writing policy snapshot temp '{}'", tmp.display()))?;
+    tokio::fs::rename(&tmp, path).await.with_context(|| {
+        format!(
+            "failed moving policy snapshot '{}' -> '{}'",
             tmp.display(),
             path.display()
         )
@@ -3911,14 +4024,14 @@ mod tests {
         find_workflow_entries_with_registry, is_authorized, load_daemon_state, load_flow_registry,
         matches_workflow_meta_filters, missing_required_capabilities, parse_chat_intents_doc,
         parse_chat_intents_value, parse_chat_run_request, parse_run_registered_options,
-        prune_hitl_in_place, prune_sessions_in_place,
+        persist_policy_snapshot, prune_hitl_in_place, prune_sessions_in_place,
         resolve_registered_workflow_entry_with_registry, resolve_trigger_leadership,
         resolve_watch_pattern, status_matches, temp_state_path,
     };
-    use crate::executor::{HitlHandler, HitlRequest};
+    use crate::executor::{Executor, HitlHandler, HitlRequest};
     use crate::workflow::{Stage, Workflow};
     use axum::http::{HeaderMap, HeaderValue};
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
     use std::sync::Arc;
     use std::time::Duration;
     use tokio::sync::RwLock;
@@ -4918,6 +5031,85 @@ mod tests {
         assert!(hitl.contains_key("pending"));
         assert!(hitl.contains_key("resolved-new"));
         assert!(!hitl.contains_key("resolved-old"));
+    }
+
+    #[tokio::test]
+    async fn persist_policy_snapshot_writes_effective_policy() {
+        let dir = std::env::temp_dir().join(format!(
+            "anna-policy-snapshot-{}-{}",
+            std::process::id(),
+            rand::random::<u32>()
+        ));
+        tokio::fs::create_dir_all(&dir)
+            .await
+            .expect("create temp policy dir");
+        let path = dir.join("policy.snapshot.json");
+        let state = super::AppState {
+            executor: Executor::new(),
+            plays_dir: dir.clone(),
+            registry_file: Some(dir.join("flows.registry.yml")),
+            chat_intents: Arc::new(RwLock::new(HashMap::from([(
+                "deploy".to_string(),
+                ChatIntentConfig {
+                    workflow: "prod-deploy".to_string(),
+                    allowed_callers: vec!["ops-bot".to_string()],
+                    allowed_owners: vec!["platform".to_string()],
+                    required_tags: vec!["prod".to_string()],
+                    max_iterations_cap: Some(2),
+                },
+            )]))),
+            trigger_lease: None,
+            trigger_leader_state: Arc::new(RwLock::new(super::TriggerLeaderState {
+                enabled: true,
+                is_leader: true,
+                node_id: "node-a".to_string(),
+                holder: Some("node-a".to_string()),
+                expires_at: Some(123),
+                lease_file: Some("/tmp/lease.json".to_string()),
+            })),
+            audit_log: None,
+            offline_mode: true,
+            node_capabilities: HashSet::from(["shell".to_string(), "vault".to_string()]),
+            allowed_providers: Some(HashSet::from(["shell".to_string(), "vault".to_string()])),
+            owner_policy: super::OwnerConcurrencyPolicy {
+                per_owner: HashMap::from([("platform".to_string(), 3usize)]),
+                default_limit: Some(1),
+            },
+            sessions: Arc::new(RwLock::new(HashMap::new())),
+            handles: Arc::new(RwLock::new(HashMap::new())),
+            hitl: Arc::new(RwLock::new(HashMap::new())),
+            auth_token: Some("secret-token".to_string()),
+            retention: super::RetentionConfig {
+                max_sessions: 100,
+                max_hitl: 100,
+            },
+        };
+        persist_policy_snapshot(&state, &path)
+            .await
+            .expect("persist policy snapshot");
+
+        let raw = tokio::fs::read_to_string(&path)
+            .await
+            .expect("read policy snapshot");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&raw).expect("policy snapshot should be valid json");
+        assert_eq!(parsed["offline_mode"].as_bool(), Some(true));
+        assert_eq!(
+            parsed["node_capabilities"],
+            serde_json::json!(["shell", "vault"])
+        );
+        assert_eq!(
+            parsed["allowed_providers"],
+            serde_json::json!(["shell", "vault"])
+        );
+        assert_eq!(
+            parsed["chat_intents"]["deploy"]["workflow"].as_str(),
+            Some("prod-deploy")
+        );
+        assert_eq!(
+            parsed["trigger_scheduler"]["is_leader"].as_bool(),
+            Some(true)
+        );
     }
 
     #[test]

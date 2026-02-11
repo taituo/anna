@@ -85,6 +85,14 @@ ANNA_DAEMON_STATE_FILE=/var/lib/anna/state.json anna daemon
 ANNA_DAEMON_STATE_FILE=off anna daemon
 ```
 
+Daemon policy snapshot persistence (effective control policy):
+
+```bash
+# writes effective policy JSON atomically every ~2s
+ANNA_POLICY_SNAPSHOT_FILE=/var/lib/anna/policy.snapshot.json anna daemon
+ANNA_POLICY_SNAPSHOT_FILE=off anna daemon
+```
+
 Daemon retention limits (in-memory + persisted snapshots):
 
 ```bash
