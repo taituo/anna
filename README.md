@@ -105,6 +105,9 @@ ANNA_CHAT_INTENTS="deploy=prod-deploy,triage=incident-triage" anna daemon --play
 
 # file-based mapping (YAML map or list)
 ANNA_CHAT_INTENTS_FILE=./chat.intents.yml anna daemon --plays-dir .
+
+# optional hot-reload poll interval for file-based intents (default 2s, off|false|0 disables)
+ANNA_CHAT_INTENTS_FILE=./chat.intents.yml ANNA_CHAT_INTENTS_RELOAD_SEC=5 anna daemon --plays-dir .
 ```
 
 `ANNA_CHAT_INTENTS` overrides keys from `ANNA_CHAT_INTENTS_FILE` when both are set.

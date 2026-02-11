@@ -30,7 +30,7 @@ struct AppState {
     executor: Executor,
     plays_dir: PathBuf,
     registry_file: Option<PathBuf>,
-    chat_intents: HashMap<String, ChatIntentConfig>,
+    chat_intents: Arc<RwLock<HashMap<String, ChatIntentConfig>>>,
     node_capabilities: HashSet<String>,
     allowed_providers: Option<HashSet<String>>,
     owner_policy: OwnerConcurrencyPolicy,
@@ -496,6 +496,7 @@ pub async fn run_daemon(bind: &str, plays_dir: PathBuf) -> Result<()> {
     let state_file = daemon_state_file();
     let registry_file = flow_registry_file();
     let chat_intents = daemon_chat_intents();
+    let chat_reload_interval = chat_intents_reload_interval();
     let retention = daemon_retention_config();
     let node_capabilities = daemon_node_capabilities();
     let owner_policy = daemon_owner_concurrency_policy();
@@ -510,11 +511,12 @@ pub async fn run_daemon(bind: &str, plays_dir: PathBuf) -> Result<()> {
         max_hitl: retention.max_hitl,
     }));
     let allowed_providers = executor.allowed_providers_set();
+    let chat_intents_state = Arc::new(RwLock::new(chat_intents.clone()));
     let state = AppState {
         executor,
         plays_dir,
         registry_file: registry_file.clone(),
-        chat_intents: chat_intents.clone(),
+        chat_intents: chat_intents_state,
         node_capabilities: node_capabilities.clone(),
         allowed_providers: allowed_providers.clone(),
         owner_policy: owner_policy.clone(),
@@ -542,6 +544,17 @@ pub async fn run_daemon(bind: &str, plays_dir: PathBuf) -> Result<()> {
             .collect::<Vec<_>>();
         routes.sort();
         println!("anna-rs chat intents: {}", routes.join(","));
+    }
+    if chat_intents_file().is_some() {
+        if let Some(interval) = chat_reload_interval {
+            println!(
+                "anna-rs chat intents hot reload enabled (interval={}s)",
+                interval.as_secs()
+            );
+            tokio::spawn(chat_intents_reload_loop(state.clone(), interval));
+        } else {
+            println!("anna-rs chat intents hot reload disabled");
+        }
     }
     if !node_capabilities.is_empty() {
         let mut capabilities = node_capabilities.iter().cloned().collect::<Vec<_>>();
@@ -623,11 +636,13 @@ async fn policy(State(state): State<AppState>, headers: HeaderMap) -> impl IntoR
         .collect::<Vec<_>>();
     owner_limits.sort_by(|a, b| a.owner.cmp(&b.owner));
 
+    let chat_intents_count = state.chat_intents.read().await.len();
+
     Json(PolicyResponse {
         registry_enabled: state.registry_file.is_some(),
         auth_enabled: state.auth_token.is_some(),
-        chat_gateway_enabled: !state.chat_intents.is_empty(),
-        chat_intents_count: state.chat_intents.len(),
+        chat_gateway_enabled: chat_intents_count > 0,
+        chat_intents_count,
         node_capabilities,
         provider_restriction_enabled: state.allowed_providers.is_some(),
         allowed_providers,
@@ -1029,8 +1044,8 @@ async fn list_chat_intents(State(state): State<AppState>, headers: HeaderMap) ->
         return resp;
     }
 
-    let mut intents = state
-        .chat_intents
+    let chat_intents = state.chat_intents.read().await.clone();
+    let mut intents = chat_intents
         .iter()
         .map(|(intent, rule)| ChatIntentRoute {
             intent: intent.clone(),
@@ -1061,7 +1076,8 @@ async fn check_chat_intent(
     if let Some(resp) = ensure_authorized(&state, &headers) {
         return resp;
     }
-    if state.chat_intents.is_empty() {
+    let chat_intents = state.chat_intents.read().await.clone();
+    if chat_intents.is_empty() {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             "chat gateway disabled: set ANNA_CHAT_INTENTS or ANNA_CHAT_INTENTS_FILE",
@@ -1070,7 +1086,7 @@ async fn check_chat_intent(
     }
 
     let normalized_intent = intent.trim().to_ascii_lowercase();
-    let Some(rule) = state.chat_intents.get(&normalized_intent) else {
+    let Some(rule) = chat_intents.get(&normalized_intent).cloned() else {
         return (
             StatusCode::NOT_FOUND,
             format!("chat intent '{}' is not configured", intent),
@@ -1104,7 +1120,7 @@ async fn check_chat_intent(
                 .into_response();
         }
     };
-    let guardrails = evaluate_chat_intent_guardrails(rule, &entry, query.max_iterations);
+    let guardrails = evaluate_chat_intent_guardrails(&rule, &entry, query.max_iterations);
 
     let (running, owner_running) = running_counts_for_entry(&state, &entry).await;
     let owner_max_concurrency = owner_limit_for(entry.owner.as_deref(), &state.owner_policy);
@@ -1150,7 +1166,8 @@ async fn run_chat_intent(
         return resp;
     }
 
-    if state.chat_intents.is_empty() {
+    let chat_intents = state.chat_intents.read().await.clone();
+    if chat_intents.is_empty() {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             "chat gateway disabled: set ANNA_CHAT_INTENTS or ANNA_CHAT_INTENTS_FILE",
@@ -1163,7 +1180,7 @@ async fn run_chat_intent(
         Err(err) => return (StatusCode::BAD_REQUEST, err.to_string()).into_response(),
     };
     let intent = request.intent.trim().to_ascii_lowercase();
-    let Some(rule) = state.chat_intents.get(&intent) else {
+    let Some(rule) = chat_intents.get(&intent).cloned() else {
         return (
             StatusCode::NOT_FOUND,
             format!("chat intent '{}' is not configured", request.intent),
@@ -1197,7 +1214,7 @@ async fn run_chat_intent(
                 .into_response();
         }
     };
-    let guardrails = evaluate_chat_intent_guardrails(rule, &entry, request.max_iterations);
+    let guardrails = evaluate_chat_intent_guardrails(&rule, &entry, request.max_iterations);
     if !guardrails.reasons.is_empty() {
         return (
             StatusCode::FORBIDDEN,
@@ -2012,6 +2029,30 @@ fn daemon_node_capabilities() -> HashSet<String> {
         .collect::<HashSet<_>>()
 }
 
+fn chat_intents_reload_interval() -> Option<Duration> {
+    let Ok(raw) = std::env::var("ANNA_CHAT_INTENTS_RELOAD_SEC") else {
+        return Some(Duration::from_secs(2));
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty()
+        || trimmed.eq_ignore_ascii_case("off")
+        || trimmed.eq_ignore_ascii_case("false")
+        || trimmed == "0"
+    {
+        return None;
+    }
+    match trimmed.parse::<u64>() {
+        Ok(seconds) if seconds >= 1 => Some(Duration::from_secs(seconds)),
+        _ => {
+            eprintln!(
+                "anna-rs daemon: invalid ANNA_CHAT_INTENTS_RELOAD_SEC='{}' (expected integer >=1, or off/false/0)",
+                trimmed
+            );
+            Some(Duration::from_secs(2))
+        }
+    }
+}
+
 fn daemon_chat_intents() -> HashMap<String, ChatIntentConfig> {
     let mut out = HashMap::new();
 
@@ -2387,6 +2428,27 @@ async fn load_daemon_state(
         }
     }
     Ok((parsed.sessions, parsed.hitl))
+}
+
+async fn chat_intents_reload_loop(state: AppState, interval: Duration) {
+    loop {
+        sleep(interval).await;
+        let next = daemon_chat_intents();
+        let mut write = state.chat_intents.write().await;
+        if *write != next {
+            *write = next.clone();
+            let mut routes = next
+                .iter()
+                .map(|(intent, rule)| format!("{}={}", intent, rule.workflow))
+                .collect::<Vec<_>>();
+            routes.sort();
+            if routes.is_empty() {
+                println!("anna-rs chat intents reloaded: <empty>");
+            } else {
+                println!("anna-rs chat intents reloaded: {}", routes.join(","));
+            }
+        }
+    }
 }
 
 async fn state_persist_loop(state: AppState, path: PathBuf) {

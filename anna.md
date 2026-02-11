@@ -451,6 +451,9 @@ ANNA_CHAT_INTENTS="deploy=prod-deploy,triage=incident-triage" anna daemon
 
 # or from YAML file
 ANNA_CHAT_INTENTS_FILE=./chat.intents.yml anna daemon
+
+# optional file hot-reload interval in seconds (default 2, off|false|0 disables)
+ANNA_CHAT_INTENTS_FILE=./chat.intents.yml ANNA_CHAT_INTENTS_RELOAD_SEC=5 anna daemon
 ```
 
 When both are set, `ANNA_CHAT_INTENTS` overrides matching keys from `ANNA_CHAT_INTENTS_FILE`.
