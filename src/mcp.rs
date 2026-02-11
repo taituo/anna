@@ -257,6 +257,11 @@ fn tool_specs() -> Vec<Value> {
             "inputSchema": { "type": "object", "additionalProperties": false }
         }),
         json!({
+            "name": "policy_snapshot",
+            "description": "Get daemon effective policy snapshot",
+            "inputSchema": { "type": "object", "additionalProperties": false }
+        }),
+        json!({
             "name": "list_llm_adapters",
             "description": "List local LLM adapter catalog loaded from ANNA_LLM_ADAPTERS_FILE",
             "inputSchema": { "type": "object", "additionalProperties": false }
@@ -549,6 +554,14 @@ async fn handle_tools_call(client: &Client, config: &McpConfig, params: &Value) 
             .await?;
             Ok(body)
         }
+        "policy_snapshot" => {
+            let body = send(authed(
+                client.get(format!("{}/policy/snapshot", daemon)),
+                &config.daemon_token,
+            ))
+            .await?;
+            Ok(body)
+        }
         "list_llm_adapters" => {
             let loaded = load_llm_adapter_catalog_from_env()?;
             let payload = match loaded {
@@ -824,6 +837,7 @@ mod tests {
         assert!(names.contains(&"stop_flow"));
         assert!(names.contains(&"stats"));
         assert!(names.contains(&"policy"));
+        assert!(names.contains(&"policy_snapshot"));
         assert!(names.contains(&"list_llm_adapters"));
         assert!(names.contains(&"daemon_llm_adapters"));
         assert!(names.contains(&"list_chat_intents"));

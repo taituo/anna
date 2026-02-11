@@ -687,6 +687,7 @@ pub async fn run_daemon(bind: &str, plays_dir: PathBuf) -> Result<()> {
     let app = Router::new()
         .route("/health", get(health))
         .route("/policy", get(policy))
+        .route("/policy/snapshot", get(policy_snapshot))
         .route("/llm/adapters", get(llm_adapters))
         .route("/stats", get(stats))
         .route("/sessions", get(list_sessions))
@@ -765,6 +766,13 @@ async fn policy(State(state): State<AppState>, headers: HeaderMap) -> impl IntoR
         retention_max_hitl: state.retention.max_hitl,
     })
     .into_response()
+}
+
+async fn policy_snapshot(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
+    if let Some(resp) = ensure_authorized(&state, &headers) {
+        return resp;
+    }
+    Json(build_policy_snapshot(&state).await).into_response()
 }
 
 async fn llm_adapters(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
@@ -3165,6 +3173,33 @@ async fn policy_snapshot_persist_loop(state: AppState, path: PathBuf) {
 }
 
 async fn persist_policy_snapshot(state: &AppState, path: &FsPath) -> Result<()> {
+    let snapshot = build_policy_snapshot(state).await;
+    let raw = serde_json::to_string_pretty(&snapshot).context("serialize policy snapshot json")?;
+
+    if let Some(parent) = path.parent() {
+        tokio::fs::create_dir_all(parent).await.with_context(|| {
+            format!(
+                "failed creating policy snapshot directory '{}'",
+                parent.display()
+            )
+        })?;
+    }
+
+    let tmp = temp_state_path(path);
+    tokio::fs::write(&tmp, raw)
+        .await
+        .with_context(|| format!("failed writing policy snapshot temp '{}'", tmp.display()))?;
+    tokio::fs::rename(&tmp, path).await.with_context(|| {
+        format!(
+            "failed moving policy snapshot '{}' -> '{}'",
+            tmp.display(),
+            path.display()
+        )
+    })?;
+    Ok(())
+}
+
+async fn build_policy_snapshot(state: &AppState) -> serde_json::Value {
     let trigger = state.trigger_leader_state.read().await.clone();
     let chat_intents = state.chat_intents.read().await.clone();
 
@@ -3202,7 +3237,7 @@ async fn persist_policy_snapshot(state: &AppState, path: &FsPath) -> Result<()> 
         );
     }
 
-    let snapshot = json!({
+    json!({
         "saved_at": now_unix_secs(),
         "registry_enabled": state.registry_file.is_some(),
         "auth_enabled": state.auth_token.is_some(),
@@ -3220,30 +3255,7 @@ async fn persist_policy_snapshot(state: &AppState, path: &FsPath) -> Result<()> 
             "expires_at": trigger.expires_at,
             "lease_file": trigger.lease_file,
         },
-    });
-    let raw = serde_json::to_string_pretty(&snapshot).context("serialize policy snapshot json")?;
-
-    if let Some(parent) = path.parent() {
-        tokio::fs::create_dir_all(parent).await.with_context(|| {
-            format!(
-                "failed creating policy snapshot directory '{}'",
-                parent.display()
-            )
-        })?;
-    }
-
-    let tmp = temp_state_path(path);
-    tokio::fs::write(&tmp, raw)
-        .await
-        .with_context(|| format!("failed writing policy snapshot temp '{}'", tmp.display()))?;
-    tokio::fs::rename(&tmp, path).await.with_context(|| {
-        format!(
-            "failed moving policy snapshot '{}' -> '{}'",
-            tmp.display(),
-            path.display()
-        )
-    })?;
-    Ok(())
+    })
 }
 
 fn temp_state_path(path: &FsPath) -> PathBuf {

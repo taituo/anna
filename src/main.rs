@@ -177,6 +177,12 @@ enum Commands {
         #[arg(long, default_value = "http://127.0.0.1:8080")]
         daemon: String,
     },
+    /// Show daemon effective policy snapshot (same shape as ANNA_POLICY_SNAPSHOT_FILE)
+    PolicySnapshot {
+        /// Daemon base URL
+        #[arg(long, default_value = "http://127.0.0.1:8080")]
+        daemon: String,
+    },
     /// Show local or daemon LLM adapter catalog
     LlmAdapters {
         /// Print JSON instead of compact text table
@@ -577,6 +583,15 @@ async fn main() -> Result<()> {
                 .send()
                 .await
                 .with_context(|| format!("failed querying policy at {}", daemon))?;
+            print_response(response).await
+        }
+        Commands::PolicySnapshot { daemon } => {
+            let daemon = normalize_daemon_url(&daemon);
+            let client = Client::new();
+            let response = with_daemon_auth(client.get(format!("{}/policy/snapshot", daemon)))
+                .send()
+                .await
+                .with_context(|| format!("failed querying policy snapshot at {}", daemon))?;
             print_response(response).await
         }
         Commands::LlmAdapters { json, daemon } => {

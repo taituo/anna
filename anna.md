@@ -411,6 +411,10 @@ The workflow file format is identical across all three profiles.
 # Health
 curl localhost:8080/health
 
+# Policy summary + effective policy snapshot
+curl localhost:8080/policy
+curl localhost:8080/policy/snapshot
+
 # List workflows
 curl localhost:8080/workflows
 
