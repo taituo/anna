@@ -195,7 +195,8 @@ fn tool_specs() -> Vec<Value> {
                 "type": "object",
                 "properties": {
                     "intent": { "type": "string" },
-                    "max_iterations": { "type": "integer", "minimum": 1 }
+                    "max_iterations": { "type": "integer", "minimum": 1 },
+                    "caller": { "type": "string" }
                 },
                 "required": ["intent"],
                 "additionalProperties": false
@@ -287,6 +288,7 @@ fn tool_specs() -> Vec<Value> {
                 "type": "object",
                 "properties": {
                     "intent": { "type": "string" },
+                    "caller": { "type": "string" },
                     "vars": {
                         "type": "object",
                         "additionalProperties": { "type": "string" }
@@ -466,9 +468,13 @@ async fn handle_tools_call(client: &Client, config: &McpConfig, params: &Value) 
         "can_run_chat_intent" => {
             let intent = arg_required_string(&args, "intent")?;
             let max_iterations = arg_u32(&args, "max_iterations")?;
-            let mut req = authed(
-                client.get(format!("{}/chat/{}/check", daemon, intent)),
-                &config.daemon_token,
+            let caller = arg_string(&args, "caller")?;
+            let mut req = with_optional_caller(
+                authed(
+                    client.get(format!("{}/chat/{}/check", daemon, intent)),
+                    &config.daemon_token,
+                ),
+                caller.as_deref(),
             );
             if let Some(max_iterations) = max_iterations {
                 req = req.query(&[("max_iterations", max_iterations)]);
@@ -591,12 +597,16 @@ async fn handle_tools_call(client: &Client, config: &McpConfig, params: &Value) 
         }
         "run_chat_intent" => {
             let intent = arg_required_string(&args, "intent")?;
+            let caller = arg_string(&args, "caller")?;
             let vars = arg_string_map(&args, "vars")?;
             let max_iterations = arg_u32(&args, "max_iterations")?;
             let body = send(
-                authed(
-                    client.post(format!("{}/chat/run", daemon)),
-                    &config.daemon_token,
+                with_optional_caller(
+                    authed(
+                        client.post(format!("{}/chat/run", daemon)),
+                        &config.daemon_token,
+                    ),
+                    caller.as_deref(),
                 )
                 .json(&json!({
                     "intent": intent,
@@ -715,6 +725,16 @@ fn arg_bool(args: &Value, key: &str) -> Result<Option<bool>> {
 fn authed(builder: reqwest::RequestBuilder, token: &Option<String>) -> reqwest::RequestBuilder {
     match token.as_ref().map(|v| v.trim()).filter(|v| !v.is_empty()) {
         Some(token) => builder.bearer_auth(token),
+        None => builder,
+    }
+}
+
+fn with_optional_caller(
+    builder: reqwest::RequestBuilder,
+    caller: Option<&str>,
+) -> reqwest::RequestBuilder {
+    match caller.map(|v| v.trim()).filter(|v| !v.is_empty()) {
+        Some(caller) => builder.header("x-anna-caller", caller),
         None => builder,
     }
 }

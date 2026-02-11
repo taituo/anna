@@ -232,6 +232,8 @@ struct ChatIntentRoute {
     intent: String,
     workflow: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    allowed_callers: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     allowed_owners: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     required_tags: Vec<String>,
@@ -264,6 +266,8 @@ struct ChatIntentCheckResponse {
     intent: String,
     workflow: String,
     can_run: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    caller: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     guardrail_reasons: Vec<String>,
     running: usize,
@@ -428,6 +432,8 @@ struct ChatIntentEntry {
 struct ChatIntentConfigDoc {
     workflow: String,
     #[serde(default)]
+    allowed_callers: Vec<String>,
+    #[serde(default)]
     allowed_owners: Vec<String>,
     #[serde(default)]
     required_tags: Vec<String>,
@@ -438,6 +444,7 @@ struct ChatIntentConfigDoc {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ChatIntentConfig {
     workflow: String,
+    allowed_callers: Vec<String>,
     allowed_owners: Vec<String>,
     required_tags: Vec<String>,
     max_iterations_cap: Option<u32>,
@@ -1112,6 +1119,7 @@ async fn list_chat_intents(State(state): State<AppState>, headers: HeaderMap) ->
         .map(|(intent, rule)| ChatIntentRoute {
             intent: intent.clone(),
             workflow: rule.workflow.clone(),
+            allowed_callers: rule.allowed_callers.clone(),
             allowed_owners: rule.allowed_owners.clone(),
             required_tags: rule.required_tags.clone(),
             max_iterations_cap: rule.max_iterations_cap,
@@ -1138,6 +1146,7 @@ async fn check_chat_intent(
     if let Some(resp) = ensure_authorized(&state, &headers) {
         return resp;
     }
+    let caller = request_caller(&headers);
     let chat_intents = state.chat_intents.read().await.clone();
     if chat_intents.is_empty() {
         return (
@@ -1182,7 +1191,8 @@ async fn check_chat_intent(
                 .into_response();
         }
     };
-    let guardrails = evaluate_chat_intent_guardrails(&rule, &entry, query.max_iterations);
+    let guardrails =
+        evaluate_chat_intent_guardrails(&rule, &entry, query.max_iterations, caller.as_deref());
 
     let (running, owner_running) = running_counts_for_entry(&state, &entry).await;
     let owner_max_concurrency = owner_limit_for(entry.owner.as_deref(), &state.owner_policy);
@@ -1202,6 +1212,7 @@ async fn check_chat_intent(
             intent: normalized_intent,
             workflow: entry.workflow_name,
             can_run,
+            caller,
             guardrail_reasons: guardrails.reasons,
             running: readiness.running,
             requested_max_iterations: query.max_iterations,
@@ -1227,6 +1238,7 @@ async fn run_chat_intent(
     if let Some(resp) = ensure_authorized(&state, &headers) {
         return resp;
     }
+    let caller = request_caller(&headers);
 
     let chat_intents = state.chat_intents.read().await.clone();
     if chat_intents.is_empty() {
@@ -1276,7 +1288,8 @@ async fn run_chat_intent(
                 .into_response();
         }
     };
-    let guardrails = evaluate_chat_intent_guardrails(&rule, &entry, request.max_iterations);
+    let guardrails =
+        evaluate_chat_intent_guardrails(&rule, &entry, request.max_iterations, caller.as_deref());
     if !guardrails.reasons.is_empty() {
         return (
             StatusCode::FORBIDDEN,
@@ -2343,6 +2356,7 @@ fn parse_chat_intents_value(raw: &str) -> HashMap<String, ChatIntentConfig> {
             intent_raw,
             ChatIntentConfig {
                 workflow: workflow_raw.to_string(),
+                allowed_callers: Vec::new(),
                 allowed_owners: Vec::new(),
                 required_tags: Vec::new(),
                 max_iterations_cap: None,
@@ -2390,6 +2404,7 @@ fn parse_chat_intents_doc(raw: &str, source: &str) -> Result<HashMap<String, Cha
                     &item.intent,
                     ChatIntentConfig {
                         workflow: item.config.workflow,
+                        allowed_callers: item.config.allowed_callers,
                         allowed_owners: item.config.allowed_owners,
                         required_tags: item.config.required_tags,
                         max_iterations_cap: item.config.max_iterations_cap,
@@ -2407,6 +2422,7 @@ fn parse_chat_intents_doc(raw: &str, source: &str) -> Result<HashMap<String, Cha
                         (
                             ChatIntentConfig {
                                 workflow,
+                                allowed_callers: Vec::new(),
                                 allowed_owners: Vec::new(),
                                 required_tags: Vec::new(),
                                 max_iterations_cap: None,
@@ -2420,6 +2436,7 @@ fn parse_chat_intents_doc(raw: &str, source: &str) -> Result<HashMap<String, Cha
                         (
                             ChatIntentConfig {
                                 workflow: config.workflow,
+                                allowed_callers: config.allowed_callers,
                                 allowed_owners: config.allowed_owners,
                                 required_tags: config.required_tags,
                                 max_iterations_cap: config.max_iterations_cap,
@@ -2462,6 +2479,15 @@ fn insert_chat_intent_entry(
         return;
     }
 
+    let mut allowed_callers = config
+        .allowed_callers
+        .iter()
+        .map(|caller| caller.trim().to_ascii_lowercase())
+        .filter(|caller| !caller.is_empty())
+        .collect::<Vec<_>>();
+    allowed_callers.sort();
+    allowed_callers.dedup();
+
     let mut allowed_owners = config
         .allowed_owners
         .iter()
@@ -2483,6 +2509,7 @@ fn insert_chat_intent_entry(
         intent,
         ChatIntentConfig {
             workflow,
+            allowed_callers,
             allowed_owners,
             required_tags,
             max_iterations_cap: config.max_iterations_cap,
@@ -2494,8 +2521,26 @@ fn evaluate_chat_intent_guardrails(
     rule: &ChatIntentConfig,
     entry: &WorkflowEntry,
     requested_max_iterations: Option<u32>,
+    caller: Option<&str>,
 ) -> ChatIntentGuardrailOutcome {
     let mut reasons = Vec::new();
+
+    if !rule.allowed_callers.is_empty() {
+        let normalized_caller = caller
+            .map(|v| v.trim().to_ascii_lowercase())
+            .filter(|v| !v.is_empty());
+        let allowed = normalized_caller
+            .as_ref()
+            .map(|value| rule.allowed_callers.contains(value))
+            .unwrap_or(false);
+        if !allowed {
+            reasons.push(format!(
+                "caller '{}' is not allowed (allowed callers: {})",
+                normalized_caller.as_deref().unwrap_or(""),
+                rule.allowed_callers.join(", ")
+            ));
+        }
+    }
 
     if !rule.allowed_owners.is_empty() {
         let workflow_owner = owner_key(entry.owner.as_deref());
@@ -2834,6 +2879,15 @@ fn is_authorized(headers: &HeaderMap, expected: &str) -> bool {
         .and_then(|v| v.to_str().ok())
         .map(|v| v.trim() == expected)
         .unwrap_or(false)
+}
+
+fn request_caller(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get("x-anna-caller")
+        .or_else(|| headers.get("x-anna-role"))
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.trim().to_ascii_lowercase())
+        .filter(|v| !v.is_empty())
 }
 
 fn status_matches(status: &str, filter: &str) -> bool {
@@ -4125,26 +4179,34 @@ mod tests {
 
         let ok_rule = ChatIntentConfig {
             workflow: "deploy".to_string(),
+            allowed_callers: vec!["ops-bot".to_string()],
             allowed_owners: vec!["platform".to_string()],
             required_tags: vec!["prod".to_string()],
             max_iterations_cap: Some(2),
         };
-        let ok = evaluate_chat_intent_guardrails(&ok_rule, &entry, None);
+        let ok = evaluate_chat_intent_guardrails(&ok_rule, &entry, None, Some("ops-bot"));
         assert!(ok.reasons.is_empty());
         assert_eq!(ok.effective_max_iterations, Some(2));
 
-        let blocked = evaluate_chat_intent_guardrails(&ok_rule, &entry, Some(9));
+        let blocked = evaluate_chat_intent_guardrails(&ok_rule, &entry, Some(9), Some("ops-bot"));
         assert!(!blocked.reasons.is_empty());
         assert!(blocked.reasons[0].contains("max_iterations"));
 
         let strict_rule = ChatIntentConfig {
             workflow: "deploy".to_string(),
+            allowed_callers: vec!["release-bot".to_string()],
             allowed_owners: vec!["ops".to_string()],
             required_tags: vec!["critical".to_string()],
             max_iterations_cap: None,
         };
-        let blocked = evaluate_chat_intent_guardrails(&strict_rule, &entry, None);
-        assert_eq!(blocked.reasons.len(), 2);
+        let blocked = evaluate_chat_intent_guardrails(&strict_rule, &entry, None, Some("ops-bot"));
+        assert_eq!(blocked.reasons.len(), 3);
+        assert!(
+            blocked
+                .reasons
+                .iter()
+                .any(|v| v.contains("allowed callers"))
+        );
         assert!(blocked.reasons.iter().any(|v| v.contains("allowed owners")));
         assert!(
             blocked
@@ -4352,6 +4414,17 @@ mod tests {
         let mut x_token = HeaderMap::new();
         x_token.insert("x-anna-token", HeaderValue::from_static("secret-token"));
         assert!(is_authorized(&x_token, "secret-token"));
+    }
+
+    #[test]
+    fn request_caller_prefers_caller_then_role() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-anna-caller", HeaderValue::from_static("Ops-Bot"));
+        assert_eq!(super::request_caller(&headers).as_deref(), Some("ops-bot"));
+
+        headers.remove("x-anna-caller");
+        headers.insert("x-anna-role", HeaderValue::from_static("Platform"));
+        assert_eq!(super::request_caller(&headers).as_deref(), Some("platform"));
     }
 
     #[test]

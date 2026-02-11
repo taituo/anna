@@ -46,13 +46,13 @@ anna workflows
 anna workflows-meta
 anna workflows-meta --available true --capability k8s
 anna can-run prod-deploy
-anna can-chat deploy --max-iterations 2
+anna can-chat deploy --caller ops-bot --max-iterations 2
 anna can-run-yaml workflow.anna
 anna run-named prod-deploy --var ENV=prod --max-iterations 1
 anna run-named prod-deploy --precheck
 anna hook deploy
 anna chat-intents
-anna chat deploy --var ENV=prod
+anna chat deploy --caller ops-bot --var ENV=prod
 anna status <request_id>
 anna sessions --status running
 anna sessions --status running --owner platform --workflow prod-deploy
@@ -126,13 +126,15 @@ anna daemon --plays-dir .
 ```yaml
 deploy:
   workflow: prod-deploy
+  allowed_callers: [ops-bot]
   allowed_owners: [platform]
   required_tags: [prod]
   max_iterations_cap: 2
 triage: incident-triage
 ```
 
-Guardrails are enforced in both `anna can-chat` and `anna chat` (`allowed_owners`, `required_tags`, `max_iterations_cap`).
+Guardrails are enforced in both `anna can-chat` and `anna chat` (`allowed_callers`, `allowed_owners`, `required_tags`, `max_iterations_cap`).
+Caller is read from `x-anna-caller` (fallback `x-anna-role`) header when using HTTP/MCP.
 
 Optional node capability ceiling (used against `required_capabilities`):
 

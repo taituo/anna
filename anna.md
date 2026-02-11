@@ -438,6 +438,7 @@ curl localhost:8080/chat/deploy/check?max_iterations=3
 # Run intent through chat gateway
 curl -X POST localhost:8080/chat/run \
   -H "content-type: application/json" \
+  -H "x-anna-caller: ops-bot" \
   -d '{"intent":"deploy","vars":{"ENV":"prod"}}'
 
 # WebSocket logs
@@ -463,12 +464,14 @@ anna daemon
 ```
 
 When both are set, `ANNA_CHAT_INTENTS` overrides matching keys from `ANNA_CHAT_INTENTS_FILE`.
+Chat caller guardrails use `x-anna-caller` (fallback `x-anna-role`) request header.
 
 `chat.intents.yml` supports optional guardrails:
 
 ```yaml
 deploy:
   workflow: prod-deploy
+  allowed_callers: [ops-bot]
   allowed_owners: [platform]
   required_tags: [prod]
   max_iterations_cap: 2

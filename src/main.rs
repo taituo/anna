@@ -127,6 +127,9 @@ enum Commands {
         /// Optional max iterations value to precheck against chat guardrails
         #[arg(long)]
         max_iterations: Option<u32>,
+        /// Optional caller identity for chat guardrails (sent as x-anna-caller)
+        #[arg(long)]
+        caller: Option<String>,
     },
     /// Check whether a workflow YAML file can run under current daemon policy
     CanRunYaml {
@@ -234,6 +237,9 @@ enum Commands {
         /// Daemon base URL
         #[arg(long, default_value = "http://127.0.0.1:8080")]
         daemon: String,
+        /// Optional caller identity for chat guardrails (sent as x-anna-caller)
+        #[arg(long)]
+        caller: Option<String>,
         /// Override workflow vars (repeatable: --var KEY=VALUE)
         #[arg(long = "var")]
         vars: Vec<String>,
@@ -481,11 +487,14 @@ async fn main() -> Result<()> {
             intent,
             daemon,
             max_iterations,
+            caller,
         } => {
             let daemon = normalize_daemon_url(&daemon);
             let client = Client::new();
-            let mut request =
-                with_daemon_auth(client.get(format!("{}/chat/{}/check", daemon, intent)));
+            let mut request = with_optional_caller(
+                with_daemon_auth(client.get(format!("{}/chat/{}/check", daemon, intent))),
+                caller.as_deref(),
+            );
             if let Some(max_iterations) = max_iterations {
                 request = request.query(&[("max_iterations", max_iterations)]);
             }
@@ -692,21 +701,25 @@ async fn main() -> Result<()> {
         Commands::Chat {
             intent,
             daemon,
+            caller,
             vars,
             max_iterations,
         } => {
             let daemon = normalize_daemon_url(&daemon);
             let overrides = parse_var_overrides(vars)?;
             let client = Client::new();
-            let response = with_daemon_auth(client.post(format!("{}/chat/run", daemon)))
-                .json(&json!({
-                    "intent": intent,
-                    "vars": overrides,
-                    "max_iterations": max_iterations
-                }))
-                .send()
-                .await
-                .with_context(|| format!("failed running chat intent at {}", daemon))?;
+            let response = with_optional_caller(
+                with_daemon_auth(client.post(format!("{}/chat/run", daemon))),
+                caller.as_deref(),
+            )
+            .json(&json!({
+                "intent": intent,
+                "vars": overrides,
+                "max_iterations": max_iterations
+            }))
+            .send()
+            .await
+            .with_context(|| format!("failed running chat intent at {}", daemon))?;
             print_response(response).await
         }
         Commands::Hitl { command } => match command {
@@ -785,6 +798,16 @@ fn daemon_auth_token() -> Option<String> {
 fn with_daemon_auth(builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
     match daemon_auth_token() {
         Some(token) => builder.bearer_auth(token),
+        None => builder,
+    }
+}
+
+fn with_optional_caller(
+    builder: reqwest::RequestBuilder,
+    caller: Option<&str>,
+) -> reqwest::RequestBuilder {
+    match caller.map(|v| v.trim()).filter(|v| !v.is_empty()) {
+        Some(caller) => builder.header("x-anna-caller", caller),
         None => builder,
     }
 }
