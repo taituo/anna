@@ -59,7 +59,7 @@ workdir: string           # default working directory for all stages
 
 stages:
   - id: string            # stage id (required, unique)
-    provider: shell|cli|llm|http|k8s  # execution provider (default: shell)
+    provider: shell|cli|llm|http|k8s|vault  # execution provider (default: shell)
     
     # Shell provider
     exec: string          # shell command
@@ -203,6 +203,28 @@ Wrapper resolution order:
   provider: k8s
   exec: "python train.py"
 ```
+
+### vault (native key-value provider)
+```yaml
+- id: set-secret
+  provider: vault
+  args: ["put", "kv/prod/token", "$token"]
+
+- id: read-secret
+  provider: vault
+  args: ["get", "kv/prod/token"]
+```
+
+Vault provider ops:
+- `get <key>`
+- `put <key> <value>` (or value from `stdin`)
+- `delete <key>`
+- `list [prefix]`
+
+Vault provider env config:
+- `ANNA_VAULT_KV_FILE` (default `~/.anna/vault-kv.json`)
+- `ANNA_VAULT_PREFIX_ALLOW` (comma-separated key prefixes)
+- `ANNA_VAULT_READ_ONLY` (`true|false`)
 
 ## Triggers (daemon mode)
 

@@ -13,7 +13,7 @@ This repository contains the language docs:
 
 ## What Anna Supports
 
-- Deterministic stages (`shell`, `http`, `k8s`)
+- Deterministic stages (`shell`, `http`, `k8s`, `vault`)
 - Native `cli` provider wrappers for external tools and model CLIs
 - LLM stages as first-class workflow providers (`llm`) decoupled from core
 - LLM adapter catalog (`ANNA_LLM_ADAPTERS_FILE`) for model/CLI wrapper routing
@@ -106,6 +106,14 @@ Optional provider allowlist ceiling (applies to `run` and daemon-triggered runs)
 ANNA_ALLOWED_PROVIDERS="shell,cli,http" anna daemon --plays-dir .
 ```
 
+Native vault provider storage config (optional):
+
+```bash
+ANNA_VAULT_KV_FILE=~/.anna/vault-kv.json anna run flow.anna
+ANNA_VAULT_PREFIX_ALLOW="kv/prod/,kv/shared/" anna daemon --plays-dir .
+ANNA_VAULT_READ_ONLY=true anna daemon --plays-dir .
+```
+
 Optional owner concurrency policy (per `owner` in registry):
 
 ```bash
@@ -164,7 +172,7 @@ This repository now includes a Rust runtime foundation in `src/`:
 
 - `workflow` parsing/validation for `.anna` YAML
 - core substitution and `when` evaluation
-- provider registry with `shell`, `cli`, `http`, `llm`, `k8s` (LLM and k8s via CLI adapters)
+- provider registry with `shell`, `cli`, `http`, `llm`, `k8s`, `vault` (LLM and k8s via CLI adapters)
 - executor with `needs`, `when`, retry, timeout, hooks, `stage.loop`/`break_when`/`max_iterations`, session logs, and `stage.worktree` git isolation
 - session metadata files (`/tmp/anna/<session>/_meta.json`) with parent/child linkage
 - daemon API + trigger scheduler (`health`, workflow submit/status/stop/logs, `/hook/*`, `/hitl/*`, `/ws`, plus `trigger.interval|cron|watch`)

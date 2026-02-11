@@ -132,6 +132,7 @@ Use providers for external execution domains:
 - llm (prefer implemented via cli wrapper)
 - http
 - k8s
+- vault (native deterministic KV operations)
 
 ## Deployment Without Kubernetes
 

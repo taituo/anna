@@ -12,6 +12,7 @@ pub mod http;
 pub mod k8s;
 pub mod llm;
 pub mod shell;
+pub mod vault;
 
 pub type ProviderResult<T> = Result<T, ProviderError>;
 
@@ -292,6 +293,7 @@ pub fn default_registry() -> ProviderRegistry {
     reg.register("http", http::HttpProvider::default());
     reg.register("llm", llm::LlmProvider::default());
     reg.register("k8s", k8s::K8sProvider::default());
+    reg.register("vault", vault::VaultProvider::default());
     reg
 }
 
