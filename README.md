@@ -151,6 +151,16 @@ Optional provider allowlist ceiling (applies to `run` and daemon-triggered runs)
 ANNA_ALLOWED_PROVIDERS="shell,cli,http" anna daemon --plays-dir .
 ```
 
+Strict offline mode (deterministic provider ceiling for edge/single-node operation):
+
+```bash
+# effective provider ceiling: shell,cli,vault
+ANNA_OFFLINE_MODE=true anna daemon --plays-dir .
+
+# explicit allowlist is still capped by offline ceiling
+ANNA_OFFLINE_MODE=true ANNA_ALLOWED_PROVIDERS="shell,http" anna daemon --plays-dir .
+```
+
 Native vault provider storage config (optional):
 
 ```bash

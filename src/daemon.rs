@@ -35,6 +35,7 @@ struct AppState {
     trigger_lease: Option<TriggerLeaseConfig>,
     trigger_leader_state: Arc<RwLock<TriggerLeaderState>>,
     audit_log: Option<AuditLogConfig>,
+    offline_mode: bool,
     node_capabilities: HashSet<String>,
     allowed_providers: Option<HashSet<String>>,
     owner_policy: OwnerConcurrencyPolicy,
@@ -82,6 +83,7 @@ struct StatsResponse {
 struct PolicyResponse {
     registry_enabled: bool,
     auth_enabled: bool,
+    offline_mode: bool,
     chat_gateway_enabled: bool,
     chat_intents_count: usize,
     trigger_leader_election_enabled: bool,
@@ -562,6 +564,7 @@ pub async fn run_daemon(bind: &str, plays_dir: PathBuf) -> Result<()> {
         pending: hitl.clone(),
         max_hitl: retention.max_hitl,
     }));
+    let offline_mode = executor.offline_mode();
     let allowed_providers = executor.allowed_providers_set();
     let chat_intents_state = Arc::new(RwLock::new(chat_intents.clone()));
     let trigger_leader_state = Arc::new(RwLock::new(initial_trigger_leader_state(
@@ -576,6 +579,7 @@ pub async fn run_daemon(bind: &str, plays_dir: PathBuf) -> Result<()> {
         trigger_lease: trigger_lease.clone(),
         trigger_leader_state,
         audit_log: audit_log.clone(),
+        offline_mode,
         node_capabilities: node_capabilities.clone(),
         allowed_providers: allowed_providers.clone(),
         owner_policy: owner_policy.clone(),
@@ -620,6 +624,9 @@ pub async fn run_daemon(bind: &str, plays_dir: PathBuf) -> Result<()> {
     if let Some(audit) = audit_log.as_ref() {
         println!("anna-rs audit log enabled at {}", audit.path.display());
     }
+    if offline_mode {
+        println!("anna-rs offline mode enabled (deterministic provider ceiling active)");
+    }
     if chat_intents_file().is_some() {
         if let Some(interval) = chat_reload_interval {
             println!(
@@ -660,6 +667,7 @@ pub async fn run_daemon(bind: &str, plays_dir: PathBuf) -> Result<()> {
             "bind": bind,
             "registry_enabled": state.registry_file.is_some(),
             "auth_enabled": state.auth_token.is_some(),
+            "offline_mode": state.offline_mode,
             "chat_intents_count": chat_intents.len(),
             "trigger_lease_enabled": trigger_lease.is_some(),
             "allowed_providers": sorted_set_values(state.allowed_providers.as_ref()),
@@ -731,6 +739,7 @@ async fn policy(State(state): State<AppState>, headers: HeaderMap) -> impl IntoR
     Json(PolicyResponse {
         registry_enabled: state.registry_file.is_some(),
         auth_enabled: state.auth_token.is_some(),
+        offline_mode: state.offline_mode,
         chat_gateway_enabled: chat_intents_count > 0,
         chat_intents_count,
         trigger_leader_election_enabled: trigger_leader_state.enabled,

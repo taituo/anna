@@ -38,36 +38,48 @@ pub trait HitlHandler: Send + Sync {
 pub struct Executor {
     providers: ProviderRegistry,
     allowed_providers: Option<HashSet<String>>,
+    offline_mode: bool,
     memory: MemoryStore,
     hitl: Option<Arc<dyn HitlHandler>>,
 }
 
 impl Executor {
     pub fn new() -> Self {
+        let (allowed_providers, offline_mode) = allowed_providers_from_env();
         Self {
             providers: default_registry(),
-            allowed_providers: allowed_providers_from_env(),
+            allowed_providers,
+            offline_mode,
             memory: MemoryStore::default(),
             hitl: None,
         }
     }
 
     pub fn with_memory_store(memory: MemoryStore) -> Self {
+        let (allowed_providers, offline_mode) = allowed_providers_from_env();
         Self {
             providers: default_registry(),
-            allowed_providers: allowed_providers_from_env(),
+            allowed_providers,
+            offline_mode,
             memory,
             hitl: None,
         }
     }
 
     pub fn with_allowed_providers(mut self, providers: Option<HashSet<String>>) -> Self {
-        self.allowed_providers = normalize_allowed_provider_set(providers);
+        self.allowed_providers = apply_offline_provider_ceiling(
+            normalize_allowed_provider_set(providers),
+            self.offline_mode,
+        );
         self
     }
 
     pub fn allowed_providers_set(&self) -> Option<HashSet<String>> {
         self.allowed_providers.clone()
+    }
+
+    pub fn offline_mode(&self) -> bool {
+        self.offline_mode
     }
 
     pub fn with_hitl_handler(mut self, hitl: Arc<dyn HitlHandler>) -> Self {
@@ -1072,8 +1084,47 @@ fn resolve_subworkflow_path(workflow: &Workflow, stage: &Stage, target: &str) ->
     target_path
 }
 
-fn allowed_providers_from_env() -> Option<HashSet<String>> {
-    parse_allowed_providers(std::env::var("ANNA_ALLOWED_PROVIDERS").ok().as_deref())
+const OFFLINE_PROVIDER_ALLOWLIST: [&str; 3] = ["shell", "cli", "vault"];
+
+fn allowed_providers_from_env() -> (Option<HashSet<String>>, bool) {
+    let offline_mode = offline_mode_enabled();
+    let allowed = parse_allowed_providers(std::env::var("ANNA_ALLOWED_PROVIDERS").ok().as_deref());
+    (
+        apply_offline_provider_ceiling(allowed, offline_mode),
+        offline_mode,
+    )
+}
+
+fn offline_mode_enabled() -> bool {
+    std::env::var("ANNA_OFFLINE_MODE")
+        .ok()
+        .map(|v| {
+            matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
+}
+
+fn apply_offline_provider_ceiling(
+    providers: Option<HashSet<String>>,
+    offline_mode: bool,
+) -> Option<HashSet<String>> {
+    if !offline_mode {
+        return providers;
+    }
+    let offline_allowlist = OFFLINE_PROVIDER_ALLOWLIST
+        .into_iter()
+        .map(|v| v.to_string())
+        .collect::<HashSet<_>>();
+    match providers {
+        None => Some(offline_allowlist),
+        Some(mut set) => {
+            set.retain(|provider| offline_allowlist.contains(provider));
+            Some(set)
+        }
+    }
 }
 
 fn normalize_allowed_provider_set(providers: Option<HashSet<String>>) -> Option<HashSet<String>> {
@@ -1126,13 +1177,18 @@ fn provider_allowed(provider_name: &str, allowed: &Option<HashSet<String>>) -> b
 fn allowed_providers_display(allowed: &HashSet<String>) -> String {
     let mut names = allowed.iter().cloned().collect::<Vec<_>>();
     names.sort();
-    names.join(",")
+    if names.is_empty() {
+        "(none)".to_string()
+    } else {
+        names.join(",")
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        Executor, HitlHandler, HitlRequest, RunConfig, parse_allowed_providers, sanitize_token,
+        Executor, HitlHandler, HitlRequest, RunConfig, apply_offline_provider_ceiling,
+        parse_allowed_providers, sanitize_token,
     };
     use crate::memory::MemoryStore;
     use crate::session::session_dir;
@@ -1864,6 +1920,30 @@ mod tests {
 
         assert!(parse_allowed_providers(Some("*")).is_none());
         assert!(parse_allowed_providers(Some("all,http")).is_none());
+    }
+
+    #[test]
+    fn offline_ceiling_defaults_to_deterministic_providers() {
+        let allowed = apply_offline_provider_ceiling(None, true)
+            .expect("offline mode should always set provider ceiling");
+        assert_eq!(allowed.len(), 3);
+        assert!(allowed.contains("shell"));
+        assert!(allowed.contains("cli"));
+        assert!(allowed.contains("vault"));
+    }
+
+    #[test]
+    fn offline_ceiling_intersects_explicit_allowlist() {
+        let allowed = apply_offline_provider_ceiling(
+            Some(HashSet::from(["shell".to_string(), "http".to_string()])),
+            true,
+        )
+        .expect("offline mode should always set provider ceiling");
+        assert_eq!(allowed, HashSet::from(["shell".to_string()]));
+
+        let empty = apply_offline_provider_ceiling(Some(HashSet::from(["http".to_string()])), true)
+            .expect("offline mode should always set provider ceiling");
+        assert!(empty.is_empty());
     }
 
     #[tokio::test]

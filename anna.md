@@ -464,6 +464,9 @@ anna daemon
 
 # optional append-only audit log (NDJSON)
 ANNA_AUDIT_LOG_FILE=/var/log/anna/audit.ndjson anna daemon
+
+# strict offline mode (deterministic provider ceiling: shell,cli,vault)
+ANNA_OFFLINE_MODE=true anna daemon
 ```
 
 When both are set, `ANNA_CHAT_INTENTS` overrides matching keys from `ANNA_CHAT_INTENTS_FILE`.
