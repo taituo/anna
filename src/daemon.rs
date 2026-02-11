@@ -13,9 +13,11 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use chrono::{DateTime, Utc};
 use cron::Schedule;
+use hmac::{Hmac, Mac};
 use humantime::parse_duration;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path as FsPath, PathBuf};
 use std::str::FromStr;
@@ -35,6 +37,7 @@ struct AppState {
     trigger_lease: Option<TriggerLeaseConfig>,
     trigger_leader_state: Arc<RwLock<TriggerLeaderState>>,
     audit_log: Option<AuditLogConfig>,
+    policy_signing_key: Option<String>,
     offline_mode: bool,
     node_capabilities: HashSet<String>,
     allowed_providers: Option<HashSet<String>>,
@@ -84,6 +87,11 @@ struct PolicyResponse {
     registry_enabled: bool,
     auth_enabled: bool,
     offline_mode: bool,
+    policy_revision: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    policy_signature: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    policy_signature_algorithm: Option<String>,
     chat_gateway_enabled: bool,
     chat_intents_count: usize,
     trigger_leader_election_enabled: bool,
@@ -103,6 +111,16 @@ struct PolicyResponse {
     owner_default_limit: Option<usize>,
     retention_max_sessions: usize,
     retention_max_hitl: usize,
+}
+
+#[derive(Debug, Serialize)]
+struct PolicyRevisionResponse {
+    policy_revision: String,
+    signed: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    policy_signature: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    policy_signature_algorithm: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -550,6 +568,7 @@ pub async fn run_daemon(bind: &str, plays_dir: PathBuf) -> Result<()> {
     let node_id = daemon_node_id();
     let trigger_lease = trigger_lease_config(&node_id);
     let audit_log = daemon_audit_log_config(&node_id);
+    let policy_signing_key = daemon_policy_signing_key();
     let chat_intents = daemon_chat_intents();
     let chat_reload_interval = chat_intents_reload_interval();
     let retention = daemon_retention_config();
@@ -580,6 +599,7 @@ pub async fn run_daemon(bind: &str, plays_dir: PathBuf) -> Result<()> {
         trigger_lease: trigger_lease.clone(),
         trigger_leader_state,
         audit_log: audit_log.clone(),
+        policy_signing_key,
         offline_mode,
         node_capabilities: node_capabilities.clone(),
         allowed_providers: allowed_providers.clone(),
@@ -668,6 +688,9 @@ pub async fn run_daemon(bind: &str, plays_dir: PathBuf) -> Result<()> {
         }
         println!("anna-rs owner concurrency policy: {}", entries.join(","));
     }
+    let policy_core = build_policy_core(&state).await;
+    let (startup_policy_revision, _policy_signature) =
+        policy_revision_and_signature(&policy_core, state.policy_signing_key.as_deref());
     emit_audit_event(
         &state,
         "daemon_started",
@@ -678,6 +701,7 @@ pub async fn run_daemon(bind: &str, plays_dir: PathBuf) -> Result<()> {
             "offline_mode": state.offline_mode,
             "chat_intents_count": chat_intents.len(),
             "trigger_lease_enabled": trigger_lease.is_some(),
+            "policy_revision": startup_policy_revision,
             "allowed_providers": sorted_set_values(state.allowed_providers.as_ref()),
             "node_capabilities": sorted_set_values(Some(&state.node_capabilities)),
         }),
@@ -687,6 +711,7 @@ pub async fn run_daemon(bind: &str, plays_dir: PathBuf) -> Result<()> {
     let app = Router::new()
         .route("/health", get(health))
         .route("/policy", get(policy))
+        .route("/policy/revision", get(policy_revision))
         .route("/policy/snapshot", get(policy_snapshot))
         .route("/llm/adapters", get(llm_adapters))
         .route("/stats", get(stats))
@@ -723,6 +748,10 @@ async fn policy(State(state): State<AppState>, headers: HeaderMap) -> impl IntoR
         return resp;
     }
 
+    let policy_core = build_policy_core(&state).await;
+    let (policy_revision, policy_signature) =
+        policy_revision_and_signature(&policy_core, state.policy_signing_key.as_deref());
+
     let mut node_capabilities = state.node_capabilities.iter().cloned().collect::<Vec<_>>();
     node_capabilities.sort();
     let mut allowed_providers = state
@@ -749,6 +778,12 @@ async fn policy(State(state): State<AppState>, headers: HeaderMap) -> impl IntoR
         registry_enabled: state.registry_file.is_some(),
         auth_enabled: state.auth_token.is_some(),
         offline_mode: state.offline_mode,
+        policy_revision,
+        policy_signature,
+        policy_signature_algorithm: state
+            .policy_signing_key
+            .as_ref()
+            .map(|_| "hmac-sha256".to_string()),
         chat_gateway_enabled: chat_intents_count > 0,
         chat_intents_count,
         trigger_leader_election_enabled: trigger_leader_state.enabled,
@@ -764,6 +799,25 @@ async fn policy(State(state): State<AppState>, headers: HeaderMap) -> impl IntoR
         owner_default_limit: state.owner_policy.default_limit,
         retention_max_sessions: state.retention.max_sessions,
         retention_max_hitl: state.retention.max_hitl,
+    })
+    .into_response()
+}
+
+async fn policy_revision(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
+    if let Some(resp) = ensure_authorized(&state, &headers) {
+        return resp;
+    }
+    let policy_core = build_policy_core(&state).await;
+    let (policy_revision, policy_signature) =
+        policy_revision_and_signature(&policy_core, state.policy_signing_key.as_deref());
+    Json(PolicyRevisionResponse {
+        policy_revision,
+        signed: policy_signature.is_some(),
+        policy_signature,
+        policy_signature_algorithm: state
+            .policy_signing_key
+            .as_ref()
+            .map(|_| "hmac-sha256".to_string()),
     })
     .into_response()
 }
@@ -2510,6 +2564,20 @@ fn daemon_audit_log_config(node_id: &str) -> Option<AuditLogConfig> {
     })
 }
 
+fn daemon_policy_signing_key() -> Option<String> {
+    let Ok(raw) = std::env::var("ANNA_POLICY_SIGNING_KEY") else {
+        return None;
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty()
+        || trimmed.eq_ignore_ascii_case("off")
+        || trimmed.eq_ignore_ascii_case("false")
+    {
+        return None;
+    }
+    Some(trimmed.to_string())
+}
+
 fn sorted_set_values(set: Option<&HashSet<String>>) -> Vec<String> {
     let mut values = set
         .map(|v| v.iter().cloned().collect::<Vec<_>>())
@@ -3201,6 +3269,38 @@ async fn persist_policy_snapshot(state: &AppState, path: &FsPath) -> Result<()> 
 
 async fn build_policy_snapshot(state: &AppState) -> serde_json::Value {
     let trigger = state.trigger_leader_state.read().await.clone();
+    let policy_core = build_policy_core(state).await;
+    let (policy_revision, policy_signature) =
+        policy_revision_and_signature(&policy_core, state.policy_signing_key.as_deref());
+
+    json!({
+        "saved_at": now_unix_secs(),
+        "policy_revision": policy_revision,
+        "policy_signature": policy_signature,
+        "policy_signature_algorithm": state.policy_signing_key.as_ref().map(|_| "hmac-sha256"),
+        "registry_enabled": policy_core["registry_enabled"].clone(),
+        "auth_enabled": policy_core["auth_enabled"].clone(),
+        "offline_mode": policy_core["offline_mode"].clone(),
+        "node_capabilities": policy_core["node_capabilities"].clone(),
+        "allowed_providers": policy_core["allowed_providers"].clone(),
+        "owner_limits": policy_core["owner_limits"].clone(),
+        "owner_default_limit": policy_core["owner_default_limit"].clone(),
+        "chat_intents": policy_core["chat_intents"].clone(),
+        "trigger_policy": policy_core["trigger_policy"].clone(),
+        "trigger_scheduler": {
+            "enabled": trigger.enabled,
+            "is_leader": trigger.is_leader,
+            "node_id": trigger.node_id,
+            "holder": trigger.holder,
+            "expires_at": trigger.expires_at,
+            "lease_file": trigger.lease_file,
+        },
+        "policy_core": policy_core,
+    })
+}
+
+async fn build_policy_core(state: &AppState) -> serde_json::Value {
+    let trigger = state.trigger_leader_state.read().await.clone();
     let chat_intents = state.chat_intents.read().await.clone();
 
     let mut owner_limits = state
@@ -3238,7 +3338,6 @@ async fn build_policy_snapshot(state: &AppState) -> serde_json::Value {
     }
 
     json!({
-        "saved_at": now_unix_secs(),
         "registry_enabled": state.registry_file.is_some(),
         "auth_enabled": state.auth_token.is_some(),
         "offline_mode": state.offline_mode,
@@ -3247,15 +3346,42 @@ async fn build_policy_snapshot(state: &AppState) -> serde_json::Value {
         "owner_limits": owner_limits,
         "owner_default_limit": state.owner_policy.default_limit,
         "chat_intents": chat_map,
-        "trigger_scheduler": {
-            "enabled": trigger.enabled,
-            "is_leader": trigger.is_leader,
+        "trigger_policy": {
+            "leader_election_enabled": trigger.enabled,
             "node_id": trigger.node_id,
-            "holder": trigger.holder,
-            "expires_at": trigger.expires_at,
             "lease_file": trigger.lease_file,
         },
     })
+}
+
+fn policy_revision_and_signature(
+    policy_core: &serde_json::Value,
+    signing_key: Option<&str>,
+) -> (String, Option<String>) {
+    let canonical = serde_json::to_vec(policy_core).unwrap_or_else(|_| b"{}".to_vec());
+    let digest = Sha256::digest(&canonical);
+    let revision = hex_encode(&digest);
+    let signature = signing_key
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .and_then(|key| sign_policy_revision(&revision, key));
+    (revision, signature)
+}
+
+fn sign_policy_revision(revision: &str, key: &str) -> Option<String> {
+    type HmacSha256 = Hmac<Sha256>;
+    let mut mac = HmacSha256::new_from_slice(key.as_bytes()).ok()?;
+    mac.update(revision.as_bytes());
+    let bytes = mac.finalize().into_bytes();
+    Some(hex_encode(&bytes))
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push_str(&format!("{:02x}", byte));
+    }
+    out
 }
 
 fn temp_state_path(path: &FsPath) -> PathBuf {
@@ -5223,6 +5349,7 @@ mod tests {
                 lease_file: Some("/tmp/lease.json".to_string()),
             })),
             audit_log: None,
+            policy_signing_key: None,
             offline_mode: true,
             node_capabilities: HashSet::from(["shell".to_string(), "vault".to_string()]),
             allowed_providers: Some(HashSet::from(["shell".to_string(), "vault".to_string()])),
@@ -5279,6 +5406,60 @@ mod tests {
             values,
             vec!["http".to_string(), "shell".to_string(), "vault".to_string()]
         );
+    }
+
+    #[test]
+    fn policy_revision_is_stable_for_same_core() {
+        let core = serde_json::json!({
+            "registry_enabled": true,
+            "auth_enabled": true,
+            "offline_mode": false,
+            "node_capabilities": ["shell", "vault"],
+            "allowed_providers": ["shell", "cli"],
+            "owner_limits": [{"owner":"platform","max_concurrency":3}],
+            "owner_default_limit": 1,
+            "chat_intents": {
+                "deploy": {
+                    "workflow": "prod-deploy",
+                    "allowed_callers": ["ops-bot"],
+                    "allowed_owners": ["platform"],
+                    "required_tags": ["prod"],
+                    "max_iterations_cap": 2
+                }
+            },
+            "trigger_policy": {
+                "leader_election_enabled": true,
+                "node_id": "node-a",
+                "lease_file": "/tmp/lease.json"
+            }
+        });
+
+        let (a_rev, a_sig) = super::policy_revision_and_signature(&core, None);
+        let (b_rev, b_sig) = super::policy_revision_and_signature(&core, None);
+        assert_eq!(a_rev, b_rev);
+        assert_eq!(a_sig, None);
+        assert_eq!(b_sig, None);
+        assert_eq!(a_rev.len(), 64);
+    }
+
+    #[test]
+    fn policy_revision_signature_uses_hmac_sha256() {
+        let core = serde_json::json!({
+            "registry_enabled": true,
+            "chat_intents": {},
+            "owner_limits": [],
+            "node_capabilities": [],
+            "allowed_providers": [],
+            "trigger_policy": {"leader_election_enabled": false, "node_id": "node-a", "lease_file": serde_json::Value::Null}
+        });
+
+        let (rev_a, sig_a) = super::policy_revision_and_signature(&core, Some("secret-a"));
+        let (rev_b, sig_b) = super::policy_revision_and_signature(&core, Some("secret-b"));
+        assert_eq!(rev_a, rev_b);
+        assert!(sig_a.is_some());
+        assert!(sig_b.is_some());
+        assert_ne!(sig_a, sig_b);
+        assert_eq!(sig_a.as_ref().map(String::len), Some(64));
     }
 
     #[tokio::test]

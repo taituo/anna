@@ -413,6 +413,7 @@ curl localhost:8080/health
 
 # Policy summary + effective policy snapshot
 curl localhost:8080/policy
+curl localhost:8080/policy/revision
 curl localhost:8080/policy/snapshot
 
 # List workflows
@@ -474,12 +475,16 @@ ANNA_OFFLINE_MODE=true anna daemon
 
 # optional effective-policy snapshot persistence (JSON)
 ANNA_POLICY_SNAPSHOT_FILE=/var/lib/anna/policy.snapshot.json anna daemon
+
+# optional policy revision signing key (HMAC-SHA256)
+ANNA_POLICY_SIGNING_KEY=replace-with-long-random-secret anna daemon
 ```
 
 When both are set, `ANNA_CHAT_INTENTS` overrides matching keys from `ANNA_CHAT_INTENTS_FILE`.
 Chat caller guardrails use `x-anna-caller` (fallback `x-anna-role`) request header.
 When trigger leader lease is enabled, `POST /hook/{name}` is accepted only on the leader node and follower nodes return `409 Conflict`.
 If `ANNA_AUDIT_LOG_FILE` is set, daemon writes append-only NDJSON events (for example `daemon_started`, `workflow_launched`, `workflow_finished`, `hook_triggered`, `chat_intent_blocked`, `hitl_resolved`).
+If `ANNA_POLICY_SIGNING_KEY` is set, daemon adds `policy_signature` (HMAC-SHA256) to policy responses and snapshots.
 
 `chat.intents.yml` supports optional guardrails:
 

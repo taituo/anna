@@ -58,6 +58,7 @@ anna sessions --status running
 anna sessions --status running --owner platform --workflow prod-deploy
 anna stats
 anna policy
+anna policy-revision
 anna policy-snapshot
 anna llm-adapters
 anna llm-adapters --json
@@ -92,6 +93,12 @@ Daemon policy snapshot persistence (effective control policy):
 # writes effective policy JSON atomically every ~2s
 ANNA_POLICY_SNAPSHOT_FILE=/var/lib/anna/policy.snapshot.json anna daemon
 ANNA_POLICY_SNAPSHOT_FILE=off anna daemon
+```
+
+Optional policy revision signing key (adds HMAC signature to policy endpoints and snapshots):
+
+```bash
+ANNA_POLICY_SIGNING_KEY=replace-with-long-random-secret anna daemon
 ```
 
 Daemon retention limits (in-memory + persisted snapshots):
@@ -290,9 +297,9 @@ Current MVP intentionally leaves some advanced features for next steps (multi-no
 
 ## Access Channels
 
-- CLI (`anna run`, `anna submit`, `anna can-run`, `anna can-chat`, `anna can-run-yaml`, `anna status`, `anna chat-intents`, `anna chat`)
-- HTTP control API (`/policy`, `/policy/snapshot`, `/llm/adapters`, `/workflow`, `/workflow/check`, `/workflow/{name}/check`, `/workflow/{name}/run`, `/workflows`, `/workflows/meta`, `/chat/intents`, `/chat/{intent}/check`, `/chat/run`, `/hook/*`, `/hitl`, `/hitl/{id}/resolve`, `/ws`)
-- MCP stdio server (`anna mcp`) with tools: `list_flows`, `list_flows_meta`, `run_flow`, `can_run_flow`, `can_run_flow_yaml`, `can_run_chat_intent`, `session_status`, `tail_logs`, `stop_flow`, `list_sessions`, `stats`, `policy`, `policy_snapshot`, `list_llm_adapters`, `daemon_llm_adapters`, `trigger_hook`, `list_chat_intents`, `run_chat_intent`, `list_hitl`, `resolve_hitl`
+- CLI (`anna run`, `anna submit`, `anna can-run`, `anna can-chat`, `anna can-run-yaml`, `anna status`, `anna policy`, `anna policy-revision`, `anna policy-snapshot`, `anna chat-intents`, `anna chat`)
+- HTTP control API (`/policy`, `/policy/revision`, `/policy/snapshot`, `/llm/adapters`, `/workflow`, `/workflow/check`, `/workflow/{name}/check`, `/workflow/{name}/run`, `/workflows`, `/workflows/meta`, `/chat/intents`, `/chat/{intent}/check`, `/chat/run`, `/hook/*`, `/hitl`, `/hitl/{id}/resolve`, `/ws`)
+- MCP stdio server (`anna mcp`) with tools: `list_flows`, `list_flows_meta`, `run_flow`, `can_run_flow`, `can_run_flow_yaml`, `can_run_chat_intent`, `session_status`, `tail_logs`, `stop_flow`, `list_sessions`, `stats`, `policy`, `policy_revision`, `policy_snapshot`, `list_llm_adapters`, `daemon_llm_adapters`, `trigger_hook`, `list_chat_intents`, `run_chat_intent`, `list_hitl`, `resolve_hitl`
 - Chat gateway (maps chat intents to approved flow runs)
 
 Minimal MCP smoke test:

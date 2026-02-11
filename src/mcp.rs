@@ -257,6 +257,11 @@ fn tool_specs() -> Vec<Value> {
             "inputSchema": { "type": "object", "additionalProperties": false }
         }),
         json!({
+            "name": "policy_revision",
+            "description": "Get daemon policy revision/hash and optional signature",
+            "inputSchema": { "type": "object", "additionalProperties": false }
+        }),
+        json!({
             "name": "policy_snapshot",
             "description": "Get daemon effective policy snapshot",
             "inputSchema": { "type": "object", "additionalProperties": false }
@@ -554,6 +559,14 @@ async fn handle_tools_call(client: &Client, config: &McpConfig, params: &Value) 
             .await?;
             Ok(body)
         }
+        "policy_revision" => {
+            let body = send(authed(
+                client.get(format!("{}/policy/revision", daemon)),
+                &config.daemon_token,
+            ))
+            .await?;
+            Ok(body)
+        }
         "policy_snapshot" => {
             let body = send(authed(
                 client.get(format!("{}/policy/snapshot", daemon)),
@@ -837,6 +850,7 @@ mod tests {
         assert!(names.contains(&"stop_flow"));
         assert!(names.contains(&"stats"));
         assert!(names.contains(&"policy"));
+        assert!(names.contains(&"policy_revision"));
         assert!(names.contains(&"policy_snapshot"));
         assert!(names.contains(&"list_llm_adapters"));
         assert!(names.contains(&"daemon_llm_adapters"));
