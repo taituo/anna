@@ -31,10 +31,20 @@ enum VaultBackend {
 #[derive(Debug, Clone)]
 struct VaultHttpConfig {
     addr: String,
-    token: String,
+    auth: VaultAuthConfig,
     namespace: Option<String>,
     mount: String,
     kv_version: u8,
+}
+
+#[derive(Debug, Clone)]
+enum VaultAuthConfig {
+    Token(String),
+    AppRole {
+        role_id: String,
+        secret_id: String,
+        auth_path: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -344,16 +354,51 @@ fn read_http_config(
             )
         })?;
 
-    let token =
-        resolve_setting("ANNA_VAULT_TOKEN", stage, workflow, vars, outputs).ok_or_else(|| {
-            ProviderError::new(
-                "provider_start_failed",
-                format!(
-                    "ANNA_VAULT_TOKEN is required for vault http backend in stage '{}'",
-                    stage.id
-                ),
-            )
-        })?;
+    let token = resolve_setting("ANNA_VAULT_TOKEN", stage, workflow, vars, outputs);
+    let role_id = resolve_setting("ANNA_VAULT_ROLE_ID", stage, workflow, vars, outputs);
+    let secret_id = resolve_setting("ANNA_VAULT_SECRET_ID", stage, workflow, vars, outputs);
+    let auth_path = resolve_setting("ANNA_VAULT_AUTH_PATH", stage, workflow, vars, outputs)
+        .unwrap_or_else(|| "auth/approle/login".to_string());
+    let auth_path = auth_path.trim().trim_matches('/').to_string();
+    if auth_path.is_empty() {
+        return Err(ProviderError::new(
+            "provider_start_failed",
+            format!(
+                "ANNA_VAULT_AUTH_PATH cannot be empty in stage '{}'",
+                stage.id
+            ),
+        ));
+    }
+
+    let auth = if let Some(token) = token {
+        VaultAuthConfig::Token(token)
+    } else {
+        match (role_id, secret_id) {
+            (Some(role_id), Some(secret_id)) => VaultAuthConfig::AppRole {
+                role_id,
+                secret_id,
+                auth_path,
+            },
+            (Some(_), None) | (None, Some(_)) => {
+                return Err(ProviderError::new(
+                    "provider_start_failed",
+                    format!(
+                        "ANNA_VAULT_ROLE_ID and ANNA_VAULT_SECRET_ID must be set together in stage '{}'",
+                        stage.id
+                    ),
+                ));
+            }
+            (None, None) => {
+                return Err(ProviderError::new(
+                    "provider_start_failed",
+                    format!(
+                        "vault http backend requires ANNA_VAULT_TOKEN or AppRole credentials (ANNA_VAULT_ROLE_ID + ANNA_VAULT_SECRET_ID) in stage '{}'",
+                        stage.id
+                    ),
+                ));
+            }
+        }
+    };
 
     let mount = resolve_setting("ANNA_VAULT_MOUNT", stage, workflow, vars, outputs)
         .unwrap_or_else(|| "secret".to_string());
@@ -393,7 +438,7 @@ fn read_http_config(
 
     Ok(VaultHttpConfig {
         addr,
-        token,
+        auth,
         namespace,
         mount,
         kv_version,
@@ -556,23 +601,102 @@ async fn execute_http_command(
                 ),
             )
         })?;
+    let token = resolve_http_token(&client, config, stage).await?;
 
     match command {
-        VaultCommand::Get { key } => http_get(&client, config, stage, key).await,
-        VaultCommand::Put { key, value } => http_put(&client, config, stage, key, value).await,
-        VaultCommand::Delete { key } => http_delete(&client, config, stage, key).await,
-        VaultCommand::List { prefix } => http_list(&client, config, stage, prefix).await,
+        VaultCommand::Get { key } => http_get(&client, config, &token, stage, key).await,
+        VaultCommand::Put { key, value } => {
+            http_put(&client, config, &token, stage, key, value).await
+        }
+        VaultCommand::Delete { key } => http_delete(&client, config, &token, stage, key).await,
+        VaultCommand::List { prefix } => http_list(&client, config, &token, stage, prefix).await,
+    }
+}
+
+async fn resolve_http_token(
+    client: &reqwest::Client,
+    config: &VaultHttpConfig,
+    stage: &Stage,
+) -> ProviderResult<String> {
+    match &config.auth {
+        VaultAuthConfig::Token(token) => Ok(token.clone()),
+        VaultAuthConfig::AppRole {
+            role_id,
+            secret_id,
+            auth_path,
+        } => {
+            let login_url = join_addr(&config.addr, &format!("v1/{}", auth_path));
+            let response = with_vault_headers(client.post(login_url), config, None)
+                .json(&json!({"role_id": role_id, "secret_id": secret_id}))
+                .send()
+                .await
+                .map_err(|err| {
+                    ProviderError::new(
+                        "provider_exec_failed",
+                        format!(
+                            "vault AppRole login request failed in stage '{}': {}",
+                            stage.id, err
+                        ),
+                    )
+                })?;
+
+            let status = response.status();
+            let body = response.text().await.map_err(|err| {
+                ProviderError::new(
+                    "provider_exec_failed",
+                    format!(
+                        "failed reading vault AppRole login response in stage '{}': {}",
+                        stage.id, err
+                    ),
+                )
+            })?;
+
+            if !status.is_success() {
+                return Err(ProviderError::new(
+                    "provider_exec_failed",
+                    format!(
+                        "vault AppRole login failed in stage '{}' with status {}: {}",
+                        stage.id, status, body
+                    ),
+                ));
+            }
+
+            let payload: Value = serde_json::from_str(&body).map_err(|err| {
+                ProviderError::new(
+                    "provider_invalid_response",
+                    format!(
+                        "vault AppRole login returned invalid json in stage '{}': {}",
+                        stage.id, err
+                    ),
+                )
+            })?;
+            payload
+                .pointer("/auth/client_token")
+                .and_then(|v| v.as_str())
+                .or_else(|| payload.get("client_token").and_then(|v| v.as_str()))
+                .map(ToOwned::to_owned)
+                .ok_or_else(|| {
+                    ProviderError::new(
+                        "provider_invalid_response",
+                        format!(
+                            "vault AppRole login response missing auth.client_token in stage '{}'",
+                            stage.id
+                        ),
+                    )
+                })
+        }
     }
 }
 
 async fn http_get(
     client: &reqwest::Client,
     config: &VaultHttpConfig,
+    token: &str,
     stage: &Stage,
     key: String,
 ) -> ProviderResult<VaultOpResult> {
     let url = build_get_url(config, &key);
-    let response = with_vault_headers(client.get(&url), config)
+    let response = with_vault_headers(client.get(&url), config, Some(token))
         .send()
         .await
         .map_err(|err| {
@@ -635,6 +759,7 @@ async fn http_get(
 async fn http_put(
     client: &reqwest::Client,
     config: &VaultHttpConfig,
+    token: &str,
     stage: &Stage,
     key: String,
     value: String,
@@ -646,7 +771,7 @@ async fn http_put(
         json!({"value": value})
     };
 
-    let response = with_vault_headers(client.post(&url), config)
+    let response = with_vault_headers(client.post(&url), config, Some(token))
         .json(&body)
         .send()
         .await
@@ -684,11 +809,12 @@ async fn http_put(
 async fn http_delete(
     client: &reqwest::Client,
     config: &VaultHttpConfig,
+    token: &str,
     stage: &Stage,
     key: String,
 ) -> ProviderResult<VaultOpResult> {
     let url = build_delete_url(config, &key);
-    let response = with_vault_headers(client.delete(&url), config)
+    let response = with_vault_headers(client.delete(&url), config, Some(token))
         .send()
         .await
         .map_err(|err| {
@@ -734,6 +860,7 @@ async fn http_delete(
 async fn http_list(
     client: &reqwest::Client,
     config: &VaultHttpConfig,
+    token: &str,
     stage: &Stage,
     prefix: Option<String>,
 ) -> ProviderResult<VaultOpResult> {
@@ -748,7 +875,7 @@ async fn http_list(
         )
     })?;
 
-    let mut response = with_vault_headers(client.request(list_method, &url), config)
+    let mut response = with_vault_headers(client.request(list_method, &url), config, Some(token))
         .send()
         .await
         .map_err(|err| {
@@ -762,18 +889,22 @@ async fn http_list(
         response.status(),
         StatusCode::METHOD_NOT_ALLOWED | StatusCode::BAD_REQUEST
     ) {
-        response = with_vault_headers(client.get(&url).query(&[("list", "true")]), config)
-            .send()
-            .await
-            .map_err(|err| {
-                ProviderError::new(
-                    "provider_exec_failed",
-                    format!(
-                        "vault list fallback request failed in stage '{}': {}",
-                        stage.id, err
-                    ),
-                )
-            })?;
+        response = with_vault_headers(
+            client.get(&url).query(&[("list", "true")]),
+            config,
+            Some(token),
+        )
+        .send()
+        .await
+        .map_err(|err| {
+            ProviderError::new(
+                "provider_exec_failed",
+                format!(
+                    "vault list fallback request failed in stage '{}': {}",
+                    stage.id, err
+                ),
+            )
+        })?;
     }
 
     let status = response.status();
@@ -851,8 +982,12 @@ fn extract_value_from_get(payload: &Value, kv_version: u8) -> Option<String> {
 fn with_vault_headers(
     builder: reqwest::RequestBuilder,
     config: &VaultHttpConfig,
+    token: Option<&str>,
 ) -> reqwest::RequestBuilder {
-    let mut builder = builder.header("X-Vault-Token", &config.token);
+    let mut builder = builder;
+    if let Some(token) = token {
+        builder = builder.header("X-Vault-Token", token);
+    }
     if let Some(namespace) = config.namespace.as_ref().filter(|v| !v.trim().is_empty()) {
         builder = builder.header("X-Vault-Namespace", namespace);
     }
@@ -991,7 +1126,7 @@ mod tests {
     use crate::workflow::{Stage, Workflow};
     use axum::extract::{Path as AxumPath, State};
     use axum::http::{HeaderMap, Method, StatusCode};
-    use axum::{Json, Router, routing::any, routing::get};
+    use axum::{Json, Router, routing::any, routing::get, routing::post};
     use serde_json::{Value, json};
     use std::collections::HashMap;
     use std::path::PathBuf;
@@ -1278,7 +1413,47 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn http_backend_requires_addr_and_token() {
+    async fn http_backend_roundtrip_kv_v2_with_approle() {
+        let addr = spawn_mock_vault_server().await;
+        let workflow = make_workflow_with_env(HashMap::from([
+            ("ANNA_VAULT_BACKEND".to_string(), "http".to_string()),
+            ("ANNA_VAULT_ADDR".to_string(), addr),
+            ("ANNA_VAULT_ROLE_ID".to_string(), "approle-role".to_string()),
+            (
+                "ANNA_VAULT_SECRET_ID".to_string(),
+                "approle-secret".to_string(),
+            ),
+            ("ANNA_VAULT_MOUNT".to_string(), "secret".to_string()),
+            ("ANNA_VAULT_KV_VERSION".to_string(), "2".to_string()),
+        ]));
+
+        let out = VaultProvider
+            .run(
+                &stage_with_args("put", vec!["put", "kv/prod/approle-token", "hello"]),
+                &workflow,
+                &HashMap::new(),
+                &HashMap::new(),
+                None,
+            )
+            .await
+            .expect("http put with approle should succeed");
+        assert_eq!(out, "ok");
+
+        let out = VaultProvider
+            .run(
+                &stage_with_args("get", vec!["get", "kv/prod/approle-token"]),
+                &workflow,
+                &HashMap::new(),
+                &HashMap::new(),
+                None,
+            )
+            .await
+            .expect("http get with approle should succeed");
+        assert_eq!(out, "hello");
+    }
+
+    #[tokio::test]
+    async fn http_backend_requires_addr_and_auth() {
         let workflow = make_workflow_with_env(HashMap::from([
             ("ANNA_VAULT_BACKEND".to_string(), "http".to_string()),
             ("ANNA_VAULT_MOUNT".to_string(), "secret".to_string()),
@@ -1295,6 +1470,28 @@ mod tests {
             .expect_err("http backend should require config");
         assert_eq!(err.code, "provider_start_failed");
         assert!(err.message.contains("ANNA_VAULT_ADDR"));
+
+        let workflow = make_workflow_with_env(HashMap::from([
+            ("ANNA_VAULT_BACKEND".to_string(), "http".to_string()),
+            (
+                "ANNA_VAULT_ADDR".to_string(),
+                "http://127.0.0.1:9999".to_string(),
+            ),
+            ("ANNA_VAULT_MOUNT".to_string(), "secret".to_string()),
+        ]));
+        let err = VaultProvider
+            .run(
+                &stage_with_args("get-no-auth", vec!["get", "kv/prod/token"]),
+                &workflow,
+                &HashMap::new(),
+                &HashMap::new(),
+                None,
+            )
+            .await
+            .expect_err("http backend should require auth config");
+        assert_eq!(err.code, "provider_start_failed");
+        assert!(err.message.contains("ANNA_VAULT_TOKEN"));
+        assert!(err.message.contains("ANNA_VAULT_ROLE_ID"));
     }
 
     #[derive(Default)]
@@ -1309,6 +1506,7 @@ mod tests {
                 "/v1/secret/data/{*path}",
                 get(mock_get).post(mock_put).delete(mock_delete),
             )
+            .route("/v1/auth/approle/login", post(mock_approle_login))
             .route("/v1/secret/metadata", any(mock_list_root))
             .route("/v1/secret/metadata/{*path}", any(mock_list))
             .with_state(state);
@@ -1330,10 +1528,27 @@ mod tests {
             .get("X-Vault-Token")
             .and_then(|v| v.to_str().ok())
             .unwrap_or_default();
-        if token != "test-token" {
+        if token != "test-token" && token != "approle-token" {
             return Err((StatusCode::FORBIDDEN, "forbidden".to_string()));
         }
         Ok(())
+    }
+
+    async fn mock_approle_login(
+        Json(body): Json<Value>,
+    ) -> Result<Json<Value>, (StatusCode, String)> {
+        let role_id = body
+            .get("role_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        let secret_id = body
+            .get("secret_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        if role_id != "approle-role" || secret_id != "approle-secret" {
+            return Err((StatusCode::FORBIDDEN, "forbidden".to_string()));
+        }
+        Ok(Json(json!({"auth": {"client_token": "approle-token"}})))
     }
 
     async fn mock_get(

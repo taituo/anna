@@ -118,9 +118,20 @@ ANNA_VAULT_READ_ONLY=true anna daemon --plays-dir .
 Native vault provider HTTP/OpenBao backend (optional):
 
 ```bash
+# token auth
 ANNA_VAULT_BACKEND=http \
 ANNA_VAULT_ADDR=http://127.0.0.1:8200 \
 ANNA_VAULT_TOKEN=... \
+ANNA_VAULT_MOUNT=secret \
+ANNA_VAULT_KV_VERSION=2 \
+anna run flow.anna
+
+# AppRole auth (token-free)
+ANNA_VAULT_BACKEND=http \
+ANNA_VAULT_ADDR=http://127.0.0.1:8200 \
+ANNA_VAULT_ROLE_ID=... \
+ANNA_VAULT_SECRET_ID=... \
+ANNA_VAULT_AUTH_PATH=auth/approle/login \
 ANNA_VAULT_MOUNT=secret \
 ANNA_VAULT_KV_VERSION=2 \
 anna run flow.anna
