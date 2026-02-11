@@ -1833,13 +1833,43 @@ async fn trigger_scheduler_loop(state: AppState) {
 }
 
 async fn scheduler_should_run(state: &AppState) -> bool {
+    let previous = state.trigger_leader_state.read().await.clone();
+
     let Some(config) = state.trigger_lease.as_ref() else {
-        let mut current = state.trigger_leader_state.write().await;
-        current.enabled = false;
-        current.is_leader = true;
-        current.holder = Some(current.node_id.clone());
-        current.expires_at = None;
-        current.lease_file = None;
+        let next = TriggerLeaderState {
+            enabled: false,
+            is_leader: true,
+            node_id: previous.node_id.clone(),
+            holder: Some(previous.node_id.clone()),
+            expires_at: None,
+            lease_file: None,
+        };
+        if trigger_leader_state_changed(&previous, &next) {
+            emit_audit_event(
+                state,
+                trigger_leader_transition_event(&previous, &next),
+                json!({
+                    "previous": {
+                        "enabled": previous.enabled,
+                        "is_leader": previous.is_leader,
+                        "node_id": previous.node_id.clone(),
+                        "holder": previous.holder.clone(),
+                        "expires_at": previous.expires_at,
+                        "lease_file": previous.lease_file.clone(),
+                    },
+                    "next": {
+                        "enabled": next.enabled,
+                        "is_leader": next.is_leader,
+                        "node_id": next.node_id.clone(),
+                        "holder": next.holder.clone(),
+                        "expires_at": next.expires_at,
+                        "lease_file": next.lease_file.clone(),
+                    },
+                }),
+            )
+            .await;
+        }
+        *state.trigger_leader_state.write().await = next;
         return true;
     };
 
@@ -1851,6 +1881,16 @@ async fn scheduler_should_run(state: &AppState) -> bool {
                 config.lease_file.display(),
                 err
             );
+            emit_audit_event(
+                state,
+                "trigger_leader_refresh_failed",
+                json!({
+                    "node_id": config.node_id,
+                    "lease_file": config.lease_file.display().to_string(),
+                    "error": err.to_string(),
+                }),
+            )
+            .await;
             TriggerLeaderState {
                 enabled: true,
                 is_leader: false,
@@ -1862,9 +1902,58 @@ async fn scheduler_should_run(state: &AppState) -> bool {
         }
     };
 
+    if trigger_leader_state_changed(&previous, &snapshot) {
+        emit_audit_event(
+            state,
+            trigger_leader_transition_event(&previous, &snapshot),
+            json!({
+                "previous": {
+                    "enabled": previous.enabled,
+                    "is_leader": previous.is_leader,
+                    "node_id": previous.node_id.clone(),
+                    "holder": previous.holder.clone(),
+                    "expires_at": previous.expires_at,
+                    "lease_file": previous.lease_file.clone(),
+                },
+                "next": {
+                    "enabled": snapshot.enabled,
+                    "is_leader": snapshot.is_leader,
+                    "node_id": snapshot.node_id.clone(),
+                    "holder": snapshot.holder.clone(),
+                    "expires_at": snapshot.expires_at,
+                    "lease_file": snapshot.lease_file.clone(),
+                },
+            }),
+        )
+        .await;
+    }
+
     let is_leader = snapshot.is_leader;
     *state.trigger_leader_state.write().await = snapshot;
     is_leader
+}
+
+fn trigger_leader_state_changed(previous: &TriggerLeaderState, next: &TriggerLeaderState) -> bool {
+    previous.enabled != next.enabled
+        || previous.is_leader != next.is_leader
+        || previous.holder != next.holder
+}
+
+fn trigger_leader_transition_event(
+    previous: &TriggerLeaderState,
+    next: &TriggerLeaderState,
+) -> &'static str {
+    if !previous.is_leader && next.is_leader {
+        "trigger_leader_acquired"
+    } else if previous.is_leader && !next.is_leader {
+        "trigger_leader_lost"
+    } else if !previous.enabled && next.enabled {
+        "trigger_leader_enabled"
+    } else if previous.enabled && !next.enabled {
+        "trigger_leader_disabled"
+    } else {
+        "trigger_leader_updated"
+    }
 }
 
 async fn resolve_trigger_leadership(config: &TriggerLeaseConfig) -> Result<TriggerLeaderState> {
@@ -4581,6 +4670,60 @@ mod tests {
             .expect("node-b should take over expired lease");
         assert!(b_takeover.is_leader);
         assert_eq!(b_takeover.holder.as_deref(), Some("node-b"));
+    }
+
+    #[test]
+    fn trigger_leader_state_change_ignores_lease_refresh_only() {
+        let previous = super::TriggerLeaderState {
+            enabled: true,
+            is_leader: true,
+            node_id: "node-a".to_string(),
+            holder: Some("node-a".to_string()),
+            expires_at: Some(100),
+            lease_file: Some("/tmp/lease.json".to_string()),
+        };
+        let next_refresh = super::TriggerLeaderState {
+            expires_at: Some(200),
+            ..previous.clone()
+        };
+        assert!(!super::trigger_leader_state_changed(
+            &previous,
+            &next_refresh
+        ));
+
+        let next_holder = super::TriggerLeaderState {
+            holder: Some("node-b".to_string()),
+            ..previous.clone()
+        };
+        assert!(super::trigger_leader_state_changed(&previous, &next_holder));
+    }
+
+    #[test]
+    fn trigger_leader_transition_event_names_are_stable() {
+        let follower = super::TriggerLeaderState {
+            enabled: true,
+            is_leader: false,
+            node_id: "node-a".to_string(),
+            holder: Some("node-b".to_string()),
+            expires_at: Some(100),
+            lease_file: Some("/tmp/lease.json".to_string()),
+        };
+        let leader = super::TriggerLeaderState {
+            enabled: true,
+            is_leader: true,
+            node_id: "node-a".to_string(),
+            holder: Some("node-a".to_string()),
+            expires_at: Some(100),
+            lease_file: Some("/tmp/lease.json".to_string()),
+        };
+        assert_eq!(
+            super::trigger_leader_transition_event(&follower, &leader),
+            "trigger_leader_acquired"
+        );
+        assert_eq!(
+            super::trigger_leader_transition_event(&leader, &follower),
+            "trigger_leader_lost"
+        );
     }
 
     #[test]

@@ -211,7 +211,7 @@ Optional append-only audit log (NDJSON, one JSON event per line):
 ANNA_AUDIT_LOG_FILE=/var/log/anna/audit.ndjson anna daemon --plays-dir .
 ```
 
-Emitted events include daemon startup, workflow launch/finish, stop requests, chat intent launch/block, webhook trigger outcomes, and HITL resolutions.
+Emitted events include daemon startup, workflow launch/finish, stop requests, chat intent launch/block, webhook trigger outcomes, trigger leadership transitions (`trigger_leader_acquired` / `trigger_leader_lost`), and HITL resolutions.
 
 Optional LLM adapter catalog (provider-independent wrapper routing):
 
