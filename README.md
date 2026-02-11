@@ -101,6 +101,16 @@ Optional policy revision signing key (adds HMAC signature to policy endpoints an
 ANNA_POLICY_SIGNING_KEY=replace-with-long-random-secret anna daemon
 ```
 
+Conditional policy fetch (ETag with revision hash):
+
+```bash
+# cache validation
+curl -H 'If-None-Match: "REVISION_HASH"' localhost:8080/policy/revision
+
+# strong precondition (rejects with 412 if revision changed)
+curl -H 'If-Match: "REVISION_HASH"' localhost:8080/policy/snapshot
+```
+
 Daemon retention limits (in-memory + persisted snapshots):
 
 ```bash

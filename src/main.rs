@@ -176,18 +176,33 @@ enum Commands {
         /// Daemon base URL
         #[arg(long, default_value = "http://127.0.0.1:8080")]
         daemon: String,
+        /// Optional If-Match header value for revision precondition
+        #[arg(long)]
+        if_match: Option<String>,
+        /// Optional If-None-Match header value for cache validation
+        #[arg(long)]
+        if_none_match: Option<String>,
     },
     /// Show daemon policy revision/hash (+ optional signature when configured)
     PolicyRevision {
         /// Daemon base URL
         #[arg(long, default_value = "http://127.0.0.1:8080")]
         daemon: String,
+        /// Optional If-None-Match header value for cache validation
+        #[arg(long)]
+        if_none_match: Option<String>,
     },
     /// Show daemon effective policy snapshot (same shape as ANNA_POLICY_SNAPSHOT_FILE)
     PolicySnapshot {
         /// Daemon base URL
         #[arg(long, default_value = "http://127.0.0.1:8080")]
         daemon: String,
+        /// Optional If-Match header value for revision precondition
+        #[arg(long)]
+        if_match: Option<String>,
+        /// Optional If-None-Match header value for cache validation
+        #[arg(long)]
+        if_none_match: Option<String>,
     },
     /// Show local or daemon LLM adapter catalog
     LlmAdapters {
@@ -582,31 +597,54 @@ async fn main() -> Result<()> {
                 .with_context(|| format!("failed querying stats at {}", daemon))?;
             print_response(response).await
         }
-        Commands::Policy { daemon } => {
+        Commands::Policy {
+            daemon,
+            if_match,
+            if_none_match,
+        } => {
             let daemon = normalize_daemon_url(&daemon);
             let client = Client::new();
-            let response = with_daemon_auth(client.get(format!("{}/policy", daemon)))
-                .send()
-                .await
-                .with_context(|| format!("failed querying policy at {}", daemon))?;
+            let response = with_optional_etag_preconditions(
+                with_daemon_auth(client.get(format!("{}/policy", daemon))),
+                if_match.as_deref(),
+                if_none_match.as_deref(),
+            )
+            .send()
+            .await
+            .with_context(|| format!("failed querying policy at {}", daemon))?;
             print_response(response).await
         }
-        Commands::PolicyRevision { daemon } => {
+        Commands::PolicyRevision {
+            daemon,
+            if_none_match,
+        } => {
             let daemon = normalize_daemon_url(&daemon);
             let client = Client::new();
-            let response = with_daemon_auth(client.get(format!("{}/policy/revision", daemon)))
-                .send()
-                .await
-                .with_context(|| format!("failed querying policy revision at {}", daemon))?;
+            let response = with_optional_etag_preconditions(
+                with_daemon_auth(client.get(format!("{}/policy/revision", daemon))),
+                None,
+                if_none_match.as_deref(),
+            )
+            .send()
+            .await
+            .with_context(|| format!("failed querying policy revision at {}", daemon))?;
             print_response(response).await
         }
-        Commands::PolicySnapshot { daemon } => {
+        Commands::PolicySnapshot {
+            daemon,
+            if_match,
+            if_none_match,
+        } => {
             let daemon = normalize_daemon_url(&daemon);
             let client = Client::new();
-            let response = with_daemon_auth(client.get(format!("{}/policy/snapshot", daemon)))
-                .send()
-                .await
-                .with_context(|| format!("failed querying policy snapshot at {}", daemon))?;
+            let response = with_optional_etag_preconditions(
+                with_daemon_auth(client.get(format!("{}/policy/snapshot", daemon))),
+                if_match.as_deref(),
+                if_none_match.as_deref(),
+            )
+            .send()
+            .await
+            .with_context(|| format!("failed querying policy snapshot at {}", daemon))?;
             print_response(response).await
         }
         Commands::LlmAdapters { json, daemon } => {
@@ -842,12 +880,32 @@ fn with_optional_caller(
     }
 }
 
+fn with_optional_etag_preconditions(
+    builder: reqwest::RequestBuilder,
+    if_match: Option<&str>,
+    if_none_match: Option<&str>,
+) -> reqwest::RequestBuilder {
+    let mut req = builder;
+    if let Some(value) = if_match.map(str::trim).filter(|v| !v.is_empty()) {
+        req = req.header("if-match", value);
+    }
+    if let Some(value) = if_none_match.map(str::trim).filter(|v| !v.is_empty()) {
+        req = req.header("if-none-match", value);
+    }
+    req
+}
+
 async fn print_response(response: reqwest::Response) -> Result<()> {
     let status = response.status();
     let body = response
         .text()
         .await
         .context("failed reading response body")?;
+
+    if status == reqwest::StatusCode::NOT_MODIFIED {
+        println!("{}", status);
+        return Ok(());
+    }
 
     if status.is_success() {
         if let Ok(json) = serde_json::from_str::<serde_json::Value>(&body) {

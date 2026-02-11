@@ -6,8 +6,9 @@ use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, Query, State};
-use axum::http::HeaderMap;
 use axum::http::StatusCode;
+use axum::http::header::{ETAG, IF_MATCH, IF_NONE_MATCH};
+use axum::http::{HeaderMap, HeaderValue};
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -751,6 +752,12 @@ async fn policy(State(state): State<AppState>, headers: HeaderMap) -> impl IntoR
     let policy_core = build_policy_core(&state).await;
     let (policy_revision, policy_signature) =
         policy_revision_and_signature(&policy_core, state.policy_signing_key.as_deref());
+    if !if_match_allows(&headers, &policy_revision) {
+        return precondition_failed_with_etag(&policy_revision);
+    }
+    if if_none_match_matches(&headers, &policy_revision) {
+        return not_modified_with_etag(&policy_revision);
+    }
 
     let mut node_capabilities = state.node_capabilities.iter().cloned().collect::<Vec<_>>();
     node_capabilities.sort();
@@ -773,8 +780,9 @@ async fn policy(State(state): State<AppState>, headers: HeaderMap) -> impl IntoR
 
     let chat_intents_count = state.chat_intents.read().await.len();
     let trigger_leader_state = state.trigger_leader_state.read().await.clone();
+    let etag_revision = policy_revision.clone();
 
-    Json(PolicyResponse {
+    let mut response = Json(PolicyResponse {
         registry_enabled: state.registry_file.is_some(),
         auth_enabled: state.auth_token.is_some(),
         offline_mode: state.offline_mode,
@@ -800,7 +808,9 @@ async fn policy(State(state): State<AppState>, headers: HeaderMap) -> impl IntoR
         retention_max_sessions: state.retention.max_sessions,
         retention_max_hitl: state.retention.max_hitl,
     })
-    .into_response()
+    .into_response();
+    set_etag_header(&mut response, &etag_revision);
+    response
 }
 
 async fn policy_revision(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
@@ -810,7 +820,11 @@ async fn policy_revision(State(state): State<AppState>, headers: HeaderMap) -> i
     let policy_core = build_policy_core(&state).await;
     let (policy_revision, policy_signature) =
         policy_revision_and_signature(&policy_core, state.policy_signing_key.as_deref());
-    Json(PolicyRevisionResponse {
+    if if_none_match_matches(&headers, &policy_revision) {
+        return not_modified_with_etag(&policy_revision);
+    }
+    let etag_revision = policy_revision.clone();
+    let mut response = Json(PolicyRevisionResponse {
         policy_revision,
         signed: policy_signature.is_some(),
         policy_signature,
@@ -819,14 +833,27 @@ async fn policy_revision(State(state): State<AppState>, headers: HeaderMap) -> i
             .as_ref()
             .map(|_| "hmac-sha256".to_string()),
     })
-    .into_response()
+    .into_response();
+    set_etag_header(&mut response, &etag_revision);
+    response
 }
 
 async fn policy_snapshot(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
     if let Some(resp) = ensure_authorized(&state, &headers) {
         return resp;
     }
-    Json(build_policy_snapshot(&state).await).into_response()
+    let policy_core = build_policy_core(&state).await;
+    let (policy_revision, _policy_signature) =
+        policy_revision_and_signature(&policy_core, state.policy_signing_key.as_deref());
+    if !if_match_allows(&headers, &policy_revision) {
+        return precondition_failed_with_etag(&policy_revision);
+    }
+    if if_none_match_matches(&headers, &policy_revision) {
+        return not_modified_with_etag(&policy_revision);
+    }
+    let mut response = Json(build_policy_snapshot(&state).await).into_response();
+    set_etag_header(&mut response, &policy_revision);
+    response
 }
 
 async fn llm_adapters(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
@@ -3439,6 +3466,72 @@ fn prune_hitl_in_place(hitl: &mut HashMap<String, HitlPending>, max_hitl: usize)
     }
 }
 
+fn set_etag_header(response: &mut axum::response::Response, revision: &str) {
+    if let Ok(value) = HeaderValue::from_str(&etag_value(revision)) {
+        response.headers_mut().insert(ETAG, value);
+    }
+}
+
+fn etag_value(revision: &str) -> String {
+    format!("\"{}\"", revision.trim())
+}
+
+fn normalize_etag_token(token: &str) -> Option<String> {
+    let mut trimmed = token.trim();
+    if let Some(rest) = trimmed.strip_prefix("W/") {
+        trimmed = rest.trim();
+    }
+    let stripped = trimmed.strip_prefix('"')?.strip_suffix('"')?;
+    let out = stripped.trim();
+    if out.is_empty() {
+        return None;
+    }
+    Some(out.to_string())
+}
+
+fn etag_header_matches_value(raw: &str, revision: &str) -> bool {
+    let revision = revision.trim();
+    raw.split(',')
+        .map(str::trim)
+        .any(|candidate| match candidate {
+            "*" => true,
+            other => normalize_etag_token(other)
+                .map(|tag| tag == revision)
+                .unwrap_or(false),
+        })
+}
+
+fn if_none_match_matches(headers: &HeaderMap, revision: &str) -> bool {
+    headers
+        .get(IF_NONE_MATCH)
+        .and_then(|v| v.to_str().ok())
+        .map(|raw| etag_header_matches_value(raw, revision))
+        .unwrap_or(false)
+}
+
+fn if_match_allows(headers: &HeaderMap, revision: &str) -> bool {
+    let Some(raw) = headers.get(IF_MATCH).and_then(|v| v.to_str().ok()) else {
+        return true;
+    };
+    etag_header_matches_value(raw, revision)
+}
+
+fn not_modified_with_etag(revision: &str) -> axum::response::Response {
+    let mut response = StatusCode::NOT_MODIFIED.into_response();
+    set_etag_header(&mut response, revision);
+    response
+}
+
+fn precondition_failed_with_etag(revision: &str) -> axum::response::Response {
+    let mut response = (
+        StatusCode::PRECONDITION_FAILED,
+        "policy revision precondition failed",
+    )
+        .into_response();
+    set_etag_header(&mut response, revision);
+    response
+}
+
 fn ensure_authorized(state: &AppState, headers: &HeaderMap) -> Option<axum::response::Response> {
     let Some(expected) = state.auth_token.as_ref() else {
         return None;
@@ -4257,6 +4350,7 @@ mod tests {
     };
     use crate::executor::{Executor, HitlHandler, HitlRequest};
     use crate::workflow::{Stage, Workflow};
+    use axum::http::header::{IF_MATCH, IF_NONE_MATCH};
     use axum::http::{HeaderMap, HeaderValue};
     use std::collections::{HashMap, HashSet};
     use std::sync::Arc;
@@ -5145,6 +5239,35 @@ mod tests {
             HeaderValue::from_static("Bearer wrong-token"),
         );
         assert!(!is_authorized(&wrong, "secret-token"));
+    }
+
+    #[test]
+    fn etag_matching_handles_quotes_weak_tags_and_lists() {
+        assert!(super::etag_header_matches_value("\"abc\"", "abc"));
+        assert!(super::etag_header_matches_value("W/\"abc\"", "abc"));
+        assert!(super::etag_header_matches_value(
+            "\"x\", \"abc\", \"y\"",
+            "abc"
+        ));
+        assert!(super::etag_header_matches_value("*", "abc"));
+        assert!(!super::etag_header_matches_value("\"def\"", "abc"));
+        assert!(!super::etag_header_matches_value("abc", "abc"));
+    }
+
+    #[test]
+    fn if_match_and_if_none_match_helpers_follow_revision() {
+        let mut headers = HeaderMap::new();
+        headers.insert(IF_NONE_MATCH, HeaderValue::from_static("\"rev-1\""));
+        assert!(super::if_none_match_matches(&headers, "rev-1"));
+        assert!(!super::if_none_match_matches(&headers, "rev-2"));
+
+        headers.clear();
+        headers.insert(IF_MATCH, HeaderValue::from_static("\"rev-1\""));
+        assert!(super::if_match_allows(&headers, "rev-1"));
+        assert!(!super::if_match_allows(&headers, "rev-2"));
+
+        headers.clear();
+        assert!(super::if_match_allows(&headers, "any"));
     }
 
     #[test]

@@ -254,17 +254,37 @@ fn tool_specs() -> Vec<Value> {
         json!({
             "name": "policy",
             "description": "Get daemon policy and capability configuration summary",
-            "inputSchema": { "type": "object", "additionalProperties": false }
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "if_match": { "type": "string" },
+                    "if_none_match": { "type": "string" }
+                },
+                "additionalProperties": false
+            }
         }),
         json!({
             "name": "policy_revision",
             "description": "Get daemon policy revision/hash and optional signature",
-            "inputSchema": { "type": "object", "additionalProperties": false }
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "if_none_match": { "type": "string" }
+                },
+                "additionalProperties": false
+            }
         }),
         json!({
             "name": "policy_snapshot",
             "description": "Get daemon effective policy snapshot",
-            "inputSchema": { "type": "object", "additionalProperties": false }
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "if_match": { "type": "string" },
+                    "if_none_match": { "type": "string" }
+                },
+                "additionalProperties": false
+            }
         }),
         json!({
             "name": "list_llm_adapters",
@@ -552,25 +572,42 @@ async fn handle_tools_call(client: &Client, config: &McpConfig, params: &Value) 
             Ok(body)
         }
         "policy" => {
-            let body = send(authed(
-                client.get(format!("{}/policy", daemon)),
-                &config.daemon_token,
+            let if_match = arg_string(&args, "if_match")?;
+            let if_none_match = arg_string(&args, "if_none_match")?;
+            let body = send(with_optional_etag_preconditions(
+                authed(
+                    client.get(format!("{}/policy", daemon)),
+                    &config.daemon_token,
+                ),
+                if_match.as_deref(),
+                if_none_match.as_deref(),
             ))
             .await?;
             Ok(body)
         }
         "policy_revision" => {
-            let body = send(authed(
-                client.get(format!("{}/policy/revision", daemon)),
-                &config.daemon_token,
+            let if_none_match = arg_string(&args, "if_none_match")?;
+            let body = send(with_optional_etag_preconditions(
+                authed(
+                    client.get(format!("{}/policy/revision", daemon)),
+                    &config.daemon_token,
+                ),
+                None,
+                if_none_match.as_deref(),
             ))
             .await?;
             Ok(body)
         }
         "policy_snapshot" => {
-            let body = send(authed(
-                client.get(format!("{}/policy/snapshot", daemon)),
-                &config.daemon_token,
+            let if_match = arg_string(&args, "if_match")?;
+            let if_none_match = arg_string(&args, "if_none_match")?;
+            let body = send(with_optional_etag_preconditions(
+                authed(
+                    client.get(format!("{}/policy/snapshot", daemon)),
+                    &config.daemon_token,
+                ),
+                if_match.as_deref(),
+                if_none_match.as_deref(),
             ))
             .await?;
             Ok(body)
@@ -765,6 +802,21 @@ fn with_optional_caller(
     }
 }
 
+fn with_optional_etag_preconditions(
+    builder: reqwest::RequestBuilder,
+    if_match: Option<&str>,
+    if_none_match: Option<&str>,
+) -> reqwest::RequestBuilder {
+    let mut req = builder;
+    if let Some(value) = if_match.map(str::trim).filter(|v| !v.is_empty()) {
+        req = req.header("if-match", value);
+    }
+    if let Some(value) = if_none_match.map(str::trim).filter(|v| !v.is_empty()) {
+        req = req.header("if-none-match", value);
+    }
+    req
+}
+
 async fn send(builder: reqwest::RequestBuilder) -> Result<String> {
     let response = builder.send().await.context("daemon request failed")?;
     let status = response.status();
@@ -772,6 +824,13 @@ async fn send(builder: reqwest::RequestBuilder) -> Result<String> {
         .text()
         .await
         .context("failed reading daemon response body")?;
+    if status == reqwest::StatusCode::NOT_MODIFIED {
+        let payload = json!({
+            "status": "not_modified",
+            "status_code": status.as_u16(),
+        });
+        return Ok(serde_json::to_string_pretty(&payload)?);
+    }
     if status.is_success() {
         if let Ok(v) = serde_json::from_str::<Value>(&body) {
             return Ok(serde_json::to_string_pretty(&v)?);

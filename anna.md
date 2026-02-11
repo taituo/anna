@@ -416,6 +416,10 @@ curl localhost:8080/policy
 curl localhost:8080/policy/revision
 curl localhost:8080/policy/snapshot
 
+# Conditional policy fetch using revision ETag
+curl -H 'If-None-Match: "REVISION_HASH"' localhost:8080/policy/revision
+curl -H 'If-Match: "REVISION_HASH"' localhost:8080/policy/snapshot
+
 # List workflows
 curl localhost:8080/workflows
 
