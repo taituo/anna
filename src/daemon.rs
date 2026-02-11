@@ -238,6 +238,25 @@ struct ChatRunResponse {
     status: String,
 }
 
+#[derive(Debug, Serialize)]
+struct ChatIntentCheckResponse {
+    intent: String,
+    workflow: String,
+    can_run: bool,
+    running: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_concurrency: Option<u32>,
+    concurrency_blocked: bool,
+    owner_running: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    owner_max_concurrency: Option<u32>,
+    owner_concurrency_blocked: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    missing_capabilities: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    missing_providers: Vec<String>,
+}
+
 #[derive(Debug, Deserialize)]
 struct WsQuery {
     id: String,
@@ -504,6 +523,7 @@ pub async fn run_daemon(bind: &str, plays_dir: PathBuf) -> Result<()> {
         .route("/workflow/{name}/check", get(check_registered_workflow))
         .route("/workflow/{name}/run", post(run_registered_workflow))
         .route("/chat/intents", get(list_chat_intents))
+        .route("/chat/{intent}/check", get(check_chat_intent))
         .route("/chat/run", post(run_chat_intent))
         .route("/workflow/{id}", get(workflow_status).delete(stop_workflow))
         .route("/workflow/{id}/logs", get(workflow_logs))
@@ -971,6 +991,88 @@ async fn list_chat_intents(State(state): State<AppState>, headers: HeaderMap) ->
         .into_response()
 }
 
+async fn check_chat_intent(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(intent): Path<String>,
+) -> impl IntoResponse {
+    if let Some(resp) = ensure_authorized(&state, &headers) {
+        return resp;
+    }
+    if state.chat_intents.is_empty() {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "chat gateway disabled: set ANNA_CHAT_INTENTS or ANNA_CHAT_INTENTS_FILE",
+        )
+            .into_response();
+    }
+
+    let normalized_intent = intent.trim().to_ascii_lowercase();
+    let Some(target_workflow) = state.chat_intents.get(&normalized_intent) else {
+        return (
+            StatusCode::NOT_FOUND,
+            format!("chat intent '{}' is not configured", intent),
+        )
+            .into_response();
+    };
+
+    let entry = match resolve_registered_workflow_entry_with_registry(
+        &state.plays_dir,
+        state.registry_file.as_deref(),
+        target_workflow,
+    )
+    .await
+    {
+        Ok(Some(v)) => v,
+        Ok(None) => {
+            return (
+                StatusCode::NOT_FOUND,
+                format!(
+                    "chat intent '{}' maps to missing workflow '{}'",
+                    intent, target_workflow
+                ),
+            )
+                .into_response();
+        }
+        Err(err) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("failed resolving chat intent workflow: {}", err),
+            )
+                .into_response();
+        }
+    };
+
+    let (running, owner_running) = running_counts_for_entry(&state, &entry).await;
+    let owner_max_concurrency = owner_limit_for(entry.owner.as_deref(), &state.owner_policy);
+    let readiness = evaluate_flow_readiness(
+        &entry,
+        &state.node_capabilities,
+        state.allowed_providers.as_ref(),
+        running,
+        None,
+        owner_running,
+        owner_max_concurrency,
+    );
+    (
+        StatusCode::OK,
+        Json(ChatIntentCheckResponse {
+            intent: normalized_intent,
+            workflow: entry.workflow_name,
+            can_run: readiness.can_run(),
+            running: readiness.running,
+            max_concurrency: readiness.max_concurrency.map(|v| v as u32),
+            concurrency_blocked: readiness.concurrency_blocked,
+            owner_running: readiness.owner_running,
+            owner_max_concurrency: readiness.owner_max_concurrency.map(|v| v as u32),
+            owner_concurrency_blocked: readiness.owner_concurrency_blocked,
+            missing_capabilities: readiness.missing_capabilities,
+            missing_providers: readiness.missing_providers,
+        }),
+    )
+        .into_response()
+}
+
 async fn run_chat_intent(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -983,7 +1085,7 @@ async fn run_chat_intent(
     if state.chat_intents.is_empty() {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
-            "chat gateway disabled: set ANNA_CHAT_INTENTS",
+            "chat gateway disabled: set ANNA_CHAT_INTENTS or ANNA_CHAT_INTENTS_FILE",
         )
             .into_response();
     }

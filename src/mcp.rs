@@ -189,6 +189,18 @@ fn tool_specs() -> Vec<Value> {
             }
         }),
         json!({
+            "name": "can_run_chat_intent",
+            "description": "Check whether a chat intent can run now based on policy/capacity",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "intent": { "type": "string" }
+                },
+                "required": ["intent"],
+                "additionalProperties": false
+            }
+        }),
+        json!({
             "name": "session_status",
             "description": "Get workflow session status by request id",
             "inputSchema": {
@@ -447,6 +459,15 @@ async fn handle_tools_call(client: &Client, config: &McpConfig, params: &Value) 
                 )
                 .body(workflow_yaml),
             )
+            .await?;
+            Ok(body)
+        }
+        "can_run_chat_intent" => {
+            let intent = arg_required_string(&args, "intent")?;
+            let body = send(authed(
+                client.get(format!("{}/chat/{}/check", daemon, intent)),
+                &config.daemon_token,
+            ))
             .await?;
             Ok(body)
         }
@@ -772,6 +793,7 @@ mod tests {
         assert!(names.contains(&"run_flow"));
         assert!(names.contains(&"can_run_flow"));
         assert!(names.contains(&"can_run_flow_yaml"));
+        assert!(names.contains(&"can_run_chat_intent"));
         assert!(names.contains(&"session_status"));
         assert!(names.contains(&"tail_logs"));
         assert!(names.contains(&"stop_flow"));

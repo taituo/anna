@@ -429,6 +429,9 @@ curl -X POST localhost:8080/hook/deploy
 # List chat intents
 curl localhost:8080/chat/intents
 
+# Check chat intent readiness
+curl localhost:8080/chat/deploy/check
+
 # Run intent through chat gateway
 curl -X POST localhost:8080/chat/run \
   -H "content-type: application/json" \
@@ -453,9 +456,9 @@ When both are set, `ANNA_CHAT_INTENTS` overrides matching keys from `ANNA_CHAT_I
 
 Flows can be accessed via multiple interfaces while keeping one execution contract:
 
-- CLI (`anna run`, `anna submit`, `anna status`, `anna logs`, `anna chat-intents`, `anna chat`)
+- CLI (`anna run`, `anna submit`, `anna status`, `anna logs`, `anna can-chat`, `anna chat-intents`, `anna chat`)
 - HTTP control API (run, status, stop, hook, chat intent routing, log streaming)
-- MCP server tools (`list_flows`, `run_flow`, `session_status`, `tail_logs`, `stop_flow`, `list_chat_intents`, `run_chat_intent`)
+- MCP server tools (`list_flows`, `run_flow`, `session_status`, `tail_logs`, `stop_flow`, `can_run_chat_intent`, `list_chat_intents`, `run_chat_intent`)
 - Chat gateways (intent -> approved flow run via control API)
 
 For production governance, use a flow registry keyed by `flow_id` + `path` + `tags` + required capabilities.

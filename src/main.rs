@@ -117,6 +117,14 @@ enum Commands {
         #[arg(long, default_value = "http://127.0.0.1:8080")]
         daemon: String,
     },
+    /// Check whether a chat intent can run now
+    CanChat {
+        /// Chat intent name
+        intent: String,
+        /// Daemon base URL
+        #[arg(long, default_value = "http://127.0.0.1:8080")]
+        daemon: String,
+    },
     /// Check whether a workflow YAML file can run under current daemon policy
     CanRunYaml {
         /// Path to .anna workflow file
@@ -463,6 +471,18 @@ async fn main() -> Result<()> {
                     .await
                     .with_context(|| {
                         format!("failed checking workflow '{}' at {}", name, daemon)
+                    })?;
+            print_response(response).await
+        }
+        Commands::CanChat { intent, daemon } => {
+            let daemon = normalize_daemon_url(&daemon);
+            let client = Client::new();
+            let response =
+                with_daemon_auth(client.get(format!("{}/chat/{}/check", daemon, intent)))
+                    .send()
+                    .await
+                    .with_context(|| {
+                        format!("failed checking chat intent '{}' at {}", intent, daemon)
                     })?;
             print_response(response).await
         }
