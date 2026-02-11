@@ -349,6 +349,20 @@ struct FlowRegistryEntry {
     max_concurrency: Option<u32>,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+enum ChatIntentDoc {
+    Wrapped { intents: Vec<ChatIntentEntry> },
+    List(Vec<ChatIntentEntry>),
+    Map(HashMap<String, String>),
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct ChatIntentEntry {
+    intent: String,
+    workflow: String,
+}
+
 #[derive(Debug, Clone, Copy)]
 struct RetentionConfig {
     max_sessions: usize,
@@ -1822,10 +1836,21 @@ fn daemon_node_capabilities() -> HashSet<String> {
 }
 
 fn daemon_chat_intents() -> HashMap<String, String> {
-    let Ok(raw) = std::env::var("ANNA_CHAT_INTENTS") else {
-        return HashMap::new();
-    };
-    parse_chat_intents_value(&raw)
+    let mut out = HashMap::new();
+
+    if let Some(path) = chat_intents_file() {
+        match load_chat_intents_file(&path) {
+            Ok(file_intents) => out.extend(file_intents),
+            Err(err) => eprintln!("anna-rs daemon: failed loading chat intents file: {}", err),
+        }
+    }
+
+    if let Ok(raw) = std::env::var("ANNA_CHAT_INTENTS") {
+        // Explicit env mapping overrides file entries when keys collide.
+        out.extend(parse_chat_intents_value(&raw));
+    }
+
+    out
 }
 
 fn parse_chat_intents_value(raw: &str) -> HashMap<String, String> {
@@ -1842,18 +1867,84 @@ fn parse_chat_intents_value(raw: &str) -> HashMap<String, String> {
             );
             continue;
         };
-        let intent = intent_raw.trim().to_ascii_lowercase();
-        let workflow = workflow_raw.trim().to_string();
-        if intent.is_empty() || workflow.is_empty() {
-            eprintln!(
-                "anna-rs daemon: ignoring invalid ANNA_CHAT_INTENTS entry '{}'",
-                trimmed
-            );
-            continue;
-        }
-        out.insert(intent, workflow);
+        insert_chat_intent_entry(
+            &mut out,
+            intent_raw,
+            workflow_raw,
+            "ANNA_CHAT_INTENTS",
+            trimmed,
+        );
     }
     out
+}
+
+fn chat_intents_file() -> Option<PathBuf> {
+    let Ok(raw) = std::env::var("ANNA_CHAT_INTENTS_FILE") else {
+        return None;
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty()
+        || trimmed.eq_ignore_ascii_case("off")
+        || trimmed.eq_ignore_ascii_case("false")
+    {
+        return None;
+    }
+    Some(PathBuf::from(trimmed))
+}
+
+fn load_chat_intents_file(path: &FsPath) -> Result<HashMap<String, String>> {
+    let raw = std::fs::read_to_string(path)
+        .with_context(|| format!("failed reading '{}'", path.display()))?;
+    parse_chat_intents_doc(&raw, &path.display().to_string())
+}
+
+fn parse_chat_intents_doc(raw: &str, source: &str) -> Result<HashMap<String, String>> {
+    let parsed: ChatIntentDoc = serde_yaml::from_str(raw)
+        .with_context(|| format!("failed parsing chat intents from '{}'", source))?;
+    let mut out = HashMap::new();
+    match parsed {
+        ChatIntentDoc::Wrapped { intents } | ChatIntentDoc::List(intents) => {
+            for item in intents {
+                let raw_entry = format!("intent='{}' workflow='{}'", item.intent, item.workflow);
+                insert_chat_intent_entry(
+                    &mut out,
+                    &item.intent,
+                    &item.workflow,
+                    source,
+                    &raw_entry,
+                );
+            }
+        }
+        ChatIntentDoc::Map(map) => {
+            for (intent, workflow) in map {
+                let raw_entry = format!("{}={}", intent, workflow);
+                insert_chat_intent_entry(&mut out, &intent, &workflow, source, &raw_entry);
+            }
+        }
+    }
+    if out.is_empty() {
+        bail!("chat intents source '{}' has no valid entries", source);
+    }
+    Ok(out)
+}
+
+fn insert_chat_intent_entry(
+    out: &mut HashMap<String, String>,
+    intent_raw: &str,
+    workflow_raw: &str,
+    source: &str,
+    raw_entry: &str,
+) {
+    let intent = intent_raw.trim().to_ascii_lowercase();
+    let workflow = workflow_raw.trim().to_string();
+    if intent.is_empty() || workflow.is_empty() {
+        eprintln!(
+            "anna-rs daemon: ignoring invalid chat intent entry '{}' from {}",
+            raw_entry, source
+        );
+        return;
+    }
+    out.insert(intent, workflow);
 }
 
 fn daemon_owner_concurrency_policy() -> OwnerConcurrencyPolicy {
@@ -2822,10 +2913,10 @@ mod tests {
         WorkflowMetaResponse, collect_required_providers, collect_watch_snapshot,
         evaluate_flow_readiness, find_workflow_entries_with_registry, is_authorized,
         load_daemon_state, load_flow_registry, matches_workflow_meta_filters,
-        missing_required_capabilities, parse_chat_intents_value, parse_chat_run_request,
-        parse_run_registered_options, prune_hitl_in_place, prune_sessions_in_place,
-        resolve_registered_workflow_entry_with_registry, resolve_watch_pattern, status_matches,
-        temp_state_path,
+        missing_required_capabilities, parse_chat_intents_doc, parse_chat_intents_value,
+        parse_chat_run_request, parse_run_registered_options, prune_hitl_in_place,
+        prune_sessions_in_place, resolve_registered_workflow_entry_with_registry,
+        resolve_watch_pattern, status_matches, temp_state_path,
     };
     use crate::executor::{HitlHandler, HitlRequest};
     use crate::workflow::{Stage, Workflow};
@@ -3279,6 +3370,43 @@ mod tests {
                 ("ops".to_string(), "ops-flow".to_string()),
             ])
         );
+    }
+
+    #[test]
+    fn parse_chat_intents_doc_supports_map_wrapped_and_list() {
+        let map = parse_chat_intents_doc(
+            "deploy: prod-deploy\ntriage: incident-triage\n",
+            "inline-map",
+        )
+        .expect("map format should parse");
+        assert_eq!(
+            map,
+            std::collections::HashMap::from([
+                ("deploy".to_string(), "prod-deploy".to_string()),
+                ("triage".to_string(), "incident-triage".to_string()),
+            ])
+        );
+
+        let wrapped = parse_chat_intents_doc(
+            "intents:\n  - intent: deploy\n    workflow: prod-deploy\n  - intent: triage\n    workflow: incident-triage\n",
+            "inline-wrapped",
+        )
+        .expect("wrapped format should parse");
+        assert_eq!(wrapped, map);
+
+        let list = parse_chat_intents_doc(
+            "- intent: deploy\n  workflow: prod-deploy\n- intent: triage\n  workflow: incident-triage\n",
+            "inline-list",
+        )
+        .expect("list format should parse");
+        assert_eq!(list, map);
+    }
+
+    #[test]
+    fn parse_chat_intents_doc_rejects_empty_result() {
+        let err = parse_chat_intents_doc("intents: []\n", "inline-empty")
+            .expect_err("empty intent list should fail");
+        assert!(err.to_string().contains("has no valid entries"));
     }
 
     #[test]

@@ -101,6 +101,18 @@ Optional chat gateway intent map (intent -> registered workflow id/name):
 
 ```bash
 ANNA_CHAT_INTENTS="deploy=prod-deploy,triage=incident-triage" anna daemon --plays-dir .
+
+# file-based mapping (YAML map or list)
+ANNA_CHAT_INTENTS_FILE=./chat.intents.yml anna daemon --plays-dir .
+```
+
+`ANNA_CHAT_INTENTS` overrides keys from `ANNA_CHAT_INTENTS_FILE` when both are set.
+
+`chat.intents.yml` example:
+
+```yaml
+deploy: prod-deploy
+triage: incident-triage
 ```
 
 Optional node capability ceiling (used against `required_capabilities`):

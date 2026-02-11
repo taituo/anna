@@ -442,7 +442,12 @@ Chat gateway mapping is configured on daemon with:
 
 ```bash
 ANNA_CHAT_INTENTS="deploy=prod-deploy,triage=incident-triage" anna daemon
+
+# or from YAML file
+ANNA_CHAT_INTENTS_FILE=./chat.intents.yml anna daemon
 ```
+
+When both are set, `ANNA_CHAT_INTENTS` overrides matching keys from `ANNA_CHAT_INTENTS_FILE`.
 
 ## Control and Access Layers
 
