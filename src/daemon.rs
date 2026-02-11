@@ -196,6 +196,17 @@ struct FlowCheckResponse {
     missing_providers: Vec<String>,
 }
 
+#[derive(Debug, Serialize)]
+struct RawFlowCheckResponse {
+    workflow: String,
+    can_run: bool,
+    provider_restriction_enabled: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    required_providers: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    missing_providers: Vec<String>,
+}
+
 #[derive(Debug, Deserialize)]
 struct WsQuery {
     id: String,
@@ -434,6 +445,7 @@ pub async fn run_daemon(bind: &str, plays_dir: PathBuf) -> Result<()> {
         .route("/workflows", get(list_workflows))
         .route("/workflows/meta", get(list_workflows_meta))
         .route("/workflow", post(start_workflow))
+        .route("/workflow/check", post(check_workflow_body))
         .route("/workflow/{name}/check", get(check_registered_workflow))
         .route("/workflow/{name}/run", post(run_registered_workflow))
         .route("/workflow/{id}", get(workflow_status).delete(stop_workflow))
@@ -770,6 +782,63 @@ async fn start_workflow(
         Json(StartWorkflowResponse {
             id: req_id,
             status: "running".to_string(),
+        }),
+    )
+        .into_response()
+}
+
+async fn check_workflow_body(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: String,
+) -> impl IntoResponse {
+    if let Some(resp) = ensure_authorized(&state, &headers) {
+        return resp;
+    }
+
+    let workflow: Workflow = match serde_yaml::from_str(&body) {
+        Ok(v) => v,
+        Err(err) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                format!("invalid workflow yaml: {}", err),
+            )
+                .into_response();
+        }
+    };
+    if let Err(err) = workflow.validate() {
+        return (
+            StatusCode::BAD_REQUEST,
+            format!("workflow validation failed: {}", err),
+        )
+            .into_response();
+    }
+
+    let mut required_providers = collect_required_providers(&workflow);
+    let mut missing_providers = state
+        .allowed_providers
+        .as_ref()
+        .map(|allowed| {
+            required_providers
+                .iter()
+                .filter(|provider| !allowed.contains(*provider))
+                .cloned()
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    required_providers.sort();
+    required_providers.dedup();
+    missing_providers.sort();
+    missing_providers.dedup();
+
+    (
+        StatusCode::OK,
+        Json(RawFlowCheckResponse {
+            workflow: workflow.name,
+            can_run: missing_providers.is_empty(),
+            provider_restriction_enabled: state.allowed_providers.is_some(),
+            required_providers,
+            missing_providers,
         }),
     )
         .into_response()

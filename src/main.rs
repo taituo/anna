@@ -117,6 +117,14 @@ enum Commands {
         #[arg(long, default_value = "http://127.0.0.1:8080")]
         daemon: String,
     },
+    /// Check whether a workflow YAML file can run under current daemon policy
+    CanRunYaml {
+        /// Path to .anna workflow file
+        workflow: PathBuf,
+        /// Daemon base URL
+        #[arg(long, default_value = "http://127.0.0.1:8080")]
+        daemon: String,
+    },
     /// Check daemon workflow status by request id
     Status {
         /// Request id
@@ -436,6 +444,27 @@ async fn main() -> Result<()> {
                     .with_context(|| {
                         format!("failed checking workflow '{}' at {}", name, daemon)
                     })?;
+            print_response(response).await
+        }
+        Commands::CanRunYaml { workflow, daemon } => {
+            let daemon = normalize_daemon_url(&daemon);
+            let body = tokio::fs::read_to_string(&workflow)
+                .await
+                .with_context(|| {
+                    format!("failed reading workflow file '{}'", workflow.display())
+                })?;
+            let client = Client::new();
+            let response = with_daemon_auth(client.post(format!("{}/workflow/check", daemon)))
+                .body(body)
+                .send()
+                .await
+                .with_context(|| {
+                    format!(
+                        "failed checking workflow yaml '{}' at {}",
+                        workflow.display(),
+                        daemon
+                    )
+                })?;
             print_response(response).await
         }
         Commands::Status { id, daemon } => {

@@ -177,6 +177,18 @@ fn tool_specs() -> Vec<Value> {
             }
         }),
         json!({
+            "name": "can_run_flow_yaml",
+            "description": "Check whether raw workflow YAML can run under daemon policy",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "workflow_yaml": { "type": "string" }
+                },
+                "required": ["workflow_yaml"],
+                "additionalProperties": false
+            }
+        }),
+        json!({
             "name": "session_status",
             "description": "Get workflow session status by request id",
             "inputSchema": {
@@ -401,6 +413,18 @@ async fn handle_tools_call(client: &Client, config: &McpConfig, params: &Value) 
                 client.get(format!("{}/workflow/{}/check", daemon, name)),
                 &config.daemon_token,
             ))
+            .await?;
+            Ok(body)
+        }
+        "can_run_flow_yaml" => {
+            let workflow_yaml = arg_required_string(&args, "workflow_yaml")?;
+            let body = send(
+                authed(
+                    client.post(format!("{}/workflow/check", daemon)),
+                    &config.daemon_token,
+                )
+                .body(workflow_yaml),
+            )
             .await?;
             Ok(body)
         }
@@ -699,6 +723,7 @@ mod tests {
         assert!(names.contains(&"list_flows_meta"));
         assert!(names.contains(&"run_flow"));
         assert!(names.contains(&"can_run_flow"));
+        assert!(names.contains(&"can_run_flow_yaml"));
         assert!(names.contains(&"session_status"));
         assert!(names.contains(&"tail_logs"));
         assert!(names.contains(&"stop_flow"));
