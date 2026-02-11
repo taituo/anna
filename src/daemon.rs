@@ -31,6 +31,8 @@ struct AppState {
     plays_dir: PathBuf,
     registry_file: Option<PathBuf>,
     chat_intents: Arc<RwLock<HashMap<String, ChatIntentConfig>>>,
+    trigger_lease: Option<TriggerLeaseConfig>,
+    trigger_leader_state: Arc<RwLock<TriggerLeaderState>>,
     node_capabilities: HashSet<String>,
     allowed_providers: Option<HashSet<String>>,
     owner_policy: OwnerConcurrencyPolicy,
@@ -80,6 +82,15 @@ struct PolicyResponse {
     auth_enabled: bool,
     chat_gateway_enabled: bool,
     chat_intents_count: usize,
+    trigger_leader_election_enabled: bool,
+    trigger_scheduler_leader: bool,
+    trigger_scheduler_node_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    trigger_scheduler_holder: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    trigger_scheduler_expires_at: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    trigger_lease_file: Option<String>,
     node_capabilities: Vec<String>,
     provider_restriction_enabled: bool,
     allowed_providers: Vec<String>,
@@ -438,6 +449,29 @@ struct ChatIntentGuardrailOutcome {
     effective_max_iterations: Option<u32>,
 }
 
+#[derive(Debug, Clone)]
+struct TriggerLeaseConfig {
+    node_id: String,
+    lease_file: PathBuf,
+    ttl_sec: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct TriggerLeaseFile {
+    holder: String,
+    expires_at: u64,
+}
+
+#[derive(Debug, Clone)]
+struct TriggerLeaderState {
+    enabled: bool,
+    is_leader: bool,
+    node_id: String,
+    holder: Option<String>,
+    expires_at: Option<u64>,
+    lease_file: Option<String>,
+}
+
 #[derive(Debug, Clone, Copy)]
 struct RetentionConfig {
     max_sessions: usize,
@@ -495,6 +529,8 @@ impl HitlHandler for DaemonHitl {
 pub async fn run_daemon(bind: &str, plays_dir: PathBuf) -> Result<()> {
     let state_file = daemon_state_file();
     let registry_file = flow_registry_file();
+    let node_id = daemon_node_id();
+    let trigger_lease = trigger_lease_config(&node_id);
     let chat_intents = daemon_chat_intents();
     let chat_reload_interval = chat_intents_reload_interval();
     let retention = daemon_retention_config();
@@ -512,11 +548,17 @@ pub async fn run_daemon(bind: &str, plays_dir: PathBuf) -> Result<()> {
     }));
     let allowed_providers = executor.allowed_providers_set();
     let chat_intents_state = Arc::new(RwLock::new(chat_intents.clone()));
+    let trigger_leader_state = Arc::new(RwLock::new(initial_trigger_leader_state(
+        &node_id,
+        trigger_lease.as_ref(),
+    )));
     let state = AppState {
         executor,
         plays_dir,
         registry_file: registry_file.clone(),
         chat_intents: chat_intents_state,
+        trigger_lease: trigger_lease.clone(),
+        trigger_leader_state,
         node_capabilities: node_capabilities.clone(),
         allowed_providers: allowed_providers.clone(),
         owner_policy: owner_policy.clone(),
@@ -544,6 +586,19 @@ pub async fn run_daemon(bind: &str, plays_dir: PathBuf) -> Result<()> {
             .collect::<Vec<_>>();
         routes.sort();
         println!("anna-rs chat intents: {}", routes.join(","));
+    }
+    match trigger_lease.as_ref() {
+        Some(lease) => {
+            println!(
+                "anna-rs trigger lease: file={} ttl={}s node_id={}",
+                lease.lease_file.display(),
+                lease.ttl_sec,
+                lease.node_id
+            );
+        }
+        None => {
+            println!("anna-rs trigger lease: disabled node_id={}", node_id);
+        }
     }
     if chat_intents_file().is_some() {
         if let Some(interval) = chat_reload_interval {
@@ -637,12 +692,19 @@ async fn policy(State(state): State<AppState>, headers: HeaderMap) -> impl IntoR
     owner_limits.sort_by(|a, b| a.owner.cmp(&b.owner));
 
     let chat_intents_count = state.chat_intents.read().await.len();
+    let trigger_leader_state = state.trigger_leader_state.read().await.clone();
 
     Json(PolicyResponse {
         registry_enabled: state.registry_file.is_some(),
         auth_enabled: state.auth_token.is_some(),
         chat_gateway_enabled: chat_intents_count > 0,
         chat_intents_count,
+        trigger_leader_election_enabled: trigger_leader_state.enabled,
+        trigger_scheduler_leader: trigger_leader_state.is_leader,
+        trigger_scheduler_node_id: trigger_leader_state.node_id,
+        trigger_scheduler_holder: trigger_leader_state.holder,
+        trigger_scheduler_expires_at: trigger_leader_state.expires_at,
+        trigger_lease_file: trigger_leader_state.lease_file,
         node_capabilities,
         provider_restriction_enabled: state.allowed_providers.is_some(),
         allowed_providers,
@@ -1555,6 +1617,11 @@ async fn ws_logs(
 async fn trigger_scheduler_loop(state: AppState) {
     let mut scheduler = TriggerScheduler::default();
     loop {
+        if !scheduler_should_run(&state).await {
+            sleep(Duration::from_secs(1)).await;
+            continue;
+        }
+
         let entries = match find_workflow_entries_with_registry(
             &state.plays_dir,
             state.registry_file.as_deref(),
@@ -1574,6 +1641,127 @@ async fn trigger_scheduler_loop(state: AppState) {
         run_watch_triggers(&state, &entries, &mut scheduler).await;
         sleep(Duration::from_secs(1)).await;
     }
+}
+
+async fn scheduler_should_run(state: &AppState) -> bool {
+    let Some(config) = state.trigger_lease.as_ref() else {
+        let mut current = state.trigger_leader_state.write().await;
+        current.enabled = false;
+        current.is_leader = true;
+        current.holder = Some(current.node_id.clone());
+        current.expires_at = None;
+        current.lease_file = None;
+        return true;
+    };
+
+    let snapshot = match resolve_trigger_leadership(config).await {
+        Ok(v) => v,
+        Err(err) => {
+            eprintln!(
+                "anna-rs scheduler: trigger lease refresh failed for '{}': {}",
+                config.lease_file.display(),
+                err
+            );
+            TriggerLeaderState {
+                enabled: true,
+                is_leader: false,
+                node_id: config.node_id.clone(),
+                holder: None,
+                expires_at: None,
+                lease_file: Some(config.lease_file.display().to_string()),
+            }
+        }
+    };
+
+    let is_leader = snapshot.is_leader;
+    *state.trigger_leader_state.write().await = snapshot;
+    is_leader
+}
+
+async fn resolve_trigger_leadership(config: &TriggerLeaseConfig) -> Result<TriggerLeaderState> {
+    let now = now_unix_secs();
+    if let Some(current) = read_trigger_lease_file(&config.lease_file).await?
+        && current.holder != config.node_id
+        && current.expires_at > now
+    {
+        return Ok(TriggerLeaderState {
+            enabled: true,
+            is_leader: false,
+            node_id: config.node_id.clone(),
+            holder: Some(current.holder),
+            expires_at: Some(current.expires_at),
+            lease_file: Some(config.lease_file.display().to_string()),
+        });
+    }
+
+    let candidate = TriggerLeaseFile {
+        holder: config.node_id.clone(),
+        expires_at: now.saturating_add(config.ttl_sec),
+    };
+    write_trigger_lease_file(&config.lease_file, &candidate).await?;
+
+    let observed = read_trigger_lease_file(&config.lease_file).await?;
+    let is_leader = observed
+        .as_ref()
+        .map(|lease| lease.holder == config.node_id && lease.expires_at > now)
+        .unwrap_or(false);
+    Ok(TriggerLeaderState {
+        enabled: true,
+        is_leader,
+        node_id: config.node_id.clone(),
+        holder: observed.as_ref().map(|lease| lease.holder.clone()),
+        expires_at: observed.as_ref().map(|lease| lease.expires_at),
+        lease_file: Some(config.lease_file.display().to_string()),
+    })
+}
+
+async fn read_trigger_lease_file(path: &FsPath) -> Result<Option<TriggerLeaseFile>> {
+    match tokio::fs::read_to_string(path).await {
+        Ok(raw) => match serde_json::from_str::<TriggerLeaseFile>(&raw) {
+            Ok(v) => Ok(Some(v)),
+            Err(err) => {
+                eprintln!(
+                    "anna-rs scheduler: ignoring invalid trigger lease file '{}': {}",
+                    path.display(),
+                    err
+                );
+                Ok(None)
+            }
+        },
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(err)
+            .with_context(|| format!("failed reading trigger lease file '{}'", path.display())),
+    }
+}
+
+async fn write_trigger_lease_file(path: &FsPath, lease: &TriggerLeaseFile) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        tokio::fs::create_dir_all(parent).await.with_context(|| {
+            format!(
+                "failed creating trigger lease parent directory '{}'",
+                parent.display()
+            )
+        })?;
+    }
+
+    let tmp_name = format!(
+        "{}.{}.tmp",
+        path.file_name().and_then(|v| v.to_str()).unwrap_or("lease"),
+        crate::session::gen_session_id()
+    );
+    let tmp_path = path.with_file_name(tmp_name);
+    let raw = serde_json::to_string(lease)?;
+    tokio::fs::write(&tmp_path, raw)
+        .await
+        .with_context(|| format!("failed writing trigger lease temp '{}'", tmp_path.display()))?;
+    tokio::fs::rename(&tmp_path, path).await.with_context(|| {
+        format!(
+            "failed moving trigger lease '{}' -> '{}'",
+            tmp_path.display(),
+            path.display()
+        )
+    })?;
+    Ok(())
 }
 
 async fn run_interval_triggers(
@@ -2017,6 +2205,71 @@ fn daemon_auth_token() -> Option<String> {
         .ok()
         .map(|v| v.trim().to_string())
         .filter(|v| !v.is_empty())
+}
+
+fn daemon_node_id() -> String {
+    if let Ok(raw) = std::env::var("ANNA_DAEMON_NODE_ID") {
+        let trimmed = raw.trim();
+        if !trimmed.is_empty() {
+            return trimmed.to_string();
+        }
+    }
+
+    let host = std::env::var("HOSTNAME")
+        .ok()
+        .or_else(|| std::env::var("COMPUTERNAME").ok())
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| "node".to_string());
+    format!("{}-{}", host, std::process::id())
+}
+
+fn trigger_lease_config(node_id: &str) -> Option<TriggerLeaseConfig> {
+    let Ok(raw) = std::env::var("ANNA_TRIGGER_LEASE_FILE") else {
+        return None;
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty()
+        || trimmed.eq_ignore_ascii_case("off")
+        || trimmed.eq_ignore_ascii_case("false")
+    {
+        return None;
+    }
+
+    let ttl_sec = std::env::var("ANNA_TRIGGER_LEASE_TTL_SEC")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|v| *v >= 2)
+        .unwrap_or(15);
+    Some(TriggerLeaseConfig {
+        node_id: node_id.to_string(),
+        lease_file: PathBuf::from(trimmed),
+        ttl_sec,
+    })
+}
+
+fn initial_trigger_leader_state(
+    node_id: &str,
+    lease: Option<&TriggerLeaseConfig>,
+) -> TriggerLeaderState {
+    match lease {
+        Some(lease) => TriggerLeaderState {
+            enabled: true,
+            is_leader: false,
+            node_id: node_id.to_string(),
+            holder: None,
+            expires_at: None,
+            lease_file: Some(lease.lease_file.display().to_string()),
+        },
+        None => TriggerLeaderState {
+            enabled: false,
+            is_leader: true,
+            node_id: node_id.to_string(),
+            holder: Some(node_id.to_string()),
+            expires_at: None,
+            lease_file: None,
+        },
+    }
 }
 
 fn daemon_node_capabilities() -> HashSet<String> {
@@ -3285,15 +3538,15 @@ async fn launch_workflow(
 #[cfg(test)]
 mod tests {
     use super::{
-        ChatIntentConfig, DaemonHitl, DaemonStateSnapshot, HitlPending, SessionInfo, WorkflowEntry,
-        WorkflowMetaResponse, collect_required_providers, collect_watch_snapshot,
-        evaluate_chat_intent_guardrails, evaluate_flow_readiness,
+        ChatIntentConfig, DaemonHitl, DaemonStateSnapshot, HitlPending, SessionInfo,
+        TriggerLeaseConfig, WorkflowEntry, WorkflowMetaResponse, collect_required_providers,
+        collect_watch_snapshot, evaluate_chat_intent_guardrails, evaluate_flow_readiness,
         find_workflow_entries_with_registry, is_authorized, load_daemon_state, load_flow_registry,
         matches_workflow_meta_filters, missing_required_capabilities, parse_chat_intents_doc,
         parse_chat_intents_value, parse_chat_run_request, parse_run_registered_options,
         prune_hitl_in_place, prune_sessions_in_place,
-        resolve_registered_workflow_entry_with_registry, resolve_watch_pattern, status_matches,
-        temp_state_path,
+        resolve_registered_workflow_entry_with_registry, resolve_trigger_leadership,
+        resolve_watch_pattern, status_matches, temp_state_path,
     };
     use crate::executor::{HitlHandler, HitlRequest};
     use crate::workflow::{Stage, Workflow};
@@ -3803,6 +4056,51 @@ mod tests {
         let err = parse_chat_intents_doc("intents: []\n", "inline-empty")
             .expect_err("empty intent list should fail");
         assert!(err.to_string().contains("has no valid entries"));
+    }
+
+    #[tokio::test]
+    async fn resolve_trigger_leadership_renews_and_fails_over() {
+        let dir = std::env::temp_dir().join(format!(
+            "anna-trigger-lease-{}-{}",
+            std::process::id(),
+            rand::random::<u32>()
+        ));
+        tokio::fs::create_dir_all(&dir)
+            .await
+            .expect("create temp lease dir");
+        let lease_file = dir.join("trigger-lease.json");
+
+        let node_a = TriggerLeaseConfig {
+            node_id: "node-a".to_string(),
+            lease_file: lease_file.clone(),
+            ttl_sec: 10,
+        };
+        let node_b = TriggerLeaseConfig {
+            node_id: "node-b".to_string(),
+            lease_file: lease_file.clone(),
+            ttl_sec: 10,
+        };
+
+        let a = resolve_trigger_leadership(&node_a)
+            .await
+            .expect("node-a should acquire lease");
+        assert!(a.is_leader);
+        assert_eq!(a.holder.as_deref(), Some("node-a"));
+
+        let b = resolve_trigger_leadership(&node_b)
+            .await
+            .expect("node-b should observe active leader");
+        assert!(!b.is_leader);
+        assert_eq!(b.holder.as_deref(), Some("node-a"));
+
+        tokio::fs::write(&lease_file, r#"{"holder":"node-a","expires_at":1}"#)
+            .await
+            .expect("force expired lease");
+        let b_takeover = resolve_trigger_leadership(&node_b)
+            .await
+            .expect("node-b should take over expired lease");
+        assert!(b_takeover.is_leader);
+        assert_eq!(b_takeover.holder.as_deref(), Some("node-b"));
     }
 
     #[test]

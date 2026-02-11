@@ -112,6 +112,15 @@ ANNA_CHAT_INTENTS_FILE=./chat.intents.yml ANNA_CHAT_INTENTS_RELOAD_SEC=5 anna da
 
 `ANNA_CHAT_INTENTS` overrides keys from `ANNA_CHAT_INTENTS_FILE` when both are set.
 
+Optional trigger leader lease for multi-node daemon deployments (shared filesystem):
+
+```bash
+ANNA_DAEMON_NODE_ID=node-a \
+ANNA_TRIGGER_LEASE_FILE=/shared/anna-trigger-lease.json \
+ANNA_TRIGGER_LEASE_TTL_SEC=15 \
+anna daemon --plays-dir .
+```
+
 `chat.intents.yml` example:
 
 ```yaml
