@@ -30,7 +30,7 @@ struct AppState {
     executor: Executor,
     plays_dir: PathBuf,
     registry_file: Option<PathBuf>,
-    chat_intents: HashMap<String, String>,
+    chat_intents: HashMap<String, ChatIntentConfig>,
     node_capabilities: HashSet<String>,
     allowed_providers: Option<HashSet<String>>,
     owner_policy: OwnerConcurrencyPolicy,
@@ -220,6 +220,12 @@ struct ChatIntentsResponse {
 struct ChatIntentRoute {
     intent: String,
     workflow: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    allowed_owners: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    required_tags: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_iterations_cap: Option<u32>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -238,6 +244,8 @@ struct ChatRunResponse {
     workflow: String,
     id: String,
     status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    effective_max_iterations: Option<u32>,
 }
 
 #[derive(Debug, Serialize)]
@@ -245,7 +253,15 @@ struct ChatIntentCheckResponse {
     intent: String,
     workflow: String,
     can_run: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    guardrail_reasons: Vec<String>,
     running: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    requested_max_iterations: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    effective_max_iterations: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_iterations_cap: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     max_concurrency: Option<u32>,
     concurrency_blocked: bool,
@@ -257,6 +273,11 @@ struct ChatIntentCheckResponse {
     missing_capabilities: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     missing_providers: Vec<String>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct ChatIntentCheckQuery {
+    max_iterations: Option<u32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -375,13 +396,46 @@ struct FlowRegistryEntry {
 enum ChatIntentDoc {
     Wrapped { intents: Vec<ChatIntentEntry> },
     List(Vec<ChatIntentEntry>),
-    Map(HashMap<String, String>),
+    Map(HashMap<String, ChatIntentMapValue>),
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+enum ChatIntentMapValue {
+    Workflow(String),
+    Config(ChatIntentConfigDoc),
 }
 
 #[derive(Debug, Clone, Deserialize)]
 struct ChatIntentEntry {
     intent: String,
+    #[serde(flatten)]
+    config: ChatIntentConfigDoc,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct ChatIntentConfigDoc {
     workflow: String,
+    #[serde(default)]
+    allowed_owners: Vec<String>,
+    #[serde(default)]
+    required_tags: Vec<String>,
+    #[serde(default)]
+    max_iterations_cap: Option<u32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ChatIntentConfig {
+    workflow: String,
+    allowed_owners: Vec<String>,
+    required_tags: Vec<String>,
+    max_iterations_cap: Option<u32>,
+}
+
+#[derive(Debug, Clone)]
+struct ChatIntentGuardrailOutcome {
+    reasons: Vec<String>,
+    effective_max_iterations: Option<u32>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -484,7 +538,7 @@ pub async fn run_daemon(bind: &str, plays_dir: PathBuf) -> Result<()> {
     if !chat_intents.is_empty() {
         let mut routes = chat_intents
             .iter()
-            .map(|(intent, workflow)| format!("{}={}", intent, workflow))
+            .map(|(intent, rule)| format!("{}={}", intent, rule.workflow))
             .collect::<Vec<_>>();
         routes.sort();
         println!("anna-rs chat intents: {}", routes.join(","));
@@ -978,9 +1032,12 @@ async fn list_chat_intents(State(state): State<AppState>, headers: HeaderMap) ->
     let mut intents = state
         .chat_intents
         .iter()
-        .map(|(intent, workflow)| ChatIntentRoute {
+        .map(|(intent, rule)| ChatIntentRoute {
             intent: intent.clone(),
-            workflow: workflow.clone(),
+            workflow: rule.workflow.clone(),
+            allowed_owners: rule.allowed_owners.clone(),
+            required_tags: rule.required_tags.clone(),
+            max_iterations_cap: rule.max_iterations_cap,
         })
         .collect::<Vec<_>>();
     intents.sort_by(|a, b| a.intent.cmp(&b.intent));
@@ -999,6 +1056,7 @@ async fn check_chat_intent(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(intent): Path<String>,
+    Query(query): Query<ChatIntentCheckQuery>,
 ) -> impl IntoResponse {
     if let Some(resp) = ensure_authorized(&state, &headers) {
         return resp;
@@ -1012,7 +1070,7 @@ async fn check_chat_intent(
     }
 
     let normalized_intent = intent.trim().to_ascii_lowercase();
-    let Some(target_workflow) = state.chat_intents.get(&normalized_intent) else {
+    let Some(rule) = state.chat_intents.get(&normalized_intent) else {
         return (
             StatusCode::NOT_FOUND,
             format!("chat intent '{}' is not configured", intent),
@@ -1023,7 +1081,7 @@ async fn check_chat_intent(
     let entry = match resolve_registered_workflow_entry_with_registry(
         &state.plays_dir,
         state.registry_file.as_deref(),
-        target_workflow,
+        &rule.workflow,
     )
     .await
     {
@@ -1033,7 +1091,7 @@ async fn check_chat_intent(
                 StatusCode::NOT_FOUND,
                 format!(
                     "chat intent '{}' maps to missing workflow '{}'",
-                    intent, target_workflow
+                    intent, rule.workflow
                 ),
             )
                 .into_response();
@@ -1046,6 +1104,7 @@ async fn check_chat_intent(
                 .into_response();
         }
     };
+    let guardrails = evaluate_chat_intent_guardrails(rule, &entry, query.max_iterations);
 
     let (running, owner_running) = running_counts_for_entry(&state, &entry).await;
     let owner_max_concurrency = owner_limit_for(entry.owner.as_deref(), &state.owner_policy);
@@ -1058,13 +1117,18 @@ async fn check_chat_intent(
         owner_running,
         owner_max_concurrency,
     );
+    let can_run = readiness.can_run() && guardrails.reasons.is_empty();
     (
         StatusCode::OK,
         Json(ChatIntentCheckResponse {
             intent: normalized_intent,
             workflow: entry.workflow_name,
-            can_run: readiness.can_run(),
+            can_run,
+            guardrail_reasons: guardrails.reasons,
             running: readiness.running,
+            requested_max_iterations: query.max_iterations,
+            effective_max_iterations: guardrails.effective_max_iterations,
+            max_iterations_cap: rule.max_iterations_cap,
             max_concurrency: readiness.max_concurrency.map(|v| v as u32),
             concurrency_blocked: readiness.concurrency_blocked,
             owner_running: readiness.owner_running,
@@ -1099,7 +1163,7 @@ async fn run_chat_intent(
         Err(err) => return (StatusCode::BAD_REQUEST, err.to_string()).into_response(),
     };
     let intent = request.intent.trim().to_ascii_lowercase();
-    let Some(target_workflow) = state.chat_intents.get(&intent) else {
+    let Some(rule) = state.chat_intents.get(&intent) else {
         return (
             StatusCode::NOT_FOUND,
             format!("chat intent '{}' is not configured", request.intent),
@@ -1110,7 +1174,7 @@ async fn run_chat_intent(
     let entry = match resolve_registered_workflow_entry_with_registry(
         &state.plays_dir,
         state.registry_file.as_deref(),
-        target_workflow,
+        &rule.workflow,
     )
     .await
     {
@@ -1120,7 +1184,7 @@ async fn run_chat_intent(
                 StatusCode::NOT_FOUND,
                 format!(
                     "chat intent '{}' maps to missing workflow '{}'",
-                    request.intent, target_workflow
+                    request.intent, rule.workflow
                 ),
             )
                 .into_response();
@@ -1133,23 +1197,29 @@ async fn run_chat_intent(
                 .into_response();
         }
     };
+    let guardrails = evaluate_chat_intent_guardrails(rule, &entry, request.max_iterations);
+    if !guardrails.reasons.is_empty() {
+        return (
+            StatusCode::FORBIDDEN,
+            format!(
+                "chat intent '{}' blocked by guardrails: {}",
+                request.intent,
+                guardrails.reasons.join("; ")
+            ),
+        )
+            .into_response();
+    }
 
     let workflow = entry.workflow_name.clone();
     let options = RunRegisteredOptions {
         vars: request.vars,
-        max_iterations: request.max_iterations,
+        max_iterations: guardrails.effective_max_iterations,
     };
-    let req_id = match launch_registered_entry_with_options(
-        &state,
-        &entry,
-        target_workflow,
-        options,
-    )
-    .await
-    {
-        Ok(v) => v,
-        Err(resp) => return resp,
-    };
+    let req_id =
+        match launch_registered_entry_with_options(&state, &entry, &rule.workflow, options).await {
+            Ok(v) => v,
+            Err(resp) => return resp,
+        };
 
     (
         StatusCode::ACCEPTED,
@@ -1158,6 +1228,7 @@ async fn run_chat_intent(
             workflow,
             id: req_id,
             status: "running".to_string(),
+            effective_max_iterations: guardrails.effective_max_iterations,
         }),
     )
         .into_response()
@@ -1941,7 +2012,7 @@ fn daemon_node_capabilities() -> HashSet<String> {
         .collect::<HashSet<_>>()
 }
 
-fn daemon_chat_intents() -> HashMap<String, String> {
+fn daemon_chat_intents() -> HashMap<String, ChatIntentConfig> {
     let mut out = HashMap::new();
 
     if let Some(path) = chat_intents_file() {
@@ -1959,7 +2030,7 @@ fn daemon_chat_intents() -> HashMap<String, String> {
     out
 }
 
-fn parse_chat_intents_value(raw: &str) -> HashMap<String, String> {
+fn parse_chat_intents_value(raw: &str) -> HashMap<String, ChatIntentConfig> {
     let mut out = HashMap::new();
     for item in raw.split([',', ';', '\n']) {
         let trimmed = item.trim();
@@ -1976,7 +2047,12 @@ fn parse_chat_intents_value(raw: &str) -> HashMap<String, String> {
         insert_chat_intent_entry(
             &mut out,
             intent_raw,
-            workflow_raw,
+            ChatIntentConfig {
+                workflow: workflow_raw.to_string(),
+                allowed_owners: Vec::new(),
+                required_tags: Vec::new(),
+                max_iterations_cap: None,
+            },
             "ANNA_CHAT_INTENTS",
             trimmed,
         );
@@ -1998,33 +2074,67 @@ fn chat_intents_file() -> Option<PathBuf> {
     Some(PathBuf::from(trimmed))
 }
 
-fn load_chat_intents_file(path: &FsPath) -> Result<HashMap<String, String>> {
+fn load_chat_intents_file(path: &FsPath) -> Result<HashMap<String, ChatIntentConfig>> {
     let raw = std::fs::read_to_string(path)
         .with_context(|| format!("failed reading '{}'", path.display()))?;
     parse_chat_intents_doc(&raw, &path.display().to_string())
 }
 
-fn parse_chat_intents_doc(raw: &str, source: &str) -> Result<HashMap<String, String>> {
+fn parse_chat_intents_doc(raw: &str, source: &str) -> Result<HashMap<String, ChatIntentConfig>> {
     let parsed: ChatIntentDoc = serde_yaml::from_str(raw)
         .with_context(|| format!("failed parsing chat intents from '{}'", source))?;
     let mut out = HashMap::new();
     match parsed {
         ChatIntentDoc::Wrapped { intents } | ChatIntentDoc::List(intents) => {
             for item in intents {
-                let raw_entry = format!("intent='{}' workflow='{}'", item.intent, item.workflow);
+                let raw_entry = format!(
+                    "intent='{}' workflow='{}'",
+                    item.intent, item.config.workflow
+                );
                 insert_chat_intent_entry(
                     &mut out,
                     &item.intent,
-                    &item.workflow,
+                    ChatIntentConfig {
+                        workflow: item.config.workflow,
+                        allowed_owners: item.config.allowed_owners,
+                        required_tags: item.config.required_tags,
+                        max_iterations_cap: item.config.max_iterations_cap,
+                    },
                     source,
                     &raw_entry,
                 );
             }
         }
         ChatIntentDoc::Map(map) => {
-            for (intent, workflow) in map {
-                let raw_entry = format!("{}={}", intent, workflow);
-                insert_chat_intent_entry(&mut out, &intent, &workflow, source, &raw_entry);
+            for (intent, value) in map {
+                let (config, raw_entry) = match value {
+                    ChatIntentMapValue::Workflow(workflow) => {
+                        let raw_entry = format!("{}={}", intent, workflow);
+                        (
+                            ChatIntentConfig {
+                                workflow,
+                                allowed_owners: Vec::new(),
+                                required_tags: Vec::new(),
+                                max_iterations_cap: None,
+                            },
+                            raw_entry,
+                        )
+                    }
+                    ChatIntentMapValue::Config(config) => {
+                        let raw_entry =
+                            format!("intent='{}' workflow='{}'", intent, config.workflow);
+                        (
+                            ChatIntentConfig {
+                                workflow: config.workflow,
+                                allowed_owners: config.allowed_owners,
+                                required_tags: config.required_tags,
+                                max_iterations_cap: config.max_iterations_cap,
+                            },
+                            raw_entry,
+                        )
+                    }
+                };
+                insert_chat_intent_entry(&mut out, &intent, config, source, &raw_entry);
             }
         }
     }
@@ -2035,14 +2145,14 @@ fn parse_chat_intents_doc(raw: &str, source: &str) -> Result<HashMap<String, Str
 }
 
 fn insert_chat_intent_entry(
-    out: &mut HashMap<String, String>,
+    out: &mut HashMap<String, ChatIntentConfig>,
     intent_raw: &str,
-    workflow_raw: &str,
+    config: ChatIntentConfig,
     source: &str,
     raw_entry: &str,
 ) {
     let intent = intent_raw.trim().to_ascii_lowercase();
-    let workflow = workflow_raw.trim().to_string();
+    let workflow = config.workflow.trim().to_string();
     if intent.is_empty() || workflow.is_empty() {
         eprintln!(
             "anna-rs daemon: ignoring invalid chat intent entry '{}' from {}",
@@ -2050,7 +2160,105 @@ fn insert_chat_intent_entry(
         );
         return;
     }
-    out.insert(intent, workflow);
+    if config.max_iterations_cap == Some(0) {
+        eprintln!(
+            "anna-rs daemon: ignoring invalid chat intent entry '{}' from {} (max_iterations_cap must be >=1)",
+            raw_entry, source
+        );
+        return;
+    }
+
+    let mut allowed_owners = config
+        .allowed_owners
+        .iter()
+        .filter_map(|owner| owner_key(Some(owner.as_str())))
+        .collect::<Vec<_>>();
+    allowed_owners.sort();
+    allowed_owners.dedup();
+
+    let mut required_tags = config
+        .required_tags
+        .iter()
+        .map(|tag| tag.trim().to_ascii_lowercase())
+        .filter(|tag| !tag.is_empty())
+        .collect::<Vec<_>>();
+    required_tags.sort();
+    required_tags.dedup();
+
+    out.insert(
+        intent,
+        ChatIntentConfig {
+            workflow,
+            allowed_owners,
+            required_tags,
+            max_iterations_cap: config.max_iterations_cap,
+        },
+    );
+}
+
+fn evaluate_chat_intent_guardrails(
+    rule: &ChatIntentConfig,
+    entry: &WorkflowEntry,
+    requested_max_iterations: Option<u32>,
+) -> ChatIntentGuardrailOutcome {
+    let mut reasons = Vec::new();
+
+    if !rule.allowed_owners.is_empty() {
+        let workflow_owner = owner_key(entry.owner.as_deref());
+        let allowed = workflow_owner
+            .as_ref()
+            .map(|owner| rule.allowed_owners.contains(owner))
+            .unwrap_or(false);
+        if !allowed {
+            reasons.push(format!(
+                "workflow owner '{}' is not allowed (allowed owners: {})",
+                entry.owner.as_deref().unwrap_or(""),
+                rule.allowed_owners.join(", ")
+            ));
+        }
+    }
+
+    if !rule.required_tags.is_empty() {
+        let entry_tags = entry
+            .tags
+            .iter()
+            .map(|tag| tag.trim().to_ascii_lowercase())
+            .filter(|tag| !tag.is_empty())
+            .collect::<HashSet<_>>();
+        let mut missing = rule
+            .required_tags
+            .iter()
+            .filter(|tag| !entry_tags.contains(*tag))
+            .cloned()
+            .collect::<Vec<_>>();
+        missing.sort();
+        missing.dedup();
+        if !missing.is_empty() {
+            reasons.push(format!(
+                "workflow missing required chat tags: {}",
+                missing.join(", ")
+            ));
+        }
+    }
+
+    let mut effective_max_iterations = requested_max_iterations;
+    if let Some(cap) = rule.max_iterations_cap {
+        match requested_max_iterations {
+            Some(value) if value > cap => reasons.push(format!(
+                "requested max_iterations={} exceeds chat cap={}",
+                value, cap
+            )),
+            Some(_) => {}
+            None => {
+                effective_max_iterations = Some(cap);
+            }
+        }
+    }
+
+    ChatIntentGuardrailOutcome {
+        reasons,
+        effective_max_iterations,
+    }
 }
 
 fn daemon_owner_concurrency_policy() -> OwnerConcurrencyPolicy {
@@ -3015,14 +3223,15 @@ async fn launch_workflow(
 #[cfg(test)]
 mod tests {
     use super::{
-        DaemonHitl, DaemonStateSnapshot, HitlPending, SessionInfo, WorkflowEntry,
+        ChatIntentConfig, DaemonHitl, DaemonStateSnapshot, HitlPending, SessionInfo, WorkflowEntry,
         WorkflowMetaResponse, collect_required_providers, collect_watch_snapshot,
-        evaluate_flow_readiness, find_workflow_entries_with_registry, is_authorized,
-        load_daemon_state, load_flow_registry, matches_workflow_meta_filters,
-        missing_required_capabilities, parse_chat_intents_doc, parse_chat_intents_value,
-        parse_chat_run_request, parse_run_registered_options, prune_hitl_in_place,
-        prune_sessions_in_place, resolve_registered_workflow_entry_with_registry,
-        resolve_watch_pattern, status_matches, temp_state_path,
+        evaluate_chat_intent_guardrails, evaluate_flow_readiness,
+        find_workflow_entries_with_registry, is_authorized, load_daemon_state, load_flow_registry,
+        matches_workflow_meta_filters, missing_required_capabilities, parse_chat_intents_doc,
+        parse_chat_intents_value, parse_chat_run_request, parse_run_registered_options,
+        prune_hitl_in_place, prune_sessions_in_place,
+        resolve_registered_workflow_entry_with_registry, resolve_watch_pattern, status_matches,
+        temp_state_path,
     };
     use crate::executor::{HitlHandler, HitlRequest};
     use crate::workflow::{Stage, Workflow};
@@ -3470,38 +3679,57 @@ mod tests {
     fn parse_chat_intents_value_handles_invalid_entries() {
         let parsed = parse_chat_intents_value("deploy=prod-deploy,ops=ops-flow,bad-entry, =empty,");
         assert_eq!(
-            parsed,
-            std::collections::HashMap::from([
-                ("deploy".to_string(), "prod-deploy".to_string()),
-                ("ops".to_string(), "ops-flow".to_string()),
-            ])
+            parsed.get("deploy").map(|v| v.workflow.as_str()),
+            Some("prod-deploy")
         );
+        assert_eq!(
+            parsed.get("ops").map(|v| v.workflow.as_str()),
+            Some("ops-flow")
+        );
+        assert_eq!(
+            parsed.get("deploy").map(|v| v.max_iterations_cap),
+            Some(None)
+        );
+        assert_eq!(parsed.len(), 2);
     }
 
     #[test]
     fn parse_chat_intents_doc_supports_map_wrapped_and_list() {
         let map = parse_chat_intents_doc(
-            "deploy: prod-deploy\ntriage: incident-triage\n",
+            "deploy:\n  workflow: prod-deploy\n  allowed_owners: [platform]\n  required_tags: [prod]\n  max_iterations_cap: 3\ntriage: incident-triage\n",
             "inline-map",
         )
         .expect("map format should parse");
         assert_eq!(
-            map,
-            std::collections::HashMap::from([
-                ("deploy".to_string(), "prod-deploy".to_string()),
-                ("triage".to_string(), "incident-triage".to_string()),
-            ])
+            map.get("deploy").map(|v| v.workflow.as_str()),
+            Some("prod-deploy")
+        );
+        assert_eq!(
+            map.get("deploy").map(|v| v.allowed_owners.clone()),
+            Some(vec!["platform".to_string()])
+        );
+        assert_eq!(
+            map.get("deploy").map(|v| v.required_tags.clone()),
+            Some(vec!["prod".to_string()])
+        );
+        assert_eq!(
+            map.get("deploy").and_then(|v| v.max_iterations_cap),
+            Some(3)
+        );
+        assert_eq!(
+            map.get("triage").map(|v| v.workflow.as_str()),
+            Some("incident-triage")
         );
 
         let wrapped = parse_chat_intents_doc(
-            "intents:\n  - intent: deploy\n    workflow: prod-deploy\n  - intent: triage\n    workflow: incident-triage\n",
+            "intents:\n  - intent: deploy\n    workflow: prod-deploy\n    allowed_owners: [platform]\n    required_tags: [prod]\n    max_iterations_cap: 3\n  - intent: triage\n    workflow: incident-triage\n",
             "inline-wrapped",
         )
         .expect("wrapped format should parse");
         assert_eq!(wrapped, map);
 
         let list = parse_chat_intents_doc(
-            "- intent: deploy\n  workflow: prod-deploy\n- intent: triage\n  workflow: incident-triage\n",
+            "- intent: deploy\n  workflow: prod-deploy\n  allowed_owners: [platform]\n  required_tags: [prod]\n  max_iterations_cap: 3\n- intent: triage\n  workflow: incident-triage\n",
             "inline-list",
         )
         .expect("list format should parse");
@@ -3513,6 +3741,57 @@ mod tests {
         let err = parse_chat_intents_doc("intents: []\n", "inline-empty")
             .expect_err("empty intent list should fail");
         assert!(err.to_string().contains("has no valid entries"));
+    }
+
+    #[test]
+    fn evaluate_chat_intent_guardrails_blocks_owner_tag_and_max_iterations() {
+        let entry = WorkflowEntry {
+            file_name: "deploy.anna".to_string(),
+            flow_id: Some("deploy".to_string()),
+            workflow_name: "deploy".to_string(),
+            path: std::path::PathBuf::from("/tmp/deploy.anna"),
+            tags: vec!["prod".to_string()],
+            required_capabilities: vec![],
+            required_providers: vec![],
+            owner: Some("platform".to_string()),
+            version: None,
+            max_concurrency: None,
+            trigger_webhook: None,
+            trigger_watch: None,
+            trigger_cron: None,
+            trigger_interval: None,
+            workflow_workdir: None,
+        };
+
+        let ok_rule = ChatIntentConfig {
+            workflow: "deploy".to_string(),
+            allowed_owners: vec!["platform".to_string()],
+            required_tags: vec!["prod".to_string()],
+            max_iterations_cap: Some(2),
+        };
+        let ok = evaluate_chat_intent_guardrails(&ok_rule, &entry, None);
+        assert!(ok.reasons.is_empty());
+        assert_eq!(ok.effective_max_iterations, Some(2));
+
+        let blocked = evaluate_chat_intent_guardrails(&ok_rule, &entry, Some(9));
+        assert!(!blocked.reasons.is_empty());
+        assert!(blocked.reasons[0].contains("max_iterations"));
+
+        let strict_rule = ChatIntentConfig {
+            workflow: "deploy".to_string(),
+            allowed_owners: vec!["ops".to_string()],
+            required_tags: vec!["critical".to_string()],
+            max_iterations_cap: None,
+        };
+        let blocked = evaluate_chat_intent_guardrails(&strict_rule, &entry, None);
+        assert_eq!(blocked.reasons.len(), 2);
+        assert!(blocked.reasons.iter().any(|v| v.contains("allowed owners")));
+        assert!(
+            blocked
+                .reasons
+                .iter()
+                .any(|v| v.contains("required chat tags"))
+        );
     }
 
     #[test]

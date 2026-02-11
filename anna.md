@@ -432,6 +432,9 @@ curl localhost:8080/chat/intents
 # Check chat intent readiness
 curl localhost:8080/chat/deploy/check
 
+# Check with requested iteration budget
+curl localhost:8080/chat/deploy/check?max_iterations=3
+
 # Run intent through chat gateway
 curl -X POST localhost:8080/chat/run \
   -H "content-type: application/json" \
@@ -451,6 +454,17 @@ ANNA_CHAT_INTENTS_FILE=./chat.intents.yml anna daemon
 ```
 
 When both are set, `ANNA_CHAT_INTENTS` overrides matching keys from `ANNA_CHAT_INTENTS_FILE`.
+
+`chat.intents.yml` supports optional guardrails:
+
+```yaml
+deploy:
+  workflow: prod-deploy
+  allowed_owners: [platform]
+  required_tags: [prod]
+  max_iterations_cap: 2
+triage: incident-triage
+```
 
 ## Control and Access Layers
 

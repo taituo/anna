@@ -194,7 +194,8 @@ fn tool_specs() -> Vec<Value> {
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "intent": { "type": "string" }
+                    "intent": { "type": "string" },
+                    "max_iterations": { "type": "integer", "minimum": 1 }
                 },
                 "required": ["intent"],
                 "additionalProperties": false
@@ -464,11 +465,15 @@ async fn handle_tools_call(client: &Client, config: &McpConfig, params: &Value) 
         }
         "can_run_chat_intent" => {
             let intent = arg_required_string(&args, "intent")?;
-            let body = send(authed(
+            let max_iterations = arg_u32(&args, "max_iterations")?;
+            let mut req = authed(
                 client.get(format!("{}/chat/{}/check", daemon, intent)),
                 &config.daemon_token,
-            ))
-            .await?;
+            );
+            if let Some(max_iterations) = max_iterations {
+                req = req.query(&[("max_iterations", max_iterations)]);
+            }
+            let body = send(req).await?;
             Ok(body)
         }
         "session_status" => {

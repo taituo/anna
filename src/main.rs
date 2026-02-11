@@ -124,6 +124,9 @@ enum Commands {
         /// Daemon base URL
         #[arg(long, default_value = "http://127.0.0.1:8080")]
         daemon: String,
+        /// Optional max iterations value to precheck against chat guardrails
+        #[arg(long)]
+        max_iterations: Option<u32>,
     },
     /// Check whether a workflow YAML file can run under current daemon policy
     CanRunYaml {
@@ -474,16 +477,21 @@ async fn main() -> Result<()> {
                     })?;
             print_response(response).await
         }
-        Commands::CanChat { intent, daemon } => {
+        Commands::CanChat {
+            intent,
+            daemon,
+            max_iterations,
+        } => {
             let daemon = normalize_daemon_url(&daemon);
             let client = Client::new();
-            let response =
-                with_daemon_auth(client.get(format!("{}/chat/{}/check", daemon, intent)))
-                    .send()
-                    .await
-                    .with_context(|| {
-                        format!("failed checking chat intent '{}' at {}", intent, daemon)
-                    })?;
+            let mut request =
+                with_daemon_auth(client.get(format!("{}/chat/{}/check", daemon, intent)));
+            if let Some(max_iterations) = max_iterations {
+                request = request.query(&[("max_iterations", max_iterations)]);
+            }
+            let response = request.send().await.with_context(|| {
+                format!("failed checking chat intent '{}' at {}", intent, daemon)
+            })?;
             print_response(response).await
         }
         Commands::CanRunYaml { workflow, daemon } => {

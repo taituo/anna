@@ -46,7 +46,7 @@ anna workflows
 anna workflows-meta
 anna workflows-meta --available true --capability k8s
 anna can-run prod-deploy
-anna can-chat deploy
+anna can-chat deploy --max-iterations 2
 anna can-run-yaml workflow.anna
 anna run-named prod-deploy --var ENV=prod --max-iterations 1
 anna run-named prod-deploy --precheck
@@ -112,9 +112,15 @@ ANNA_CHAT_INTENTS_FILE=./chat.intents.yml anna daemon --plays-dir .
 `chat.intents.yml` example:
 
 ```yaml
-deploy: prod-deploy
+deploy:
+  workflow: prod-deploy
+  allowed_owners: [platform]
+  required_tags: [prod]
+  max_iterations_cap: 2
 triage: incident-triage
 ```
+
+Guardrails are enforced in both `anna can-chat` and `anna chat` (`allowed_owners`, `required_tags`, `max_iterations_cap`).
 
 Optional node capability ceiling (used against `required_capabilities`):
 
