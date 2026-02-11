@@ -78,6 +78,8 @@ struct StatsResponse {
 struct PolicyResponse {
     registry_enabled: bool,
     auth_enabled: bool,
+    chat_gateway_enabled: bool,
+    chat_intents_count: usize,
     node_capabilities: Vec<String>,
     provider_restriction_enabled: bool,
     allowed_providers: Vec<String>,
@@ -570,6 +572,8 @@ async fn policy(State(state): State<AppState>, headers: HeaderMap) -> impl IntoR
     Json(PolicyResponse {
         registry_enabled: state.registry_file.is_some(),
         auth_enabled: state.auth_token.is_some(),
+        chat_gateway_enabled: !state.chat_intents.is_empty(),
+        chat_intents_count: state.chat_intents.len(),
         node_capabilities,
         provider_restriction_enabled: state.allowed_providers.is_some(),
         allowed_providers,
