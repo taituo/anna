@@ -210,6 +210,26 @@ enum Commands {
         #[arg(long, default_value = "http://127.0.0.1:8080")]
         daemon: String,
     },
+    /// List chat intent routes configured in daemon
+    ChatIntents {
+        /// Daemon base URL
+        #[arg(long, default_value = "http://127.0.0.1:8080")]
+        daemon: String,
+    },
+    /// Run workflow through chat intent route
+    Chat {
+        /// Chat intent name (must exist in daemon intent map)
+        intent: String,
+        /// Daemon base URL
+        #[arg(long, default_value = "http://127.0.0.1:8080")]
+        daemon: String,
+        /// Override workflow vars (repeatable: --var KEY=VALUE)
+        #[arg(long = "var")]
+        vars: Vec<String>,
+        /// Stop after N iterations in continuous mode
+        #[arg(long)]
+        max_iterations: Option<u32>,
+    },
     /// Manage pending human-in-the-loop requests
     Hitl {
         #[command(subcommand)]
@@ -630,6 +650,35 @@ async fn main() -> Result<()> {
             .send()
             .await
             .with_context(|| format!("failed triggering hook '{}' at {}", name, daemon))?;
+            print_response(response).await
+        }
+        Commands::ChatIntents { daemon } => {
+            let daemon = normalize_daemon_url(&daemon);
+            let client = Client::new();
+            let response = with_daemon_auth(client.get(format!("{}/chat/intents", daemon)))
+                .send()
+                .await
+                .with_context(|| format!("failed listing chat intents at {}", daemon))?;
+            print_response(response).await
+        }
+        Commands::Chat {
+            intent,
+            daemon,
+            vars,
+            max_iterations,
+        } => {
+            let daemon = normalize_daemon_url(&daemon);
+            let overrides = parse_var_overrides(vars)?;
+            let client = Client::new();
+            let response = with_daemon_auth(client.post(format!("{}/chat/run", daemon)))
+                .json(&json!({
+                    "intent": intent,
+                    "vars": overrides,
+                    "max_iterations": max_iterations
+                }))
+                .send()
+                .await
+                .with_context(|| format!("failed running chat intent at {}", daemon))?;
             print_response(response).await
         }
         Commands::Hitl { command } => match command {

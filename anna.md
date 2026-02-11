@@ -426,16 +426,30 @@ curl -X DELETE localhost:8080/workflow/SESSION_ID
 # Trigger webhook
 curl -X POST localhost:8080/hook/deploy
 
+# List chat intents
+curl localhost:8080/chat/intents
+
+# Run intent through chat gateway
+curl -X POST localhost:8080/chat/run \
+  -H "content-type: application/json" \
+  -d '{"intent":"deploy","vars":{"ENV":"prod"}}'
+
 # WebSocket logs
 wscat -c ws://localhost:8080/ws?id=SESSION_ID
+```
+
+Chat gateway mapping is configured on daemon with:
+
+```bash
+ANNA_CHAT_INTENTS="deploy=prod-deploy,triage=incident-triage" anna daemon
 ```
 
 ## Control and Access Layers
 
 Flows can be accessed via multiple interfaces while keeping one execution contract:
 
-- CLI (`anna run`, `anna submit`, `anna status`, `anna logs`)
-- HTTP control API (run, status, stop, hook, log streaming)
+- CLI (`anna run`, `anna submit`, `anna status`, `anna logs`, `anna chat-intents`, `anna chat`)
+- HTTP control API (run, status, stop, hook, chat intent routing, log streaming)
 - MCP server tools (`list_flows`, `run_flow`, `session_status`, `tail_logs`, `stop_flow`)
 - Chat gateways (intent -> approved flow run via control API)
 

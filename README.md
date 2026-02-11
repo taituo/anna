@@ -50,6 +50,8 @@ anna can-run-yaml workflow.anna
 anna run-named prod-deploy --var ENV=prod --max-iterations 1
 anna run-named prod-deploy --precheck
 anna hook deploy
+anna chat-intents
+anna chat deploy --var ENV=prod
 anna status <request_id>
 anna sessions --status running
 anna sessions --status running --owner platform --workflow prod-deploy
@@ -93,6 +95,12 @@ Optional flow registry (restrict daemon-discoverable flows to approved list):
 
 ```bash
 ANNA_FLOW_REGISTRY_FILE=./flows.registry.yml anna daemon --plays-dir .
+```
+
+Optional chat gateway intent map (intent -> registered workflow id/name):
+
+```bash
+ANNA_CHAT_INTENTS="deploy=prod-deploy,triage=incident-triage" anna daemon --plays-dir .
 ```
 
 Optional node capability ceiling (used against `required_capabilities`):
@@ -218,8 +226,8 @@ Current MVP intentionally leaves some advanced features for next steps (multi-no
 
 ## Access Channels
 
-- CLI (`anna run`, `anna submit`, `anna can-run`, `anna can-run-yaml`, `anna status`)
-- HTTP control API (`/policy`, `/llm/adapters`, `/workflow`, `/workflow/check`, `/workflow/{name}/check`, `/workflow/{name}/run`, `/workflows`, `/workflows/meta`, `/hook/*`, `/hitl`, `/hitl/{id}/resolve`, `/ws`)
+- CLI (`anna run`, `anna submit`, `anna can-run`, `anna can-run-yaml`, `anna status`, `anna chat-intents`, `anna chat`)
+- HTTP control API (`/policy`, `/llm/adapters`, `/workflow`, `/workflow/check`, `/workflow/{name}/check`, `/workflow/{name}/run`, `/workflows`, `/workflows/meta`, `/chat/intents`, `/chat/run`, `/hook/*`, `/hitl`, `/hitl/{id}/resolve`, `/ws`)
 - MCP stdio server (`anna mcp`) with tools: `list_flows`, `list_flows_meta`, `run_flow`, `can_run_flow`, `can_run_flow_yaml`, `session_status`, `tail_logs`, `stop_flow`, `list_sessions`, `stats`, `policy`, `list_llm_adapters`, `daemon_llm_adapters`, `trigger_hook`, `list_hitl`, `resolve_hitl`
 - Chat gateway (maps chat intents to approved flow runs)
 

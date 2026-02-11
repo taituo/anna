@@ -30,6 +30,7 @@ struct AppState {
     executor: Executor,
     plays_dir: PathBuf,
     registry_file: Option<PathBuf>,
+    chat_intents: HashMap<String, String>,
     node_capabilities: HashSet<String>,
     allowed_providers: Option<HashSet<String>>,
     owner_policy: OwnerConcurrencyPolicy,
@@ -207,6 +208,36 @@ struct RawFlowCheckResponse {
     missing_providers: Vec<String>,
 }
 
+#[derive(Debug, Serialize)]
+struct ChatIntentsResponse {
+    enabled: bool,
+    intents: Vec<ChatIntentRoute>,
+}
+
+#[derive(Debug, Serialize)]
+struct ChatIntentRoute {
+    intent: String,
+    workflow: String,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct ChatRunRequest {
+    #[serde(default)]
+    intent: String,
+    #[serde(default)]
+    vars: HashMap<String, String>,
+    #[serde(default)]
+    max_iterations: Option<u32>,
+}
+
+#[derive(Debug, Serialize)]
+struct ChatRunResponse {
+    intent: String,
+    workflow: String,
+    id: String,
+    status: String,
+}
+
 #[derive(Debug, Deserialize)]
 struct WsQuery {
     id: String,
@@ -375,6 +406,7 @@ impl HitlHandler for DaemonHitl {
 pub async fn run_daemon(bind: &str, plays_dir: PathBuf) -> Result<()> {
     let state_file = daemon_state_file();
     let registry_file = flow_registry_file();
+    let chat_intents = daemon_chat_intents();
     let retention = daemon_retention_config();
     let node_capabilities = daemon_node_capabilities();
     let owner_policy = daemon_owner_concurrency_policy();
@@ -393,6 +425,7 @@ pub async fn run_daemon(bind: &str, plays_dir: PathBuf) -> Result<()> {
         executor,
         plays_dir,
         registry_file: registry_file.clone(),
+        chat_intents: chat_intents.clone(),
         node_capabilities: node_capabilities.clone(),
         allowed_providers: allowed_providers.clone(),
         owner_policy: owner_policy.clone(),
@@ -412,6 +445,14 @@ pub async fn run_daemon(bind: &str, plays_dir: PathBuf) -> Result<()> {
     }
     if let Some(path) = registry_file {
         println!("anna-rs flow registry enabled at {}", path.display());
+    }
+    if !chat_intents.is_empty() {
+        let mut routes = chat_intents
+            .iter()
+            .map(|(intent, workflow)| format!("{}={}", intent, workflow))
+            .collect::<Vec<_>>();
+        routes.sort();
+        println!("anna-rs chat intents: {}", routes.join(","));
     }
     if !node_capabilities.is_empty() {
         let mut capabilities = node_capabilities.iter().cloned().collect::<Vec<_>>();
@@ -448,6 +489,8 @@ pub async fn run_daemon(bind: &str, plays_dir: PathBuf) -> Result<()> {
         .route("/workflow/check", post(check_workflow_body))
         .route("/workflow/{name}/check", get(check_registered_workflow))
         .route("/workflow/{name}/run", post(run_registered_workflow))
+        .route("/chat/intents", get(list_chat_intents))
+        .route("/chat/run", post(run_chat_intent))
         .route("/workflow/{id}", get(workflow_status).delete(stop_workflow))
         .route("/workflow/{id}/logs", get(workflow_logs))
         .route("/hook/{name}", post(trigger_hook))
@@ -874,95 +917,125 @@ async fn run_registered_workflow(
                 .into_response();
         }
     };
-    let (running, owner_running) = running_counts_for_entry(&state, &entry).await;
-    let owner_max_concurrency = owner_limit_for(entry.owner.as_deref(), &state.owner_policy);
-    let readiness = evaluate_flow_readiness(
-        &entry,
-        &state.node_capabilities,
-        state.allowed_providers.as_ref(),
-        running,
-        None,
-        owner_running,
-        owner_max_concurrency,
-    );
-    if !readiness.missing_capabilities.is_empty() {
-        return (
-            StatusCode::FORBIDDEN,
-            format!(
-                "workflow '{}' requires missing capabilities: {}",
-                name,
-                readiness.missing_capabilities.join(", ")
-            ),
-        )
-            .into_response();
-    }
-    if !readiness.missing_providers.is_empty() {
-        return (
-            StatusCode::FORBIDDEN,
-            format!(
-                "workflow '{}' requires blocked providers: {}",
-                name,
-                readiness.missing_providers.join(", ")
-            ),
-        )
-            .into_response();
-    }
-    if readiness.owner_concurrency_blocked {
-        return (
-            StatusCode::TOO_MANY_REQUESTS,
-            format!(
-                "workflow '{}' owner concurrency limit reached: owner='{}' running={} max_concurrency={}",
-                name,
-                entry.owner.as_deref().unwrap_or(""),
-                readiness.owner_running,
-                readiness.owner_max_concurrency.unwrap_or(0)
-            ),
-        )
-            .into_response();
-    }
-    if readiness.concurrency_blocked {
-        return (
-            StatusCode::TOO_MANY_REQUESTS,
-            format!(
-                "workflow '{}' concurrency limit reached: running={} max_concurrency={}",
-                name,
-                readiness.running,
-                readiness.max_concurrency.unwrap_or(0)
-            ),
-        )
-            .into_response();
-    }
-
-    let mut workflow = match Workflow::load(&entry.path) {
+    let req_id = match launch_registered_entry_with_options(&state, &entry, &name, options).await {
         Ok(v) => v,
-        Err(err) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                format!("invalid workflow '{}': {}", entry.path.display(), err),
-            )
-                .into_response();
-        }
-    };
-    if workflow.workdir.is_none() {
-        workflow.workdir = Some(state.plays_dir.display().to_string());
-    }
-    workflow.vars.extend(options.vars);
-
-    let req_id = match launch_workflow(&state, workflow, options.max_iterations, entry.owner).await
-    {
-        Ok(v) => v,
-        Err(err) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("failed to start workflow: {}", err),
-            )
-                .into_response();
-        }
+        Err(resp) => return resp,
     };
 
     (
         StatusCode::ACCEPTED,
         Json(StartWorkflowResponse {
+            id: req_id,
+            status: "running".to_string(),
+        }),
+    )
+        .into_response()
+}
+
+async fn list_chat_intents(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
+    if let Some(resp) = ensure_authorized(&state, &headers) {
+        return resp;
+    }
+
+    let mut intents = state
+        .chat_intents
+        .iter()
+        .map(|(intent, workflow)| ChatIntentRoute {
+            intent: intent.clone(),
+            workflow: workflow.clone(),
+        })
+        .collect::<Vec<_>>();
+    intents.sort_by(|a, b| a.intent.cmp(&b.intent));
+
+    (
+        StatusCode::OK,
+        Json(ChatIntentsResponse {
+            enabled: !intents.is_empty(),
+            intents,
+        }),
+    )
+        .into_response()
+}
+
+async fn run_chat_intent(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: String,
+) -> impl IntoResponse {
+    if let Some(resp) = ensure_authorized(&state, &headers) {
+        return resp;
+    }
+
+    if state.chat_intents.is_empty() {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "chat gateway disabled: set ANNA_CHAT_INTENTS",
+        )
+            .into_response();
+    }
+
+    let request = match parse_chat_run_request(&body) {
+        Ok(v) => v,
+        Err(err) => return (StatusCode::BAD_REQUEST, err.to_string()).into_response(),
+    };
+    let intent = request.intent.trim().to_ascii_lowercase();
+    let Some(target_workflow) = state.chat_intents.get(&intent) else {
+        return (
+            StatusCode::NOT_FOUND,
+            format!("chat intent '{}' is not configured", request.intent),
+        )
+            .into_response();
+    };
+
+    let entry = match resolve_registered_workflow_entry_with_registry(
+        &state.plays_dir,
+        state.registry_file.as_deref(),
+        target_workflow,
+    )
+    .await
+    {
+        Ok(Some(v)) => v,
+        Ok(None) => {
+            return (
+                StatusCode::NOT_FOUND,
+                format!(
+                    "chat intent '{}' maps to missing workflow '{}'",
+                    request.intent, target_workflow
+                ),
+            )
+                .into_response();
+        }
+        Err(err) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("failed resolving chat intent workflow: {}", err),
+            )
+                .into_response();
+        }
+    };
+
+    let workflow = entry.workflow_name.clone();
+    let options = RunRegisteredOptions {
+        vars: request.vars,
+        max_iterations: request.max_iterations,
+    };
+    let req_id = match launch_registered_entry_with_options(
+        &state,
+        &entry,
+        target_workflow,
+        options,
+    )
+    .await
+    {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
+
+    (
+        StatusCode::ACCEPTED,
+        Json(ChatRunResponse {
+            intent,
+            workflow,
             id: req_id,
             status: "running".to_string(),
         }),
@@ -1748,6 +1821,41 @@ fn daemon_node_capabilities() -> HashSet<String> {
         .collect::<HashSet<_>>()
 }
 
+fn daemon_chat_intents() -> HashMap<String, String> {
+    let Ok(raw) = std::env::var("ANNA_CHAT_INTENTS") else {
+        return HashMap::new();
+    };
+    parse_chat_intents_value(&raw)
+}
+
+fn parse_chat_intents_value(raw: &str) -> HashMap<String, String> {
+    let mut out = HashMap::new();
+    for item in raw.split([',', ';', '\n']) {
+        let trimmed = item.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let Some((intent_raw, workflow_raw)) = trimmed.split_once('=') else {
+            eprintln!(
+                "anna-rs daemon: ignoring invalid ANNA_CHAT_INTENTS entry '{}'",
+                trimmed
+            );
+            continue;
+        };
+        let intent = intent_raw.trim().to_ascii_lowercase();
+        let workflow = workflow_raw.trim().to_string();
+        if intent.is_empty() || workflow.is_empty() {
+            eprintln!(
+                "anna-rs daemon: ignoring invalid ANNA_CHAT_INTENTS entry '{}'",
+                trimmed
+            );
+            continue;
+        }
+        out.insert(intent, workflow);
+    }
+    out
+}
+
 fn daemon_owner_concurrency_policy() -> OwnerConcurrencyPolicy {
     let Ok(raw) = std::env::var("ANNA_OWNER_MAX_CONCURRENCY") else {
         return OwnerConcurrencyPolicy::default();
@@ -2525,12 +2633,114 @@ async fn running_counts_for_entry(state: &AppState, entry: &WorkflowEntry) -> (u
     (running_workflow, running_owner)
 }
 
+async fn launch_registered_entry_with_options(
+    state: &AppState,
+    entry: &WorkflowEntry,
+    requested_name: &str,
+    options: RunRegisteredOptions,
+) -> std::result::Result<String, axum::response::Response> {
+    let (running, owner_running) = running_counts_for_entry(state, entry).await;
+    let owner_max_concurrency = owner_limit_for(entry.owner.as_deref(), &state.owner_policy);
+    let readiness = evaluate_flow_readiness(
+        entry,
+        &state.node_capabilities,
+        state.allowed_providers.as_ref(),
+        running,
+        None,
+        owner_running,
+        owner_max_concurrency,
+    );
+    if !readiness.missing_capabilities.is_empty() {
+        return Err((
+            StatusCode::FORBIDDEN,
+            format!(
+                "workflow '{}' requires missing capabilities: {}",
+                requested_name,
+                readiness.missing_capabilities.join(", ")
+            ),
+        )
+            .into_response());
+    }
+    if !readiness.missing_providers.is_empty() {
+        return Err((
+            StatusCode::FORBIDDEN,
+            format!(
+                "workflow '{}' requires blocked providers: {}",
+                requested_name,
+                readiness.missing_providers.join(", ")
+            ),
+        )
+            .into_response());
+    }
+    if readiness.owner_concurrency_blocked {
+        return Err((
+            StatusCode::TOO_MANY_REQUESTS,
+            format!(
+                "workflow '{}' owner concurrency limit reached: owner='{}' running={} max_concurrency={}",
+                requested_name,
+                entry.owner.as_deref().unwrap_or(""),
+                readiness.owner_running,
+                readiness.owner_max_concurrency.unwrap_or(0)
+            ),
+        )
+            .into_response());
+    }
+    if readiness.concurrency_blocked {
+        return Err((
+            StatusCode::TOO_MANY_REQUESTS,
+            format!(
+                "workflow '{}' concurrency limit reached: running={} max_concurrency={}",
+                requested_name,
+                readiness.running,
+                readiness.max_concurrency.unwrap_or(0)
+            ),
+        )
+            .into_response());
+    }
+
+    let mut workflow = match Workflow::load(&entry.path) {
+        Ok(v) => v,
+        Err(err) => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!("invalid workflow '{}': {}", entry.path.display(), err),
+            )
+                .into_response());
+        }
+    };
+    if workflow.workdir.is_none() {
+        workflow.workdir = Some(state.plays_dir.display().to_string());
+    }
+    workflow.vars.extend(options.vars);
+
+    match launch_workflow(state, workflow, options.max_iterations, entry.owner.clone()).await {
+        Ok(v) => Ok(v),
+        Err(err) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("failed to start workflow: {}", err),
+        )
+            .into_response()),
+    }
+}
+
 fn parse_run_registered_options(body: &str) -> Result<RunRegisteredOptions> {
     if body.trim().is_empty() {
         return Ok(RunRegisteredOptions::default());
     }
     let parsed = serde_json::from_str::<RunRegisteredOptions>(body)
         .context("invalid run options json body, expected {\"vars\":{...},\"max_iterations\":N}")?;
+    Ok(parsed)
+}
+
+fn parse_chat_run_request(body: &str) -> Result<ChatRunRequest> {
+    if body.trim().is_empty() {
+        bail!("chat run body is required, expected {{\"intent\":\"...\"}}");
+    }
+    let parsed = serde_json::from_str::<ChatRunRequest>(body)
+        .context("invalid chat run json body, expected {\"intent\":\"...\",\"vars\":{...},\"max_iterations\":N}")?;
+    if parsed.intent.trim().is_empty() {
+        bail!("chat run requires non-empty 'intent'");
+    }
     Ok(parsed)
 }
 
@@ -2612,9 +2822,10 @@ mod tests {
         WorkflowMetaResponse, collect_required_providers, collect_watch_snapshot,
         evaluate_flow_readiness, find_workflow_entries_with_registry, is_authorized,
         load_daemon_state, load_flow_registry, matches_workflow_meta_filters,
-        missing_required_capabilities, parse_run_registered_options, prune_hitl_in_place,
-        prune_sessions_in_place, resolve_registered_workflow_entry_with_registry,
-        resolve_watch_pattern, status_matches, temp_state_path,
+        missing_required_capabilities, parse_chat_intents_value, parse_chat_run_request,
+        parse_run_registered_options, prune_hitl_in_place, prune_sessions_in_place,
+        resolve_registered_workflow_entry_with_registry, resolve_watch_pattern, status_matches,
+        temp_state_path,
     };
     use crate::executor::{HitlHandler, HitlRequest};
     use crate::workflow::{Stage, Workflow};
@@ -3042,6 +3253,32 @@ mod tests {
             ])
         );
         assert_eq!(parsed.max_iterations, Some(2));
+    }
+
+    #[test]
+    fn parse_chat_run_request_requires_intent() {
+        let err = parse_chat_run_request("{}").expect_err("intent is required");
+        assert!(err.to_string().contains("requires non-empty 'intent'"));
+
+        let parsed = parse_chat_run_request(
+            r#"{"intent":"deploy","vars":{"ENV":"prod"},"max_iterations":2}"#,
+        )
+        .expect("valid chat request");
+        assert_eq!(parsed.intent, "deploy");
+        assert_eq!(parsed.vars.get("ENV").map(String::as_str), Some("prod"));
+        assert_eq!(parsed.max_iterations, Some(2));
+    }
+
+    #[test]
+    fn parse_chat_intents_value_handles_invalid_entries() {
+        let parsed = parse_chat_intents_value("deploy=prod-deploy,ops=ops-flow,bad-entry, =empty,");
+        assert_eq!(
+            parsed,
+            std::collections::HashMap::from([
+                ("deploy".to_string(), "prod-deploy".to_string()),
+                ("ops".to_string(), "ops-flow".to_string()),
+            ])
+        );
     }
 
     #[test]
