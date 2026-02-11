@@ -263,6 +263,28 @@ fn tool_specs() -> Vec<Value> {
             }
         }),
         json!({
+            "name": "list_chat_intents",
+            "description": "List daemon chat intent routes",
+            "inputSchema": { "type": "object", "additionalProperties": false }
+        }),
+        json!({
+            "name": "run_chat_intent",
+            "description": "Run approved workflow through daemon chat intent mapping",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "intent": { "type": "string" },
+                    "vars": {
+                        "type": "object",
+                        "additionalProperties": { "type": "string" }
+                    },
+                    "max_iterations": { "type": "integer", "minimum": 1 }
+                },
+                "required": ["intent"],
+                "additionalProperties": false
+            }
+        }),
+        json!({
             "name": "list_hitl",
             "description": "List HITL requests",
             "inputSchema": {
@@ -533,6 +555,32 @@ async fn handle_tools_call(client: &Client, config: &McpConfig, params: &Value) 
             .await?;
             Ok(body)
         }
+        "list_chat_intents" => {
+            let body = send(authed(
+                client.get(format!("{}/chat/intents", daemon)),
+                &config.daemon_token,
+            ))
+            .await?;
+            Ok(body)
+        }
+        "run_chat_intent" => {
+            let intent = arg_required_string(&args, "intent")?;
+            let vars = arg_string_map(&args, "vars")?;
+            let max_iterations = arg_u32(&args, "max_iterations")?;
+            let body = send(
+                authed(
+                    client.post(format!("{}/chat/run", daemon)),
+                    &config.daemon_token,
+                )
+                .json(&json!({
+                    "intent": intent,
+                    "vars": vars,
+                    "max_iterations": max_iterations,
+                })),
+            )
+            .await?;
+            Ok(body)
+        }
         "list_hitl" => {
             let status = arg_string(&args, "status")?;
             let session_id = arg_string(&args, "session_id")?;
@@ -731,6 +779,8 @@ mod tests {
         assert!(names.contains(&"policy"));
         assert!(names.contains(&"list_llm_adapters"));
         assert!(names.contains(&"daemon_llm_adapters"));
+        assert!(names.contains(&"list_chat_intents"));
+        assert!(names.contains(&"run_chat_intent"));
     }
 
     #[test]
