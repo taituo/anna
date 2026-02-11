@@ -222,9 +222,15 @@ Vault provider ops:
 - `list [prefix]`
 
 Vault provider env config:
+- `ANNA_VAULT_BACKEND` (`file|http|vault|openbao`, default `file`)
 - `ANNA_VAULT_KV_FILE` (default `~/.anna/vault-kv.json`)
 - `ANNA_VAULT_PREFIX_ALLOW` (comma-separated key prefixes)
 - `ANNA_VAULT_READ_ONLY` (`true|false`)
+- `ANNA_VAULT_ADDR` (required for http backend)
+- `ANNA_VAULT_TOKEN` (required for http backend)
+- `ANNA_VAULT_MOUNT` (default `secret`)
+- `ANNA_VAULT_KV_VERSION` (`1|2`, default `2`)
+- `ANNA_VAULT_NAMESPACE` (optional)
 
 ## Triggers (daemon mode)
 

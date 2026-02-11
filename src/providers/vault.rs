@@ -2,7 +2,8 @@ use crate::expr::subst;
 use crate::providers::{Provider, ProviderError, ProviderResult};
 use crate::workflow::{Stage, Workflow};
 use async_trait::async_trait;
-use serde_json::json;
+use reqwest::{Method, StatusCode};
+use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
@@ -14,15 +15,46 @@ pub struct VaultProvider;
 
 #[derive(Debug, Clone)]
 struct VaultConfig {
+    backend: VaultBackend,
     kv_file: PathBuf,
     allow_prefixes: Option<Vec<String>>,
     read_only: bool,
+    http: Option<VaultHttpConfig>,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum VaultBackend {
+    File,
+    Http,
+}
+
+#[derive(Debug, Clone)]
+struct VaultHttpConfig {
+    addr: String,
+    token: String,
+    namespace: Option<String>,
+    mount: String,
+    kv_version: u8,
 }
 
 #[derive(Debug, Clone, Copy)]
 enum RenderMode {
     Text,
     Json,
+}
+
+#[derive(Debug, Clone)]
+enum VaultCommand {
+    Get { key: String },
+    Put { key: String, value: String },
+    Delete { key: String },
+    List { prefix: Option<String> },
+}
+
+impl VaultCommand {
+    fn is_mutating(&self) -> bool {
+        matches!(self, Self::Put { .. } | Self::Delete { .. })
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -52,68 +84,20 @@ impl Provider for VaultProvider {
         workflow: &Workflow,
         vars: &HashMap<String, String>,
         outputs: &HashMap<String, String>,
-        _timeout: Option<Duration>,
+        timeout: Option<Duration>,
     ) -> ProviderResult<String> {
         let tokens = parse_command_tokens(stage, vars, outputs)?;
         let mode = parse_render_mode(stage, vars, outputs)?;
-        let config = read_config(stage, workflow, vars, outputs);
+        let config = read_config(stage, workflow, vars, outputs)?;
+        let command = parse_vault_command(&tokens, stage, vars, outputs)?;
 
-        let _guard = store_lock().lock().await;
-        let mut store = load_store(&config.kv_file).await?;
-
-        let op = tokens[0].to_ascii_lowercase();
-        let result = match op.as_str() {
-            "get" => {
-                let key = required_key(&tokens, stage)?;
-                ensure_key_allowed(&config, stage, &key)?;
-                let value = store.get(&key).cloned().ok_or_else(|| {
-                    ProviderError::new(
-                        "provider_secret_not_found",
-                        format!("vault key '{}' not found in stage '{}'", key, stage.id),
-                    )
-                })?;
-                VaultOpResult::Get { key, value }
+        match &command {
+            VaultCommand::Get { key }
+            | VaultCommand::Put { key, .. }
+            | VaultCommand::Delete { key } => {
+                ensure_key_allowed(&config, stage, key)?;
             }
-            "put" | "set" => {
-                if config.read_only {
-                    return Err(ProviderError::new(
-                        "provider_exec_failed",
-                        format!("vault provider is read-only in stage '{}'", stage.id),
-                    ));
-                }
-                let key = required_key(&tokens, stage)?;
-                ensure_key_allowed(&config, stage, &key)?;
-                let value = match parse_value_from_tokens_or_stdin(&tokens, stage, vars, outputs)? {
-                    Some(v) => v,
-                    None => {
-                        return Err(ProviderError::new(
-                            "provider_exec_failed",
-                            format!(
-                                "vault put requires value in args or stdin for stage '{}'",
-                                stage.id
-                            ),
-                        ));
-                    }
-                };
-                store.insert(key.clone(), value);
-                save_store(&config.kv_file, &store).await?;
-                VaultOpResult::Put { key }
-            }
-            "delete" | "del" | "rm" => {
-                if config.read_only {
-                    return Err(ProviderError::new(
-                        "provider_exec_failed",
-                        format!("vault provider is read-only in stage '{}'", stage.id),
-                    ));
-                }
-                let key = required_key(&tokens, stage)?;
-                ensure_key_allowed(&config, stage, &key)?;
-                let deleted = store.remove(&key).is_some();
-                save_store(&config.kv_file, &store).await?;
-                VaultOpResult::Delete { key, deleted }
-            }
-            "list" => {
-                let prefix = tokens.get(1).cloned();
+            VaultCommand::List { prefix } => {
                 if let Some(prefix) = prefix.as_ref()
                     && !prefix.trim().is_empty()
                     && !key_allowed(&config, prefix)
@@ -126,30 +110,29 @@ impl Provider for VaultProvider {
                         ),
                     ));
                 }
-
-                let mut keys = store
-                    .keys()
-                    .filter(|key| {
-                        if let Some(prefix) = prefix.as_ref() {
-                            if !key.starts_with(prefix) {
-                                return false;
-                            }
-                        }
-                        key_allowed(&config, key)
-                    })
-                    .cloned()
-                    .collect::<Vec<_>>();
-                keys.sort();
-                VaultOpResult::List { prefix, keys }
             }
-            other => {
-                return Err(ProviderError::new(
-                    "provider_exec_failed",
-                    format!(
-                        "unsupported vault operation '{}' in stage '{}'; expected get|put|delete|list",
-                        other, stage.id
-                    ),
-                ));
+        }
+
+        if config.read_only && command.is_mutating() {
+            return Err(ProviderError::new(
+                "provider_exec_failed",
+                format!("vault provider is read-only in stage '{}'", stage.id),
+            ));
+        }
+
+        let result = match config.backend {
+            VaultBackend::File => execute_file_command(&config, command).await?,
+            VaultBackend::Http => {
+                let http = config.http.as_ref().ok_or_else(|| {
+                    ProviderError::new(
+                        "provider_start_failed",
+                        format!(
+                            "vault http backend missing configuration in stage '{}'",
+                            stage.id
+                        ),
+                    )
+                })?;
+                execute_http_command(http, command, timeout, stage).await?
             }
         };
 
@@ -232,12 +215,73 @@ fn parse_render_mode(
     }
 }
 
+fn parse_vault_command(
+    tokens: &[String],
+    stage: &Stage,
+    vars: &HashMap<String, String>,
+    outputs: &HashMap<String, String>,
+) -> ProviderResult<VaultCommand> {
+    if tokens.is_empty() {
+        return Err(ProviderError::new(
+            "provider_exec_failed",
+            format!("vault command is empty in stage '{}'", stage.id),
+        ));
+    }
+    let op = tokens[0].to_ascii_lowercase();
+    match op.as_str() {
+        "get" => {
+            let key = required_key(tokens, stage)?;
+            Ok(VaultCommand::Get { key })
+        }
+        "put" | "set" => {
+            let key = required_key(tokens, stage)?;
+            let value = parse_value_from_tokens_or_stdin(tokens, stage, vars, outputs)?
+                .ok_or_else(|| {
+                    ProviderError::new(
+                        "provider_exec_failed",
+                        format!(
+                            "vault put requires value in args or stdin for stage '{}'",
+                            stage.id
+                        ),
+                    )
+                })?;
+            Ok(VaultCommand::Put { key, value })
+        }
+        "delete" | "del" | "rm" => {
+            let key = required_key(tokens, stage)?;
+            Ok(VaultCommand::Delete { key })
+        }
+        "list" => {
+            let prefix = tokens
+                .get(1)
+                .cloned()
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty());
+            Ok(VaultCommand::List { prefix })
+        }
+        other => Err(ProviderError::new(
+            "provider_exec_failed",
+            format!(
+                "unsupported vault operation '{}' in stage '{}'; expected get|put|delete|list",
+                other, stage.id
+            ),
+        )),
+    }
+}
+
 fn read_config(
     stage: &Stage,
     workflow: &Workflow,
     vars: &HashMap<String, String>,
     outputs: &HashMap<String, String>,
-) -> VaultConfig {
+) -> ProviderResult<VaultConfig> {
+    let backend = parse_backend(
+        resolve_setting("ANNA_VAULT_BACKEND", stage, workflow, vars, outputs)
+            .as_deref()
+            .unwrap_or("file"),
+        stage,
+    )?;
+
     let kv_file = resolve_setting("ANNA_VAULT_KV_FILE", stage, workflow, vars, outputs)
         .map(PathBuf::from)
         .unwrap_or_else(default_vault_kv_file);
@@ -255,11 +299,105 @@ fn read_config(
         .map(|v| is_truthy(&v))
         .unwrap_or(false);
 
-    VaultConfig {
+    let http = match backend {
+        VaultBackend::File => None,
+        VaultBackend::Http => Some(read_http_config(stage, workflow, vars, outputs)?),
+    };
+
+    Ok(VaultConfig {
+        backend,
         kv_file,
         allow_prefixes,
         read_only,
+        http,
+    })
+}
+
+fn parse_backend(raw: &str, stage: &Stage) -> ProviderResult<VaultBackend> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "" | "file" => Ok(VaultBackend::File),
+        "http" | "vault" | "openbao" => Ok(VaultBackend::Http),
+        other => Err(ProviderError::new(
+            "provider_start_failed",
+            format!(
+                "unsupported ANNA_VAULT_BACKEND '{}' in stage '{}', expected file|http|vault|openbao",
+                other, stage.id
+            ),
+        )),
     }
+}
+
+fn read_http_config(
+    stage: &Stage,
+    workflow: &Workflow,
+    vars: &HashMap<String, String>,
+    outputs: &HashMap<String, String>,
+) -> ProviderResult<VaultHttpConfig> {
+    let addr =
+        resolve_setting("ANNA_VAULT_ADDR", stage, workflow, vars, outputs).ok_or_else(|| {
+            ProviderError::new(
+                "provider_start_failed",
+                format!(
+                    "ANNA_VAULT_ADDR is required for vault http backend in stage '{}'",
+                    stage.id
+                ),
+            )
+        })?;
+
+    let token =
+        resolve_setting("ANNA_VAULT_TOKEN", stage, workflow, vars, outputs).ok_or_else(|| {
+            ProviderError::new(
+                "provider_start_failed",
+                format!(
+                    "ANNA_VAULT_TOKEN is required for vault http backend in stage '{}'",
+                    stage.id
+                ),
+            )
+        })?;
+
+    let mount = resolve_setting("ANNA_VAULT_MOUNT", stage, workflow, vars, outputs)
+        .unwrap_or_else(|| "secret".to_string());
+    let mount = mount.trim().trim_matches('/').to_string();
+    if mount.is_empty() {
+        return Err(ProviderError::new(
+            "provider_start_failed",
+            format!("ANNA_VAULT_MOUNT cannot be empty for stage '{}'", stage.id),
+        ));
+    }
+
+    let kv_version = resolve_setting("ANNA_VAULT_KV_VERSION", stage, workflow, vars, outputs)
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| "2".to_string());
+    let kv_version = kv_version.parse::<u8>().map_err(|err| {
+        ProviderError::new(
+            "provider_start_failed",
+            format!(
+                "invalid ANNA_VAULT_KV_VERSION '{}' in stage '{}': {}",
+                kv_version, stage.id, err
+            ),
+        )
+    })?;
+    if kv_version != 1 && kv_version != 2 {
+        return Err(ProviderError::new(
+            "provider_start_failed",
+            format!(
+                "unsupported ANNA_VAULT_KV_VERSION '{}' in stage '{}', expected 1 or 2",
+                kv_version, stage.id
+            ),
+        ));
+    }
+
+    let namespace = resolve_setting("ANNA_VAULT_NAMESPACE", stage, workflow, vars, outputs)
+        .filter(|v| !v.trim().is_empty());
+
+    Ok(VaultHttpConfig {
+        addr,
+        token,
+        namespace,
+        mount,
+        kv_version,
+    })
 }
 
 fn resolve_setting(
@@ -309,6 +447,7 @@ fn required_key(tokens: &[String], stage: &Stage) -> ProviderResult<String> {
     tokens
         .get(1)
         .cloned()
+        .map(|v| normalize_key(&v))
         .filter(|v| !v.trim().is_empty())
         .ok_or_else(|| {
             ProviderError::new(
@@ -330,6 +469,10 @@ fn parse_value_from_tokens_or_stdin(
     Ok(stage.stdin.as_deref().map(|v| subst(v, vars, outputs)))
 }
 
+fn normalize_key(raw: &str) -> String {
+    raw.trim().trim_matches('/').to_string()
+}
+
 fn key_allowed(config: &VaultConfig, key: &str) -> bool {
     match config.allow_prefixes.as_ref() {
         None => true,
@@ -348,6 +491,420 @@ fn ensure_key_allowed(config: &VaultConfig, stage: &Stage, key: &str) -> Provide
             key, stage.id
         ),
     ))
+}
+
+async fn execute_file_command(
+    config: &VaultConfig,
+    command: VaultCommand,
+) -> ProviderResult<VaultOpResult> {
+    let _guard = store_lock().lock().await;
+    let mut store = load_store(&config.kv_file).await?;
+    match command {
+        VaultCommand::Get { key } => {
+            let value = store.get(&key).cloned().ok_or_else(|| {
+                ProviderError::new(
+                    "provider_secret_not_found",
+                    format!("vault key '{}' not found", key),
+                )
+            })?;
+            Ok(VaultOpResult::Get { key, value })
+        }
+        VaultCommand::Put { key, value } => {
+            store.insert(key.clone(), value);
+            save_store(&config.kv_file, &store).await?;
+            Ok(VaultOpResult::Put { key })
+        }
+        VaultCommand::Delete { key } => {
+            let deleted = store.remove(&key).is_some();
+            save_store(&config.kv_file, &store).await?;
+            Ok(VaultOpResult::Delete { key, deleted })
+        }
+        VaultCommand::List { prefix } => {
+            let mut keys = store
+                .keys()
+                .filter(|key| {
+                    if let Some(prefix) = prefix.as_ref()
+                        && !key.starts_with(prefix)
+                    {
+                        return false;
+                    }
+                    key_allowed(config, key)
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            keys.sort();
+            Ok(VaultOpResult::List { prefix, keys })
+        }
+    }
+}
+
+async fn execute_http_command(
+    config: &VaultHttpConfig,
+    command: VaultCommand,
+    timeout: Option<Duration>,
+    stage: &Stage,
+) -> ProviderResult<VaultOpResult> {
+    let client = reqwest::Client::builder()
+        .timeout(timeout.unwrap_or(Duration::from_secs(60)))
+        .build()
+        .map_err(|err| {
+            ProviderError::new(
+                "provider_start_failed",
+                format!(
+                    "failed creating vault http client in stage '{}': {}",
+                    stage.id, err
+                ),
+            )
+        })?;
+
+    match command {
+        VaultCommand::Get { key } => http_get(&client, config, stage, key).await,
+        VaultCommand::Put { key, value } => http_put(&client, config, stage, key, value).await,
+        VaultCommand::Delete { key } => http_delete(&client, config, stage, key).await,
+        VaultCommand::List { prefix } => http_list(&client, config, stage, prefix).await,
+    }
+}
+
+async fn http_get(
+    client: &reqwest::Client,
+    config: &VaultHttpConfig,
+    stage: &Stage,
+    key: String,
+) -> ProviderResult<VaultOpResult> {
+    let url = build_get_url(config, &key);
+    let response = with_vault_headers(client.get(&url), config)
+        .send()
+        .await
+        .map_err(|err| {
+            ProviderError::new(
+                "provider_exec_failed",
+                format!("vault get request failed in stage '{}': {}", stage.id, err),
+            )
+        })?;
+
+    let status = response.status();
+    let body = response.text().await.map_err(|err| {
+        ProviderError::new(
+            "provider_exec_failed",
+            format!(
+                "failed reading vault get response in stage '{}': {}",
+                stage.id, err
+            ),
+        )
+    })?;
+
+    if status == StatusCode::NOT_FOUND {
+        return Err(ProviderError::new(
+            "provider_secret_not_found",
+            format!("vault key '{}' not found in stage '{}'", key, stage.id),
+        ));
+    }
+    if !status.is_success() {
+        return Err(ProviderError::new(
+            "provider_exec_failed",
+            format!(
+                "vault get failed in stage '{}' with status {}: {}",
+                stage.id, status, body
+            ),
+        ));
+    }
+
+    let payload: Value = serde_json::from_str(&body).map_err(|err| {
+        ProviderError::new(
+            "provider_invalid_response",
+            format!(
+                "vault get returned invalid json in stage '{}': {}",
+                stage.id, err
+            ),
+        )
+    })?;
+
+    let value = extract_value_from_get(&payload, config.kv_version).ok_or_else(|| {
+        ProviderError::new(
+            "provider_invalid_response",
+            format!(
+                "vault get response missing value for key '{}' in stage '{}'",
+                key, stage.id
+            ),
+        )
+    })?;
+
+    Ok(VaultOpResult::Get { key, value })
+}
+
+async fn http_put(
+    client: &reqwest::Client,
+    config: &VaultHttpConfig,
+    stage: &Stage,
+    key: String,
+    value: String,
+) -> ProviderResult<VaultOpResult> {
+    let url = build_put_url(config, &key);
+    let body = if config.kv_version == 2 {
+        json!({"data": {"value": value}})
+    } else {
+        json!({"value": value})
+    };
+
+    let response = with_vault_headers(client.post(&url), config)
+        .json(&body)
+        .send()
+        .await
+        .map_err(|err| {
+            ProviderError::new(
+                "provider_exec_failed",
+                format!("vault put request failed in stage '{}': {}", stage.id, err),
+            )
+        })?;
+
+    let status = response.status();
+    let body = response.text().await.map_err(|err| {
+        ProviderError::new(
+            "provider_exec_failed",
+            format!(
+                "failed reading vault put response in stage '{}': {}",
+                stage.id, err
+            ),
+        )
+    })?;
+
+    if !status.is_success() {
+        return Err(ProviderError::new(
+            "provider_exec_failed",
+            format!(
+                "vault put failed in stage '{}' with status {}: {}",
+                stage.id, status, body
+            ),
+        ));
+    }
+
+    Ok(VaultOpResult::Put { key })
+}
+
+async fn http_delete(
+    client: &reqwest::Client,
+    config: &VaultHttpConfig,
+    stage: &Stage,
+    key: String,
+) -> ProviderResult<VaultOpResult> {
+    let url = build_delete_url(config, &key);
+    let response = with_vault_headers(client.delete(&url), config)
+        .send()
+        .await
+        .map_err(|err| {
+            ProviderError::new(
+                "provider_exec_failed",
+                format!(
+                    "vault delete request failed in stage '{}': {}",
+                    stage.id, err
+                ),
+            )
+        })?;
+
+    let status = response.status();
+    let body = response.text().await.map_err(|err| {
+        ProviderError::new(
+            "provider_exec_failed",
+            format!(
+                "failed reading vault delete response in stage '{}': {}",
+                stage.id, err
+            ),
+        )
+    })?;
+
+    if status == StatusCode::NOT_FOUND {
+        return Ok(VaultOpResult::Delete {
+            key,
+            deleted: false,
+        });
+    }
+    if !status.is_success() {
+        return Err(ProviderError::new(
+            "provider_exec_failed",
+            format!(
+                "vault delete failed in stage '{}' with status {}: {}",
+                stage.id, status, body
+            ),
+        ));
+    }
+
+    Ok(VaultOpResult::Delete { key, deleted: true })
+}
+
+async fn http_list(
+    client: &reqwest::Client,
+    config: &VaultHttpConfig,
+    stage: &Stage,
+    prefix: Option<String>,
+) -> ProviderResult<VaultOpResult> {
+    let url = build_list_url(config, prefix.as_deref());
+    let list_method = Method::from_bytes(b"LIST").map_err(|err| {
+        ProviderError::new(
+            "provider_start_failed",
+            format!(
+                "failed creating LIST method in stage '{}': {}",
+                stage.id, err
+            ),
+        )
+    })?;
+
+    let mut response = with_vault_headers(client.request(list_method, &url), config)
+        .send()
+        .await
+        .map_err(|err| {
+            ProviderError::new(
+                "provider_exec_failed",
+                format!("vault list request failed in stage '{}': {}", stage.id, err),
+            )
+        })?;
+
+    if matches!(
+        response.status(),
+        StatusCode::METHOD_NOT_ALLOWED | StatusCode::BAD_REQUEST
+    ) {
+        response = with_vault_headers(client.get(&url).query(&[("list", "true")]), config)
+            .send()
+            .await
+            .map_err(|err| {
+                ProviderError::new(
+                    "provider_exec_failed",
+                    format!(
+                        "vault list fallback request failed in stage '{}': {}",
+                        stage.id, err
+                    ),
+                )
+            })?;
+    }
+
+    let status = response.status();
+    let body = response.text().await.map_err(|err| {
+        ProviderError::new(
+            "provider_exec_failed",
+            format!(
+                "failed reading vault list response in stage '{}': {}",
+                stage.id, err
+            ),
+        )
+    })?;
+
+    if status == StatusCode::NOT_FOUND {
+        return Ok(VaultOpResult::List {
+            prefix,
+            keys: Vec::new(),
+        });
+    }
+    if !status.is_success() {
+        return Err(ProviderError::new(
+            "provider_exec_failed",
+            format!(
+                "vault list failed in stage '{}' with status {}: {}",
+                stage.id, status, body
+            ),
+        ));
+    }
+
+    let payload: Value = serde_json::from_str(&body).map_err(|err| {
+        ProviderError::new(
+            "provider_invalid_response",
+            format!(
+                "vault list returned invalid json in stage '{}': {}",
+                stage.id, err
+            ),
+        )
+    })?;
+
+    let mut keys = payload
+        .pointer("/data/keys")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str())
+                .map(ToOwned::to_owned)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    keys.sort();
+
+    Ok(VaultOpResult::List { prefix, keys })
+}
+
+fn extract_value_from_get(payload: &Value, kv_version: u8) -> Option<String> {
+    let candidate = if kv_version == 2 {
+        payload
+            .pointer("/data/data/value")
+            .or_else(|| payload.pointer("/data/value"))
+    } else {
+        payload
+            .pointer("/data/value")
+            .or_else(|| payload.pointer("/data"))
+    }?;
+
+    match candidate {
+        Value::String(v) => Some(v.clone()),
+        Value::Number(_) | Value::Bool(_) | Value::Array(_) | Value::Object(_) => {
+            Some(candidate.to_string())
+        }
+        Value::Null => None,
+    }
+}
+
+fn with_vault_headers(
+    builder: reqwest::RequestBuilder,
+    config: &VaultHttpConfig,
+) -> reqwest::RequestBuilder {
+    let mut builder = builder.header("X-Vault-Token", &config.token);
+    if let Some(namespace) = config.namespace.as_ref().filter(|v| !v.trim().is_empty()) {
+        builder = builder.header("X-Vault-Namespace", namespace);
+    }
+    builder
+}
+
+fn build_get_url(config: &VaultHttpConfig, key: &str) -> String {
+    if config.kv_version == 2 {
+        join_addr(
+            &config.addr,
+            &format!("v1/{}/data/{}", config.mount, normalize_key(key)),
+        )
+    } else {
+        join_addr(
+            &config.addr,
+            &format!("v1/{}/{}", config.mount, normalize_key(key)),
+        )
+    }
+}
+
+fn build_put_url(config: &VaultHttpConfig, key: &str) -> String {
+    build_get_url(config, key)
+}
+
+fn build_delete_url(config: &VaultHttpConfig, key: &str) -> String {
+    build_get_url(config, key)
+}
+
+fn build_list_url(config: &VaultHttpConfig, prefix: Option<&str>) -> String {
+    let prefix = prefix.map(normalize_key).unwrap_or_default();
+    if config.kv_version == 2 {
+        if prefix.is_empty() {
+            join_addr(&config.addr, &format!("v1/{}/metadata", config.mount))
+        } else {
+            join_addr(
+                &config.addr,
+                &format!("v1/{}/metadata/{}", config.mount, prefix),
+            )
+        }
+    } else if prefix.is_empty() {
+        join_addr(&config.addr, &format!("v1/{}", config.mount))
+    } else {
+        join_addr(&config.addr, &format!("v1/{}/{}", config.mount, prefix))
+    }
+}
+
+fn join_addr(addr: &str, path: &str) -> String {
+    format!(
+        "{}/{}",
+        addr.trim_end_matches('/'),
+        path.trim_start_matches('/')
+    )
 }
 
 async fn load_store(path: &Path) -> ProviderResult<HashMap<String, String>> {
@@ -432,9 +989,14 @@ mod tests {
     use super::VaultProvider;
     use crate::providers::Provider;
     use crate::workflow::{Stage, Workflow};
-    use serde_json::Value;
+    use axum::extract::{Path as AxumPath, State};
+    use axum::http::{HeaderMap, Method, StatusCode};
+    use axum::{Json, Router, routing::any, routing::get};
+    use serde_json::{Value, json};
     use std::collections::HashMap;
     use std::path::PathBuf;
+    use std::sync::Arc;
+    use tokio::sync::Mutex;
 
     fn make_workflow_with_env(env: HashMap<String, String>) -> Workflow {
         Workflow {
@@ -471,10 +1033,10 @@ mod tests {
     #[tokio::test]
     async fn put_get_list_delete_roundtrip_text() {
         let file = temp_vault_file();
-        let workflow = make_workflow_with_env(HashMap::from([(
-            "ANNA_VAULT_KV_FILE".to_string(),
-            file.display().to_string(),
-        )]));
+        let workflow = make_workflow_with_env(HashMap::from([
+            ("ANNA_VAULT_BACKEND".to_string(), "file".to_string()),
+            ("ANNA_VAULT_KV_FILE".to_string(), file.display().to_string()),
+        ]));
 
         let out = VaultProvider
             .run(
@@ -542,10 +1104,10 @@ mod tests {
     #[tokio::test]
     async fn json_mode_outputs_structured_payload() {
         let file = temp_vault_file();
-        let workflow = make_workflow_with_env(HashMap::from([(
-            "ANNA_VAULT_KV_FILE".to_string(),
-            file.display().to_string(),
-        )]));
+        let workflow = make_workflow_with_env(HashMap::from([
+            ("ANNA_VAULT_BACKEND".to_string(), "file".to_string()),
+            ("ANNA_VAULT_KV_FILE".to_string(), file.display().to_string()),
+        ]));
 
         let mut put = stage_with_args("put", vec!["put", "kv/prod/key", "secret"]);
         put.parse = Some("json".to_string());
@@ -578,6 +1140,7 @@ mod tests {
     async fn allowlist_blocks_disallowed_keys() {
         let file = temp_vault_file();
         let workflow = make_workflow_with_env(HashMap::from([
+            ("ANNA_VAULT_BACKEND".to_string(), "file".to_string()),
             ("ANNA_VAULT_KV_FILE".to_string(), file.display().to_string()),
             (
                 "ANNA_VAULT_PREFIX_ALLOW".to_string(),
@@ -621,6 +1184,7 @@ mod tests {
             .expect("seed vault file");
 
         let workflow = make_workflow_with_env(HashMap::from([
+            ("ANNA_VAULT_BACKEND".to_string(), "file".to_string()),
             ("ANNA_VAULT_KV_FILE".to_string(), file.display().to_string()),
             ("ANNA_VAULT_READ_ONLY".to_string(), "true".to_string()),
         ]));
@@ -651,5 +1215,213 @@ mod tests {
         assert!(err.message.contains("read-only"));
 
         let _ = tokio::fs::remove_file(file).await;
+    }
+
+    #[tokio::test]
+    async fn http_backend_roundtrip_kv_v2() {
+        let addr = spawn_mock_vault_server().await;
+        let workflow = make_workflow_with_env(HashMap::from([
+            ("ANNA_VAULT_BACKEND".to_string(), "http".to_string()),
+            ("ANNA_VAULT_ADDR".to_string(), addr),
+            ("ANNA_VAULT_TOKEN".to_string(), "test-token".to_string()),
+            ("ANNA_VAULT_MOUNT".to_string(), "secret".to_string()),
+            ("ANNA_VAULT_KV_VERSION".to_string(), "2".to_string()),
+        ]));
+
+        let out = VaultProvider
+            .run(
+                &stage_with_args("put", vec!["put", "kv/prod/token", "hello"]),
+                &workflow,
+                &HashMap::new(),
+                &HashMap::new(),
+                None,
+            )
+            .await
+            .expect("http put should succeed");
+        assert_eq!(out, "ok");
+
+        let out = VaultProvider
+            .run(
+                &stage_with_args("get", vec!["get", "kv/prod/token"]),
+                &workflow,
+                &HashMap::new(),
+                &HashMap::new(),
+                None,
+            )
+            .await
+            .expect("http get should succeed");
+        assert_eq!(out, "hello");
+
+        let out = VaultProvider
+            .run(
+                &stage_with_args("list", vec!["list", "kv/prod"]),
+                &workflow,
+                &HashMap::new(),
+                &HashMap::new(),
+                None,
+            )
+            .await
+            .expect("http list should succeed");
+        assert_eq!(out, "kv/prod/token");
+
+        let out = VaultProvider
+            .run(
+                &stage_with_args("delete", vec!["delete", "kv/prod/token"]),
+                &workflow,
+                &HashMap::new(),
+                &HashMap::new(),
+                None,
+            )
+            .await
+            .expect("http delete should succeed");
+        assert_eq!(out, "ok");
+    }
+
+    #[tokio::test]
+    async fn http_backend_requires_addr_and_token() {
+        let workflow = make_workflow_with_env(HashMap::from([
+            ("ANNA_VAULT_BACKEND".to_string(), "http".to_string()),
+            ("ANNA_VAULT_MOUNT".to_string(), "secret".to_string()),
+        ]));
+        let err = VaultProvider
+            .run(
+                &stage_with_args("get", vec!["get", "kv/prod/token"]),
+                &workflow,
+                &HashMap::new(),
+                &HashMap::new(),
+                None,
+            )
+            .await
+            .expect_err("http backend should require config");
+        assert_eq!(err.code, "provider_start_failed");
+        assert!(err.message.contains("ANNA_VAULT_ADDR"));
+    }
+
+    #[derive(Default)]
+    struct MockVaultState {
+        store: Mutex<HashMap<String, String>>,
+    }
+
+    async fn spawn_mock_vault_server() -> String {
+        let state = Arc::new(MockVaultState::default());
+        let app = Router::new()
+            .route(
+                "/v1/secret/data/{*path}",
+                get(mock_get).post(mock_put).delete(mock_delete),
+            )
+            .route("/v1/secret/metadata", any(mock_list_root))
+            .route("/v1/secret/metadata/{*path}", any(mock_list))
+            .with_state(state);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock vault listener");
+        let addr = listener
+            .local_addr()
+            .expect("read mock vault listener addr");
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        format!("http://{}", addr)
+    }
+
+    fn authorize(headers: &HeaderMap) -> Result<(), (StatusCode, String)> {
+        let token = headers
+            .get("X-Vault-Token")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default();
+        if token != "test-token" {
+            return Err((StatusCode::FORBIDDEN, "forbidden".to_string()));
+        }
+        Ok(())
+    }
+
+    async fn mock_get(
+        State(state): State<Arc<MockVaultState>>,
+        headers: HeaderMap,
+        AxumPath(path): AxumPath<String>,
+    ) -> Result<Json<Value>, (StatusCode, String)> {
+        authorize(&headers)?;
+        let key = path.trim_matches('/').to_string();
+        let store = state.store.lock().await;
+        let Some(value) = store.get(&key) else {
+            return Err((StatusCode::NOT_FOUND, "not found".to_string()));
+        };
+        Ok(Json(json!({"data": {"data": {"value": value}}})))
+    }
+
+    async fn mock_put(
+        State(state): State<Arc<MockVaultState>>,
+        headers: HeaderMap,
+        AxumPath(path): AxumPath<String>,
+        Json(body): Json<Value>,
+    ) -> Result<StatusCode, (StatusCode, String)> {
+        authorize(&headers)?;
+        let key = path.trim_matches('/').to_string();
+        let value = body
+            .pointer("/data/value")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
+        let mut store = state.store.lock().await;
+        store.insert(key, value);
+        Ok(StatusCode::NO_CONTENT)
+    }
+
+    async fn mock_delete(
+        State(state): State<Arc<MockVaultState>>,
+        headers: HeaderMap,
+        AxumPath(path): AxumPath<String>,
+    ) -> Result<StatusCode, (StatusCode, String)> {
+        authorize(&headers)?;
+        let key = path.trim_matches('/').to_string();
+        let mut store = state.store.lock().await;
+        if store.remove(&key).is_some() {
+            Ok(StatusCode::NO_CONTENT)
+        } else {
+            Err((StatusCode::NOT_FOUND, "not found".to_string()))
+        }
+    }
+
+    async fn mock_list_root(
+        method: Method,
+        State(state): State<Arc<MockVaultState>>,
+        headers: HeaderMap,
+    ) -> Result<Json<Value>, (StatusCode, String)> {
+        mock_list_impl(method, state, headers, "").await
+    }
+
+    async fn mock_list(
+        method: Method,
+        State(state): State<Arc<MockVaultState>>,
+        headers: HeaderMap,
+        AxumPath(path): AxumPath<String>,
+    ) -> Result<Json<Value>, (StatusCode, String)> {
+        mock_list_impl(method, state, headers, &path).await
+    }
+
+    async fn mock_list_impl(
+        method: Method,
+        state: Arc<MockVaultState>,
+        headers: HeaderMap,
+        prefix: &str,
+    ) -> Result<Json<Value>, (StatusCode, String)> {
+        authorize(&headers)?;
+        if method.as_str() != "LIST" && method != Method::GET {
+            return Err((
+                StatusCode::METHOD_NOT_ALLOWED,
+                "method not allowed".to_string(),
+            ));
+        }
+
+        let prefix = prefix.trim_matches('/').to_string();
+        let store = state.store.lock().await;
+        let mut keys = store
+            .keys()
+            .filter(|key| prefix.is_empty() || key.starts_with(&prefix))
+            .cloned()
+            .collect::<Vec<_>>();
+        keys.sort();
+        Ok(Json(json!({"data": {"keys": keys}})))
     }
 }

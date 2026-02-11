@@ -114,6 +114,17 @@ ANNA_VAULT_PREFIX_ALLOW="kv/prod/,kv/shared/" anna daemon --plays-dir .
 ANNA_VAULT_READ_ONLY=true anna daemon --plays-dir .
 ```
 
+Native vault provider HTTP/OpenBao backend (optional):
+
+```bash
+ANNA_VAULT_BACKEND=http \
+ANNA_VAULT_ADDR=http://127.0.0.1:8200 \
+ANNA_VAULT_TOKEN=... \
+ANNA_VAULT_MOUNT=secret \
+ANNA_VAULT_KV_VERSION=2 \
+anna run flow.anna
+```
+
 Optional owner concurrency policy (per `owner` in registry):
 
 ```bash
