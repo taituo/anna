@@ -121,6 +121,9 @@ ANNA_TRIGGER_LEASE_TTL_SEC=15 \
 anna daemon --plays-dir .
 ```
 
+When trigger leader lease is enabled, `POST /hook/{name}` is accepted only on the current leader node.
+Follower nodes return `409 Conflict` to prevent duplicate webhook-triggered launches.
+
 `chat.intents.yml` example:
 
 ```yaml
@@ -184,6 +187,14 @@ Optional owner concurrency policy (per `owner` in registry):
 ANNA_OWNER_MAX_CONCURRENCY="platform=4,research=2,*=1" anna daemon --plays-dir .
 ```
 
+Optional append-only audit log (NDJSON, one JSON event per line):
+
+```bash
+ANNA_AUDIT_LOG_FILE=/var/log/anna/audit.ndjson anna daemon --plays-dir .
+```
+
+Emitted events include daemon startup, workflow launch/finish, stop requests, chat intent launch/block, webhook trigger outcomes, and HITL resolutions.
+
 Optional LLM adapter catalog (provider-independent wrapper routing):
 
 ```bash
@@ -240,6 +251,7 @@ This repository now includes a Rust runtime foundation in `src/`:
 - executor with `needs`, `when`, retry, timeout, hooks, `stage.loop`/`break_when`/`max_iterations`, session logs, and `stage.worktree` git isolation
 - session metadata files (`/tmp/anna/<session>/_meta.json`) with parent/child linkage
 - daemon API + trigger scheduler (`health`, workflow submit/status/stop/logs, `/hook/*`, `/hitl/*`, `/ws`, plus `trigger.interval|cron|watch`)
+- optional append-only daemon audit log (`ANNA_AUDIT_LOG_FILE`) for operational events
 
 Run locally:
 

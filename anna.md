@@ -461,10 +461,15 @@ ANNA_DAEMON_NODE_ID=node-a \
 ANNA_TRIGGER_LEASE_FILE=/shared/anna-trigger-lease.json \
 ANNA_TRIGGER_LEASE_TTL_SEC=15 \
 anna daemon
+
+# optional append-only audit log (NDJSON)
+ANNA_AUDIT_LOG_FILE=/var/log/anna/audit.ndjson anna daemon
 ```
 
 When both are set, `ANNA_CHAT_INTENTS` overrides matching keys from `ANNA_CHAT_INTENTS_FILE`.
 Chat caller guardrails use `x-anna-caller` (fallback `x-anna-role`) request header.
+When trigger leader lease is enabled, `POST /hook/{name}` is accepted only on the leader node and follower nodes return `409 Conflict`.
+If `ANNA_AUDIT_LOG_FILE` is set, daemon writes append-only NDJSON events (for example `daemon_started`, `workflow_launched`, `workflow_finished`, `hook_triggered`, `chat_intent_blocked`, `hitl_resolved`).
 
 `chat.intents.yml` supports optional guardrails:
 

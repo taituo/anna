@@ -21,6 +21,7 @@ use std::path::{Path as FsPath, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use tokio::io::AsyncWriteExt;
 use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
 use tokio::time::{Duration, sleep};
@@ -33,6 +34,7 @@ struct AppState {
     chat_intents: Arc<RwLock<HashMap<String, ChatIntentConfig>>>,
     trigger_lease: Option<TriggerLeaseConfig>,
     trigger_leader_state: Arc<RwLock<TriggerLeaderState>>,
+    audit_log: Option<AuditLogConfig>,
     node_capabilities: HashSet<String>,
     allowed_providers: Option<HashSet<String>>,
     owner_policy: OwnerConcurrencyPolicy,
@@ -479,6 +481,12 @@ struct TriggerLeaderState {
     lease_file: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+struct AuditLogConfig {
+    path: PathBuf,
+    node_id: String,
+}
+
 #[derive(Debug, Clone, Copy)]
 struct RetentionConfig {
     max_sessions: usize,
@@ -538,6 +546,7 @@ pub async fn run_daemon(bind: &str, plays_dir: PathBuf) -> Result<()> {
     let registry_file = flow_registry_file();
     let node_id = daemon_node_id();
     let trigger_lease = trigger_lease_config(&node_id);
+    let audit_log = daemon_audit_log_config(&node_id);
     let chat_intents = daemon_chat_intents();
     let chat_reload_interval = chat_intents_reload_interval();
     let retention = daemon_retention_config();
@@ -566,6 +575,7 @@ pub async fn run_daemon(bind: &str, plays_dir: PathBuf) -> Result<()> {
         chat_intents: chat_intents_state,
         trigger_lease: trigger_lease.clone(),
         trigger_leader_state,
+        audit_log: audit_log.clone(),
         node_capabilities: node_capabilities.clone(),
         allowed_providers: allowed_providers.clone(),
         owner_policy: owner_policy.clone(),
@@ -607,6 +617,9 @@ pub async fn run_daemon(bind: &str, plays_dir: PathBuf) -> Result<()> {
             println!("anna-rs trigger lease: disabled node_id={}", node_id);
         }
     }
+    if let Some(audit) = audit_log.as_ref() {
+        println!("anna-rs audit log enabled at {}", audit.path.display());
+    }
     if chat_intents_file().is_some() {
         if let Some(interval) = chat_reload_interval {
             println!(
@@ -640,6 +653,20 @@ pub async fn run_daemon(bind: &str, plays_dir: PathBuf) -> Result<()> {
         }
         println!("anna-rs owner concurrency policy: {}", entries.join(","));
     }
+    emit_audit_event(
+        &state,
+        "daemon_started",
+        json!({
+            "bind": bind,
+            "registry_enabled": state.registry_file.is_some(),
+            "auth_enabled": state.auth_token.is_some(),
+            "chat_intents_count": chat_intents.len(),
+            "trigger_lease_enabled": trigger_lease.is_some(),
+            "allowed_providers": sorted_set_values(state.allowed_providers.as_ref()),
+            "node_capabilities": sorted_set_values(Some(&state.node_capabilities)),
+        }),
+    )
+    .await;
 
     let app = Router::new()
         .route("/health", get(health))
@@ -986,7 +1013,7 @@ async fn start_workflow(
         }
     }
 
-    let req_id = match launch_workflow(&state, workflow, None, None).await {
+    let req_id = match launch_workflow(&state, workflow, None, None, "api_workflow_body").await {
         Ok(v) => v,
         Err(err) => {
             return (
@@ -1093,7 +1120,15 @@ async fn run_registered_workflow(
                 .into_response();
         }
     };
-    let req_id = match launch_registered_entry_with_options(&state, &entry, &name, options).await {
+    let req_id = match launch_registered_entry_with_options(
+        &state,
+        &entry,
+        &name,
+        options,
+        "api_workflow_named",
+    )
+    .await
+    {
         Ok(v) => v,
         Err(resp) => return resp,
     };
@@ -1291,6 +1326,18 @@ async fn run_chat_intent(
     let guardrails =
         evaluate_chat_intent_guardrails(&rule, &entry, request.max_iterations, caller.as_deref());
     if !guardrails.reasons.is_empty() {
+        emit_audit_event(
+            &state,
+            "chat_intent_blocked",
+            json!({
+                "intent": intent.clone(),
+                "workflow": entry.workflow_name.clone(),
+                "caller": caller.clone(),
+                "reasons": guardrails.reasons.clone(),
+                "requested_max_iterations": request.max_iterations,
+            }),
+        )
+        .await;
         return (
             StatusCode::FORBIDDEN,
             format!(
@@ -1307,11 +1354,31 @@ async fn run_chat_intent(
         vars: request.vars,
         max_iterations: guardrails.effective_max_iterations,
     };
-    let req_id =
-        match launch_registered_entry_with_options(&state, &entry, &rule.workflow, options).await {
-            Ok(v) => v,
-            Err(resp) => return resp,
-        };
+    let launch_source = format!("chat_intent:{}", intent);
+    let req_id = match launch_registered_entry_with_options(
+        &state,
+        &entry,
+        &rule.workflow,
+        options,
+        &launch_source,
+    )
+    .await
+    {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
+    emit_audit_event(
+        &state,
+        "chat_intent_launched",
+        json!({
+            "intent": intent.clone(),
+            "workflow": workflow.clone(),
+            "caller": caller.clone(),
+            "request_id": req_id.clone(),
+            "effective_max_iterations": guardrails.effective_max_iterations,
+        }),
+    )
+    .await;
 
     (
         StatusCode::ACCEPTED,
@@ -1429,8 +1496,30 @@ async fn stop_workflow(
             info.clone()
         };
         prune_sessions_in_place(&mut sessions, state.retention.max_sessions);
+        drop(sessions);
+        emit_audit_event(
+            &state,
+            "workflow_stop",
+            json!({
+                "request_id": updated.id,
+                "workflow": updated.workflow,
+                "status": updated.status,
+                "stopped_task": stopped,
+            }),
+        )
+        .await;
         return (StatusCode::OK, Json(updated)).into_response();
     }
+    drop(sessions);
+
+    emit_audit_event(
+        &state,
+        "workflow_stop_not_found",
+        json!({
+            "request_id": id,
+        }),
+    )
+    .await;
 
     (StatusCode::NOT_FOUND, "session not found").into_response()
 }
@@ -1444,12 +1533,48 @@ async fn trigger_hook(
         return resp;
     }
     let hook_path = format!("/{}", name.trim_matches('/'));
+    let leader_state = state.trigger_leader_state.read().await.clone();
+    if leader_state.enabled && !leader_state.is_leader {
+        emit_audit_event(
+            &state,
+            "hook_rejected_not_leader",
+            json!({
+                "hook": hook_path.clone(),
+                "node_id": leader_state.node_id.clone(),
+                "leader": leader_state.holder.clone(),
+                "expires_at": leader_state.expires_at,
+            }),
+        )
+        .await;
+        return (
+            StatusCode::CONFLICT,
+            format!(
+                "hook '{}' rejected on follower node '{}' (leader='{}')",
+                hook_path,
+                leader_state.node_id,
+                leader_state
+                    .holder
+                    .clone()
+                    .unwrap_or_else(|| "unknown".to_string())
+            ),
+        )
+            .into_response();
+    }
     let entries =
         match find_workflow_entries_with_registry(&state.plays_dir, state.registry_file.as_deref())
             .await
         {
             Ok(v) => v,
             Err(err) => {
+                emit_audit_event(
+                    &state,
+                    "hook_scan_failed",
+                    json!({
+                        "hook": hook_path.clone(),
+                        "error": err.to_string(),
+                    }),
+                )
+                .await;
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     format!("failed scanning workflows: {}", err),
@@ -1510,8 +1635,29 @@ async fn trigger_hook(
         && skipped_provider.is_empty()
         && skipped_concurrency.is_empty()
     {
+        emit_audit_event(
+            &state,
+            "hook_no_match",
+            json!({
+                "hook": hook_path.clone(),
+            }),
+        )
+        .await;
         return (StatusCode::NOT_FOUND, "no workflows for hook").into_response();
     }
+    emit_audit_event(
+        &state,
+        "hook_triggered",
+        json!({
+            "hook": hook_path.clone(),
+            "launched": launched.len(),
+            "skipped_running": skipped_running.len(),
+            "skipped_capability": skipped_capability.len(),
+            "skipped_provider": skipped_provider.len(),
+            "skipped_concurrency": skipped_concurrency.len(),
+        }),
+    )
+    .await;
     (
         StatusCode::ACCEPTED,
         Json(HookTriggerResponse {
@@ -1612,6 +1758,19 @@ async fn resolve_hitl(
         item.clone()
     };
     prune_hitl_in_place(&mut pending, state.retention.max_hitl);
+    drop(pending);
+    emit_audit_event(
+        &state,
+        "hitl_resolved",
+        json!({
+            "hitl_id": updated.id,
+            "session_id": updated.session_id,
+            "workflow": updated.workflow,
+            "stage_id": updated.stage_id,
+            "decision": updated.decision,
+        }),
+    )
+    .await;
     (StatusCode::OK, Json(updated)).into_response()
 }
 
@@ -2220,6 +2379,81 @@ fn daemon_auth_token() -> Option<String> {
         .filter(|v| !v.is_empty())
 }
 
+fn daemon_audit_log_config(node_id: &str) -> Option<AuditLogConfig> {
+    let Ok(raw) = std::env::var("ANNA_AUDIT_LOG_FILE") else {
+        return None;
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty()
+        || trimmed.eq_ignore_ascii_case("off")
+        || trimmed.eq_ignore_ascii_case("false")
+    {
+        return None;
+    }
+    Some(AuditLogConfig {
+        path: PathBuf::from(trimmed),
+        node_id: node_id.to_string(),
+    })
+}
+
+fn sorted_set_values(set: Option<&HashSet<String>>) -> Vec<String> {
+    let mut values = set
+        .map(|v| v.iter().cloned().collect::<Vec<_>>())
+        .unwrap_or_default();
+    values.sort();
+    values
+}
+
+async fn emit_audit_event(state: &AppState, event: &str, data: serde_json::Value) {
+    let Some(config) = state.audit_log.as_ref() else {
+        return;
+    };
+    if let Err(err) = append_audit_event(config, event, data).await {
+        eprintln!(
+            "anna-rs daemon: failed writing audit event '{}': {}",
+            event, err
+        );
+    }
+}
+
+async fn append_audit_event(
+    config: &AuditLogConfig,
+    event: &str,
+    data: serde_json::Value,
+) -> Result<()> {
+    if let Some(parent) = config.path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        tokio::fs::create_dir_all(parent).await.with_context(|| {
+            format!(
+                "failed creating audit log parent directory '{}'",
+                parent.display()
+            )
+        })?;
+    }
+    let mut file = tokio::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&config.path)
+        .await
+        .with_context(|| format!("failed opening audit log '{}'", config.path.display()))?;
+    let mut encoded = serde_json::to_vec(&json!({
+        "ts": now_unix_secs(),
+        "node_id": config.node_id,
+        "event": event,
+        "data": data,
+    }))
+    .context("failed serializing audit event")?;
+    encoded.push(b'\n');
+    file.write_all(&encoded)
+        .await
+        .with_context(|| format!("failed appending audit log '{}'", config.path.display()))?;
+    file.flush()
+        .await
+        .with_context(|| format!("failed flushing audit log '{}'", config.path.display()))?;
+    Ok(())
+}
+
 fn daemon_node_id() -> String {
     if let Ok(raw) = std::env::var("ANNA_DAEMON_NODE_ID") {
         let trimmed = raw.trim();
@@ -2745,6 +2979,16 @@ async fn chat_intents_reload_loop(state: AppState, interval: Duration) {
             } else {
                 println!("anna-rs chat intents reloaded: {}", routes.join(","));
             }
+            drop(write);
+            emit_audit_event(
+                &state,
+                "chat_intents_reloaded",
+                json!({
+                    "count": next.len(),
+                    "routes": routes,
+                }),
+            )
+            .await;
         }
     }
 }
@@ -3381,7 +3625,8 @@ async fn launch_workflow_from_entry(
     if wf.workdir.is_none() {
         wf.workdir = Some(state.plays_dir.display().to_string());
     }
-    let req_id = launch_workflow(state, wf, None, entry.owner.clone()).await?;
+    let source = format!("trigger:{}", trigger_source);
+    let req_id = launch_workflow(state, wf, None, entry.owner.clone(), &source).await?;
     println!(
         "anna-rs daemon trigger={} workflow='{}' request_id={}",
         trigger_source, entry.workflow_name, req_id
@@ -3412,6 +3657,7 @@ async fn launch_registered_entry_with_options(
     entry: &WorkflowEntry,
     requested_name: &str,
     options: RunRegisteredOptions,
+    launch_source: &str,
 ) -> std::result::Result<String, axum::response::Response> {
     let (running, owner_running) = running_counts_for_entry(state, entry).await;
     let owner_max_concurrency = owner_limit_for(entry.owner.as_deref(), &state.owner_policy);
@@ -3487,7 +3733,15 @@ async fn launch_registered_entry_with_options(
     }
     workflow.vars.extend(options.vars);
 
-    match launch_workflow(state, workflow, options.max_iterations, entry.owner.clone()).await {
+    match launch_workflow(
+        state,
+        workflow,
+        options.max_iterations,
+        entry.owner.clone(),
+        launch_source,
+    )
+    .await
+    {
         Ok(v) => Ok(v),
         Err(err) => Err((
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -3523,9 +3777,12 @@ async fn launch_workflow(
     workflow: Workflow,
     max_iterations: Option<u32>,
     owner: Option<String>,
+    launch_source: &str,
 ) -> Result<String> {
     let req_id = crate::session::gen_session_id();
     let runtime_session_id = crate::session::gen_session_id();
+    let workflow_name = workflow.name.clone();
+    let owner_for_audit = owner.clone();
     let now = now_unix_secs();
     {
         let mut sessions = state.sessions.write().await;
@@ -3534,8 +3791,8 @@ async fn launch_workflow(
             SessionInfo {
                 id: req_id.clone(),
                 status: "running".to_string(),
-                workflow: workflow.name.clone(),
-                owner,
+                workflow: workflow_name.clone(),
+                owner: owner.clone(),
                 created_at: now,
                 updated_at: now,
                 runtime_session_id: Some(runtime_session_id.clone()),
@@ -3545,9 +3802,27 @@ async fn launch_workflow(
         );
         prune_sessions_in_place(&mut sessions, state.retention.max_sessions);
     }
+    emit_audit_event(
+        state,
+        "workflow_launched",
+        json!({
+            "request_id": req_id.clone(),
+            "runtime_session_id": runtime_session_id.clone(),
+            "workflow": workflow_name.clone(),
+            "owner": owner_for_audit.clone(),
+            "source": launch_source,
+            "max_iterations": max_iterations,
+        }),
+    )
+    .await;
 
     let state_for_task = state.clone();
     let req_id_for_task = req_id.clone();
+    let workflow_name_for_task = workflow.name.clone();
+    let source_for_task = launch_source.to_string();
+    let owner_for_task = owner.clone();
+    let runtime_for_task = runtime_session_id.clone();
+    let started = Instant::now();
     let handle = tokio::spawn(async move {
         let run = state_for_task
             .executor
@@ -3555,30 +3830,59 @@ async fn launch_workflow(
                 &workflow,
                 RunConfig {
                     max_iterations,
-                    session_id_override: Some(runtime_session_id.clone()),
+                    session_id_override: Some(runtime_for_task.clone()),
                 },
             )
             .await;
+        let elapsed_ms = started.elapsed().as_millis() as u64;
 
         let mut sessions = state_for_task.sessions.write().await;
-        if let Some(info) = sessions.get_mut(&req_id_for_task) {
-            match run {
-                Ok(result) => {
+        let event_data = match run {
+            Ok(result) => {
+                let runtime_id = result.session_id.clone();
+                let outputs_count = result.outputs.len();
+                let errors_count = result.errors.len();
+                if let Some(info) = sessions.get_mut(&req_id_for_task) {
                     info.status = "done".to_string();
                     info.updated_at = now_unix_secs();
-                    info.runtime_session_id = Some(result.session_id);
+                    info.runtime_session_id = Some(runtime_id.clone());
                     info.outputs = result.outputs;
                     info.errors = result.errors;
                 }
-                Err(err) => {
+                json!({
+                    "request_id": req_id_for_task.clone(),
+                    "runtime_session_id": runtime_id,
+                    "workflow": workflow_name_for_task,
+                    "owner": owner_for_task,
+                    "source": source_for_task,
+                    "status": "done",
+                    "elapsed_ms": elapsed_ms,
+                    "outputs_count": outputs_count,
+                    "errors_count": errors_count,
+                })
+            }
+            Err(err) => {
+                let message = err.to_string();
+                if let Some(info) = sessions.get_mut(&req_id_for_task) {
                     info.status = "failed".to_string();
                     info.updated_at = now_unix_secs();
-                    info.errors.push(err.to_string());
+                    info.errors.push(message.clone());
                 }
+                json!({
+                    "request_id": req_id_for_task.clone(),
+                    "runtime_session_id": runtime_for_task,
+                    "workflow": workflow_name_for_task,
+                    "owner": owner_for_task,
+                    "source": source_for_task,
+                    "status": "failed",
+                    "elapsed_ms": elapsed_ms,
+                    "error": message,
+                })
             }
-        }
+        };
         prune_sessions_in_place(&mut sessions, state_for_task.retention.max_sessions);
         drop(sessions);
+        emit_audit_event(&state_for_task, "workflow_finished", event_data).await;
         state_for_task
             .handles
             .write()
@@ -4605,5 +4909,58 @@ mod tests {
         assert!(hitl.contains_key("pending"));
         assert!(hitl.contains_key("resolved-new"));
         assert!(!hitl.contains_key("resolved-old"));
+    }
+
+    #[test]
+    fn sorted_set_values_returns_stable_sorted_copy() {
+        let set = std::collections::HashSet::from([
+            "vault".to_string(),
+            "shell".to_string(),
+            "http".to_string(),
+        ]);
+        let values = super::sorted_set_values(Some(&set));
+        assert_eq!(
+            values,
+            vec!["http".to_string(), "shell".to_string(), "vault".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn append_audit_event_writes_ndjson_line() {
+        let dir = std::env::temp_dir().join(format!(
+            "anna-audit-{}-{}",
+            std::process::id(),
+            rand::random::<u32>()
+        ));
+        tokio::fs::create_dir_all(&dir)
+            .await
+            .expect("create temp audit dir");
+        let path = dir.join("audit.log");
+        let config = super::AuditLogConfig {
+            path: path.clone(),
+            node_id: "node-test".to_string(),
+        };
+        super::append_audit_event(
+            &config,
+            "workflow_launched",
+            serde_json::json!({"request_id":"req-1","source":"api_workflow_named"}),
+        )
+        .await
+        .expect("append audit event");
+
+        let raw = tokio::fs::read_to_string(&path)
+            .await
+            .expect("read audit log");
+        let line = raw.lines().last().expect("audit line should exist");
+        let parsed: serde_json::Value =
+            serde_json::from_str(line).expect("audit line should be valid json");
+        assert_eq!(parsed["event"].as_str(), Some("workflow_launched"));
+        assert_eq!(parsed["node_id"].as_str(), Some("node-test"));
+        assert_eq!(parsed["data"]["request_id"].as_str(), Some("req-1"));
+        assert_eq!(
+            parsed["data"]["source"].as_str(),
+            Some("api_workflow_named")
+        );
+        assert!(parsed["ts"].as_u64().is_some());
     }
 }
