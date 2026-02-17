@@ -2,6 +2,10 @@ use anna_rs::executor::{Executor, RunConfig};
 use anna_rs::policy_crypto::{
     sign_policy_revision_hmac_sha256, verify_policy_revision_hmac_sha256,
 };
+use anna_rs::policy_sync::{
+    default_local_policy_snapshot_path, ensure_http_success, etag_revision,
+    policy_revision_from_json, policy_signature_algorithm_from_json, policy_signature_from_json,
+};
 use anna_rs::providers::llm::{active_llm_adapter_name, load_llm_adapter_catalog_from_env};
 use anna_rs::workflow::Workflow;
 use anyhow::{Context, Result, anyhow};
@@ -355,10 +359,9 @@ enum HitlCommands {
     },
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    let cli = Cli::parse();
-    match cli.command {
+macro_rules! dispatch_cli_command {
+    ($command:expr) => {
+        match $command {
         Commands::Run {
             workflow,
             vars,
@@ -366,8 +369,8 @@ async fn main() -> Result<()> {
             dry_run,
         } => {
             let mut wf = Workflow::load(&workflow)?;
-            let overrides = parse_var_overrides(vars)?;
-            wf.vars.extend(overrides);
+            let run_overrides = parse_var_overrides(vars)?;
+            wf.vars.extend(run_overrides);
 
             if dry_run {
                 println!("{}", serde_yaml::to_string(&wf)?);
@@ -401,8 +404,12 @@ async fn main() -> Result<()> {
             Ok(())
         }
         Commands::Validate { workflow } => {
-            let wf = Workflow::load(&workflow)?;
-            println!("valid workflow '{}' (stages={})", wf.name, wf.stages.len());
+            let validated_workflow = Workflow::load(&workflow)?;
+            println!(
+                "valid workflow '{}' (stages={})",
+                validated_workflow.name,
+                validated_workflow.stages.len()
+            );
             Ok(())
         }
         Commands::Daemon { bind, plays_dir } => {
@@ -421,26 +428,37 @@ async fn main() -> Result<()> {
             .await
         }
         Commands::Submit { workflow, daemon } => {
-            let daemon = normalize_daemon_url(&daemon);
-            let body = tokio::fs::read_to_string(&workflow)
+            let submit_body = tokio::fs::read_to_string(&workflow)
                 .await
                 .with_context(|| format!("failed reading '{}'", workflow.display()))?;
-            let client = Client::new();
-            let response = with_daemon_auth(client.post(format!("{}/workflow", daemon)))
-                .body(body)
+            print_response(
+                with_daemon_auth(
+                    Client::new().post(format!("{}/workflow", normalize_daemon_url(&daemon))),
+                )
+                .body(submit_body)
                 .send()
                 .await
-                .with_context(|| format!("failed submitting workflow to {}", daemon))?;
-            print_response(response).await
+                .with_context(|| {
+                    format!(
+                        "failed submitting workflow to {}",
+                        normalize_daemon_url(&daemon)
+                    )
+                })?,
+            )
+            .await
         }
         Commands::Workflows { daemon } => {
-            let daemon = normalize_daemon_url(&daemon);
-            let client = Client::new();
-            let response = with_daemon_auth(client.get(format!("{}/workflows", daemon)))
+            print_response(
+                with_daemon_auth(
+                    Client::new().get(format!("{}/workflows", normalize_daemon_url(&daemon))),
+                )
                 .send()
                 .await
-                .with_context(|| format!("failed querying workflows at {}", daemon))?;
-            print_response(response).await
+                .with_context(|| {
+                    format!("failed querying workflows at {}", normalize_daemon_url(&daemon))
+                })?,
+            )
+            .await
         }
         Commands::WorkflowsMeta {
             daemon,
@@ -450,29 +468,36 @@ async fn main() -> Result<()> {
             available,
             limit,
         } => {
-            let daemon = normalize_daemon_url(&daemon);
-            let client = Client::new();
-            let mut request = with_daemon_auth(client.get(format!("{}/workflows/meta", daemon)));
+            let mut metadata_request = with_daemon_auth(
+                Client::new().get(format!(
+                    "{}/workflows/meta",
+                    normalize_daemon_url(&daemon)
+                )),
+            );
             if let Some(tag) = tag {
-                request = request.query(&[("tag", tag)]);
+                metadata_request = metadata_request.query(&[("tag", tag)]);
             }
             if let Some(owner) = owner {
-                request = request.query(&[("owner", owner)]);
+                metadata_request = metadata_request.query(&[("owner", owner)]);
             }
             if let Some(capability) = capability {
-                request = request.query(&[("capability", capability)]);
+                metadata_request = metadata_request.query(&[("capability", capability)]);
             }
             if let Some(available) = available {
-                request = request.query(&[("available", available)]);
+                metadata_request = metadata_request.query(&[("available", available)]);
             }
             if let Some(limit) = limit {
-                request = request.query(&[("limit", limit)]);
+                metadata_request = metadata_request.query(&[("limit", limit)]);
             }
-            let response = request
-                .send()
-                .await
-                .with_context(|| format!("failed querying workflow metadata at {}", daemon))?;
-            print_response(response).await
+            print_response(
+                metadata_request.send().await.with_context(|| {
+                    format!(
+                        "failed querying workflow metadata at {}",
+                        normalize_daemon_url(&daemon)
+                    )
+                })?,
+            )
+            .await
         }
         Commands::RunNamed {
             name,
@@ -481,76 +506,93 @@ async fn main() -> Result<()> {
             max_iterations,
             precheck,
         } => {
-            let daemon = normalize_daemon_url(&daemon);
-            let client = Client::new();
             if precheck {
-                let response =
-                    with_daemon_auth(client.get(format!("{}/workflow/{}/check", daemon, name)))
+                let precheck_response = with_daemon_auth(Client::new().get(format!(
+                    "{}/workflow/{}/check",
+                    normalize_daemon_url(&daemon),
+                    name
+                )))
                         .send()
                         .await
                         .with_context(|| {
                             format!(
                                 "failed running precheck for workflow '{}' at {}",
-                                name, daemon
+                                name,
+                                normalize_daemon_url(&daemon)
                             )
                         })?;
-                let status = response.status();
-                let body = response
+                let precheck_status = precheck_response.status();
+                let precheck_body = precheck_response
                     .text()
                     .await
                     .context("failed reading precheck response body")?;
-                if !status.is_success() {
-                    if body.trim().is_empty() {
+                if !precheck_status.is_success() {
+                    if precheck_body.trim().is_empty() {
                         return Err(anyhow!(
                             "precheck request failed with status {} for '{}'",
-                            status,
+                            precheck_status,
                             name
                         ));
                     }
                     return Err(anyhow!(
                         "precheck request failed with status {} for '{}': {}",
-                        status,
+                        precheck_status,
                         name,
-                        body
+                        precheck_body
                     ));
                 }
-                let parsed: serde_json::Value = serde_json::from_str(&body)
+                let precheck_payload: serde_json::Value = serde_json::from_str(&precheck_body)
                     .context("daemon returned non-json precheck response")?;
-                let can_run = parsed
+                let can_run = precheck_payload
                     .get("can_run")
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false);
                 if !can_run {
-                    println!("{}", serde_json::to_string_pretty(&parsed)?);
+                    println!("{}", serde_json::to_string_pretty(&precheck_payload)?);
                     return Err(anyhow!("precheck blocked workflow '{}'", name));
                 }
             }
-            let overrides = parse_var_overrides(vars)?;
-            let mut request =
-                with_daemon_auth(client.post(format!("{}/workflow/{}/run", daemon, name)));
-            if !overrides.is_empty() || max_iterations.is_some() {
-                request = request.json(&json!({
-                    "vars": overrides,
+            let run_named_overrides = parse_var_overrides(vars)?;
+            let mut run_named_request = with_daemon_auth(Client::new().post(format!(
+                "{}/workflow/{}/run",
+                normalize_daemon_url(&daemon),
+                name
+            )));
+            if !run_named_overrides.is_empty() || max_iterations.is_some() {
+                run_named_request = run_named_request.json(&json!({
+                    "vars": run_named_overrides,
                     "max_iterations": max_iterations
                 }));
             }
-            let response = request
-                .send()
-                .await
-                .with_context(|| format!("failed launching workflow '{}' at {}", name, daemon))?;
-            print_response(response).await
+            print_response(
+                run_named_request.send().await.with_context(|| {
+                    format!(
+                        "failed launching workflow '{}' at {}",
+                        name,
+                        normalize_daemon_url(&daemon)
+                    )
+                })?,
+            )
+            .await
         }
         Commands::CanRun { name, daemon } => {
-            let daemon = normalize_daemon_url(&daemon);
-            let client = Client::new();
-            let response =
-                with_daemon_auth(client.get(format!("{}/workflow/{}/check", daemon, name)))
+            print_response(
+                with_daemon_auth(Client::new().get(format!(
+                    "{}/workflow/{}/check",
+                    normalize_daemon_url(&daemon),
+                    name
+                )))
                     .send()
                     .await
                     .with_context(|| {
-                        format!("failed checking workflow '{}' at {}", name, daemon)
-                    })?;
-            print_response(response).await
+                        format!(
+                            "failed checking workflow '{}' at {}",
+                            name,
+                            normalize_daemon_url(&daemon)
+                        )
+                    })?,
+            )
+            .await
         }
         Commands::CanChat {
             intent,
@@ -558,49 +600,66 @@ async fn main() -> Result<()> {
             max_iterations,
             caller,
         } => {
-            let daemon = normalize_daemon_url(&daemon);
-            let client = Client::new();
-            let mut request = with_optional_caller(
-                with_daemon_auth(client.get(format!("{}/chat/{}/check", daemon, intent))),
+            let mut can_chat_request = with_optional_caller(
+                with_daemon_auth(Client::new().get(format!(
+                    "{}/chat/{}/check",
+                    normalize_daemon_url(&daemon),
+                    intent
+                ))),
                 caller.as_deref(),
             );
             if let Some(max_iterations) = max_iterations {
-                request = request.query(&[("max_iterations", max_iterations)]);
+                can_chat_request = can_chat_request.query(&[("max_iterations", max_iterations)]);
             }
-            let response = request.send().await.with_context(|| {
-                format!("failed checking chat intent '{}' at {}", intent, daemon)
-            })?;
-            print_response(response).await
+            print_response(can_chat_request.send().await.with_context(|| {
+                format!(
+                    "failed checking chat intent '{}' at {}",
+                    intent,
+                    normalize_daemon_url(&daemon)
+                )
+            })?)
+            .await
         }
         Commands::CanRunYaml { workflow, daemon } => {
-            let daemon = normalize_daemon_url(&daemon);
-            let body = tokio::fs::read_to_string(&workflow)
+            let workflow_yaml = tokio::fs::read_to_string(&workflow)
                 .await
                 .with_context(|| {
                     format!("failed reading workflow file '{}'", workflow.display())
                 })?;
-            let client = Client::new();
-            let response = with_daemon_auth(client.post(format!("{}/workflow/check", daemon)))
-                .body(body)
+            print_response(
+                with_daemon_auth(Client::new().post(format!(
+                    "{}/workflow/check",
+                    normalize_daemon_url(&daemon)
+                )))
+                .body(workflow_yaml)
                 .send()
                 .await
                 .with_context(|| {
                     format!(
                         "failed checking workflow yaml '{}' at {}",
                         workflow.display(),
-                        daemon
+                        normalize_daemon_url(&daemon)
                     )
-                })?;
-            print_response(response).await
+                })?,
+            )
+            .await
         }
         Commands::Status { id, daemon } => {
-            let daemon = normalize_daemon_url(&daemon);
-            let client = Client::new();
-            let response = with_daemon_auth(client.get(format!("{}/workflow/{}", daemon, id)))
+            print_response(
+                with_daemon_auth(
+                    Client::new().get(format!("{}/workflow/{}", normalize_daemon_url(&daemon), id)),
+                )
                 .send()
                 .await
-                .with_context(|| format!("failed querying workflow '{}' at {}", id, daemon))?;
-            print_response(response).await
+                .with_context(|| {
+                    format!(
+                        "failed querying workflow '{}' at {}",
+                        id,
+                        normalize_daemon_url(&daemon)
+                    )
+                })?,
+            )
+            .await
         }
         Commands::Sessions {
             daemon,
@@ -609,85 +668,110 @@ async fn main() -> Result<()> {
             workflow,
             limit,
         } => {
-            let daemon = normalize_daemon_url(&daemon);
-            let client = Client::new();
-            let mut req = with_daemon_auth(client.get(format!("{}/sessions", daemon)));
+            let mut sessions_request = with_daemon_auth(
+                Client::new().get(format!("{}/sessions", normalize_daemon_url(&daemon))),
+            );
             if let Some(status) = status {
-                req = req.query(&[("status", status)]);
+                sessions_request = sessions_request.query(&[("status", status)]);
             }
             if let Some(owner) = owner {
-                req = req.query(&[("owner", owner)]);
+                sessions_request = sessions_request.query(&[("owner", owner)]);
             }
             if let Some(workflow) = workflow {
-                req = req.query(&[("workflow", workflow)]);
+                sessions_request = sessions_request.query(&[("workflow", workflow)]);
             }
             if let Some(limit) = limit {
-                req = req.query(&[("limit", limit)]);
+                sessions_request = sessions_request.query(&[("limit", limit)]);
             }
-            let response = req
-                .send()
-                .await
-                .with_context(|| format!("failed querying sessions at {}", daemon))?;
-            print_response(response).await
+            print_response(
+                sessions_request.send().await.with_context(|| {
+                    format!("failed querying sessions at {}", normalize_daemon_url(&daemon))
+                })?,
+            )
+            .await
         }
         Commands::Stats { daemon } => {
-            let daemon = normalize_daemon_url(&daemon);
-            let client = Client::new();
-            let response = with_daemon_auth(client.get(format!("{}/stats", daemon)))
+            print_response(
+                with_daemon_auth(
+                    Client::new().get(format!("{}/stats", normalize_daemon_url(&daemon))),
+                )
                 .send()
                 .await
-                .with_context(|| format!("failed querying stats at {}", daemon))?;
-            print_response(response).await
+                .with_context(|| {
+                    format!("failed querying stats at {}", normalize_daemon_url(&daemon))
+                })?,
+            )
+            .await
         }
         Commands::Policy {
             daemon,
             if_match,
             if_none_match,
         } => {
-            let daemon = normalize_daemon_url(&daemon);
-            let client = Client::new();
-            let response = with_optional_etag_preconditions(
-                with_daemon_auth(client.get(format!("{}/policy", daemon))),
-                if_match.as_deref(),
-                if_none_match.as_deref(),
+            print_response(
+                with_optional_etag_preconditions(
+                    with_daemon_auth(
+                        Client::new().get(format!("{}/policy", normalize_daemon_url(&daemon))),
+                    ),
+                    if_match.as_deref(),
+                    if_none_match.as_deref(),
+                )
+                .send()
+                .await
+                .with_context(|| {
+                    format!("failed querying policy at {}", normalize_daemon_url(&daemon))
+                })?,
             )
-            .send()
             .await
-            .with_context(|| format!("failed querying policy at {}", daemon))?;
-            print_response(response).await
         }
         Commands::PolicyRevision {
             daemon,
             if_none_match,
         } => {
-            let daemon = normalize_daemon_url(&daemon);
-            let client = Client::new();
-            let response = with_optional_etag_preconditions(
-                with_daemon_auth(client.get(format!("{}/policy/revision", daemon))),
-                None,
-                if_none_match.as_deref(),
+            print_response(
+                with_optional_etag_preconditions(
+                    with_daemon_auth(Client::new().get(format!(
+                        "{}/policy/revision",
+                        normalize_daemon_url(&daemon)
+                    ))),
+                    None,
+                    if_none_match.as_deref(),
+                )
+                .send()
+                .await
+                .with_context(|| {
+                    format!(
+                        "failed querying policy revision at {}",
+                        normalize_daemon_url(&daemon)
+                    )
+                })?,
             )
-            .send()
             .await
-            .with_context(|| format!("failed querying policy revision at {}", daemon))?;
-            print_response(response).await
         }
         Commands::PolicySnapshot {
             daemon,
             if_match,
             if_none_match,
         } => {
-            let daemon = normalize_daemon_url(&daemon);
-            let client = Client::new();
-            let response = with_optional_etag_preconditions(
-                with_daemon_auth(client.get(format!("{}/policy/snapshot", daemon))),
-                if_match.as_deref(),
-                if_none_match.as_deref(),
+            print_response(
+                with_optional_etag_preconditions(
+                    with_daemon_auth(Client::new().get(format!(
+                        "{}/policy/snapshot",
+                        normalize_daemon_url(&daemon)
+                    ))),
+                    if_match.as_deref(),
+                    if_none_match.as_deref(),
+                )
+                .send()
+                .await
+                .with_context(|| {
+                    format!(
+                        "failed querying policy snapshot at {}",
+                        normalize_daemon_url(&daemon)
+                    )
+                })?,
             )
-            .send()
             .await
-            .with_context(|| format!("failed querying policy snapshot at {}", daemon))?;
-            print_response(response).await
         }
         Commands::PolicySync {
             daemon,
@@ -698,18 +782,18 @@ async fn main() -> Result<()> {
             key_file,
             allow_unsigned,
         } => {
-            let daemon = normalize_daemon_url(&daemon);
-            let output = output.unwrap_or_else(default_local_policy_snapshot_path);
-            let key = resolve_inline_or_file_key(key.as_deref(), key_file.as_deref())?;
-            sync_policy_snapshot(
-                &daemon,
-                &output,
+            let policy_sync_daemon = normalize_daemon_url(&daemon);
+            let policy_sync_output = output.unwrap_or_else(default_local_policy_snapshot_path);
+            let policy_sync_key =
+                resolve_inline_or_file_key(key.as_deref(), key_file.as_deref())?;
+            let sync_options = PolicySyncOptions {
+                output: &policy_sync_output,
                 retries,
                 verify,
-                key.as_deref(),
+                key: policy_sync_key.as_deref(),
                 allow_unsigned,
-            )
-            .await
+            };
+            sync_policy_snapshot(&policy_sync_daemon, &sync_options).await
         }
         Commands::PolicyVerify {
             daemon,
@@ -717,21 +801,28 @@ async fn main() -> Result<()> {
             key_file,
             allow_unsigned,
         } => {
-            let daemon = normalize_daemon_url(&daemon);
-            let key = resolve_inline_or_file_key(key.as_deref(), key_file.as_deref())?;
-            verify_policy_revision_signature(&daemon, key.as_deref(), allow_unsigned).await
+            let policy_verify_daemon = normalize_daemon_url(&daemon);
+            let policy_verify_key =
+                resolve_inline_or_file_key(key.as_deref(), key_file.as_deref())?;
+            verify_policy_revision_signature(
+                &policy_verify_daemon,
+                policy_verify_key.as_deref(),
+                allow_unsigned,
+            )
+            .await
         }
         Commands::LlmAdapters { json, daemon } => {
             if let Some(daemon) = daemon {
-                let daemon = normalize_daemon_url(&daemon);
-                let client = Client::new();
-                let response = with_daemon_auth(client.get(format!("{}/llm/adapters", daemon)))
-                    .send()
-                    .await
-                    .with_context(|| {
-                        format!("failed querying daemon llm adapters at {}", daemon)
-                    })?;
-                return print_response(response).await;
+                let adapters_daemon = normalize_daemon_url(&daemon);
+                return print_response(
+                    with_daemon_auth(Client::new().get(format!("{}/llm/adapters", adapters_daemon)))
+                        .send()
+                        .await
+                        .with_context(|| {
+                            format!("failed querying daemon llm adapters at {}", adapters_daemon)
+                        })?,
+                )
+                .await;
             }
             let loaded = load_llm_adapter_catalog_from_env()?;
             match loaded {
@@ -740,14 +831,14 @@ async fn main() -> Result<()> {
                     let mut names = loaded.catalog.adapters.keys().cloned().collect::<Vec<_>>();
                     names.sort();
                     if json {
-                        let payload = json!({
+                        let llm_adapters_payload = json!({
                             "configured": true,
                             "source": loaded.path,
                             "selected": selected,
                             "default": loaded.catalog.default,
                             "adapters": loaded.catalog.adapters,
                         });
-                        println!("{}", serde_json::to_string_pretty(&payload)?);
+                        println!("{}", serde_json::to_string_pretty(&llm_adapters_payload)?);
                     } else {
                         println!("source: {}", loaded.path);
                         println!(
@@ -774,7 +865,7 @@ async fn main() -> Result<()> {
                 }
                 None => {
                     if json {
-                        let payload = json!({
+                        let llm_not_configured_payload = json!({
                             "configured": false,
                             "source": null,
                             "selected": null,
@@ -782,7 +873,7 @@ async fn main() -> Result<()> {
                             "adapters": {},
                             "note": "set ANNA_LLM_ADAPTERS_FILE to enable adapter catalog"
                         });
-                        println!("{}", serde_json::to_string_pretty(&payload)?);
+                        println!("{}", serde_json::to_string_pretty(&llm_not_configured_payload)?);
                     } else {
                         println!("LLM adapter catalog not configured.");
                         println!("Set ANNA_LLM_ADAPTERS_FILE to enable adapter routing.");
@@ -797,48 +888,81 @@ async fn main() -> Result<()> {
             poll_ms,
             timeout_sec,
         } => {
-            let daemon = normalize_daemon_url(&daemon);
-            wait_for_workflow(&daemon, &id, poll_ms.max(50), timeout_sec).await
+            let wait_daemon = normalize_daemon_url(&daemon);
+            wait_for_workflow(&wait_daemon, &id, poll_ms.max(50), timeout_sec).await
         }
         Commands::Stop { id, daemon } => {
-            let daemon = normalize_daemon_url(&daemon);
-            let client = Client::new();
-            let response = with_daemon_auth(client.delete(format!("{}/workflow/{}", daemon, id)))
+            print_response(
+                with_daemon_auth(Client::new().delete(format!(
+                    "{}/workflow/{}",
+                    normalize_daemon_url(&daemon),
+                    id
+                )))
                 .send()
                 .await
-                .with_context(|| format!("failed stopping workflow '{}' at {}", id, daemon))?;
-            print_response(response).await
+                .with_context(|| {
+                    format!(
+                        "failed stopping workflow '{}' at {}",
+                        id,
+                        normalize_daemon_url(&daemon)
+                    )
+                })?,
+            )
+            .await
         }
         Commands::Logs { id, daemon } => {
-            let daemon = normalize_daemon_url(&daemon);
-            let client = Client::new();
-            let response = with_daemon_auth(client.get(format!("{}/workflow/{}/logs", daemon, id)))
+            print_response(
+                with_daemon_auth(Client::new().get(format!(
+                    "{}/workflow/{}/logs",
+                    normalize_daemon_url(&daemon),
+                    id
+                )))
                 .send()
                 .await
-                .with_context(|| format!("failed reading workflow logs '{}' at {}", id, daemon))?;
-            print_response(response).await
+                .with_context(|| {
+                    format!(
+                        "failed reading workflow logs '{}' at {}",
+                        id,
+                        normalize_daemon_url(&daemon)
+                    )
+                })?,
+            )
+            .await
         }
         Commands::Hook { name, daemon } => {
-            let daemon = normalize_daemon_url(&daemon);
-            let client = Client::new();
-            let response = with_daemon_auth(client.post(format!(
-                "{}/hook/{}",
-                daemon,
-                name.trim_matches('/')
-            )))
-            .send()
-            .await
-            .with_context(|| format!("failed triggering hook '{}' at {}", name, daemon))?;
-            print_response(response).await
-        }
-        Commands::ChatIntents { daemon } => {
-            let daemon = normalize_daemon_url(&daemon);
-            let client = Client::new();
-            let response = with_daemon_auth(client.get(format!("{}/chat/intents", daemon)))
+            print_response(
+                with_daemon_auth(Client::new().post(format!(
+                    "{}/hook/{}",
+                    normalize_daemon_url(&daemon),
+                    name.trim_matches('/')
+                )))
                 .send()
                 .await
-                .with_context(|| format!("failed listing chat intents at {}", daemon))?;
-            print_response(response).await
+                .with_context(|| {
+                    format!(
+                        "failed triggering hook '{}' at {}",
+                        name,
+                        normalize_daemon_url(&daemon)
+                    )
+                })?,
+            )
+            .await
+        }
+        Commands::ChatIntents { daemon } => {
+            print_response(
+                with_daemon_auth(
+                    Client::new().get(format!("{}/chat/intents", normalize_daemon_url(&daemon))),
+                )
+                .send()
+                .await
+                .with_context(|| {
+                    format!(
+                        "failed listing chat intents at {}",
+                        normalize_daemon_url(&daemon)
+                    )
+                })?,
+            )
+            .await
         }
         Commands::Chat {
             intent,
@@ -847,22 +971,26 @@ async fn main() -> Result<()> {
             vars,
             max_iterations,
         } => {
-            let daemon = normalize_daemon_url(&daemon);
-            let overrides = parse_var_overrides(vars)?;
-            let client = Client::new();
-            let response = with_optional_caller(
-                with_daemon_auth(client.post(format!("{}/chat/run", daemon))),
-                caller.as_deref(),
+            let chat_overrides = parse_var_overrides(vars)?;
+            print_response(
+                with_optional_caller(
+                    with_daemon_auth(
+                        Client::new().post(format!("{}/chat/run", normalize_daemon_url(&daemon))),
+                    ),
+                    caller.as_deref(),
+                )
+                .json(&json!({
+                    "intent": intent,
+                    "vars": chat_overrides,
+                    "max_iterations": max_iterations
+                }))
+                .send()
+                .await
+                .with_context(|| {
+                    format!("failed running chat intent at {}", normalize_daemon_url(&daemon))
+                })?,
             )
-            .json(&json!({
-                "intent": intent,
-                "vars": overrides,
-                "max_iterations": max_iterations
-            }))
-            .send()
             .await
-            .with_context(|| format!("failed running chat intent at {}", daemon))?;
-            print_response(response).await
         }
         Commands::Hitl { command } => match command {
             HitlCommands::List {
@@ -872,44 +1000,61 @@ async fn main() -> Result<()> {
                 workflow,
                 limit,
             } => {
-                let daemon = normalize_daemon_url(&daemon);
-                let client = Client::new();
-                let mut req = with_daemon_auth(client.get(format!("{}/hitl", daemon)));
+                let mut hitl_list_request = with_daemon_auth(
+                    Client::new().get(format!("{}/hitl", normalize_daemon_url(&daemon))),
+                );
                 if let Some(status) = status {
-                    req = req.query(&[("status", status)]);
+                    hitl_list_request = hitl_list_request.query(&[("status", status)]);
                 }
                 if let Some(session_id) = session_id {
-                    req = req.query(&[("session_id", session_id)]);
+                    hitl_list_request = hitl_list_request.query(&[("session_id", session_id)]);
                 }
                 if let Some(workflow) = workflow {
-                    req = req.query(&[("workflow", workflow)]);
+                    hitl_list_request = hitl_list_request.query(&[("workflow", workflow)]);
                 }
                 if let Some(limit) = limit {
-                    req = req.query(&[("limit", limit)]);
+                    hitl_list_request = hitl_list_request.query(&[("limit", limit)]);
                 }
-                let response = req
-                    .send()
-                    .await
-                    .with_context(|| format!("failed querying hitl at {}", daemon))?;
-                print_response(response).await
+                print_response(
+                    hitl_list_request.send().await.with_context(|| {
+                        format!("failed querying hitl at {}", normalize_daemon_url(&daemon))
+                    })?,
+                )
+                .await
             }
             HitlCommands::Resolve {
                 id,
                 decision,
                 daemon,
             } => {
-                let daemon = normalize_daemon_url(&daemon);
-                let client = Client::new();
-                let response =
-                    with_daemon_auth(client.post(format!("{}/hitl/{}/resolve", daemon, id)))
-                        .json(&json!({ "decision": decision }))
-                        .send()
-                        .await
-                        .with_context(|| format!("failed resolving hitl '{}' at {}", id, daemon))?;
-                print_response(response).await
+                print_response(
+                    with_daemon_auth(Client::new().post(format!(
+                        "{}/hitl/{}/resolve",
+                        normalize_daemon_url(&daemon),
+                        id
+                    )))
+                    .json(&json!({ "decision": decision }))
+                    .send()
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "failed resolving hitl '{}' at {}",
+                            id,
+                            normalize_daemon_url(&daemon)
+                        )
+                    })?,
+                )
+                .await
             }
         },
-    }
+        }
+    };
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    let cli = Cli::parse();
+    dispatch_cli_command!(cli.command)
 }
 
 fn parse_var_overrides(raw: Vec<String>) -> Result<HashMap<String, String>> {
@@ -953,10 +1098,12 @@ fn resolve_inline_or_file_key(
 }
 
 fn daemon_auth_token() -> Option<String> {
-    std::env::var("ANNA_DAEMON_TOKEN")
-        .ok()
-        .map(|v| v.trim().to_string())
-        .filter(|v| !v.is_empty())
+    let token_value = std::env::var("ANNA_DAEMON_TOKEN").ok()?;
+    let token = token_value.trim();
+    if token.is_empty() {
+        return None;
+    }
+    Some(token.to_string())
 }
 
 fn with_daemon_auth(builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
@@ -1021,185 +1168,305 @@ async fn print_response(response: reqwest::Response) -> Result<()> {
     }
 }
 
-async fn sync_policy_snapshot(
-    daemon: &str,
-    output: &Path,
+struct PolicySyncOptions<'a> {
+    output: &'a Path,
     retries: usize,
     verify: bool,
-    key: Option<&str>,
+    key: Option<&'a str>,
     allow_unsigned: bool,
-) -> Result<()> {
+}
+
+async fn sync_policy_snapshot(daemon: &str, options: &PolicySyncOptions<'_>) -> Result<()> {
     let client = Client::new();
-    let previous_revision = read_local_policy_revision(output).await?;
+    let previous_revision = read_local_policy_revision(options.output).await?;
+    let sync_ctx = PolicySyncAttemptCtx {
+        client: &client,
+        daemon,
+        output: options.output,
+        previous_revision: previous_revision.as_deref(),
+        options,
+    };
     let mut attempt = 0usize;
 
     loop {
         attempt += 1;
-        let mut revision_request =
-            with_daemon_auth(client.get(format!("{}/policy/revision", daemon)));
-        if let Some(previous_revision) = previous_revision.as_deref() {
-            revision_request =
-                with_optional_etag_preconditions(revision_request, None, Some(previous_revision));
-        }
-
-        let revision_response = revision_request
-            .send()
-            .await
-            .with_context(|| format!("failed querying policy revision at {}", daemon))?;
-        let revision_status = revision_response.status();
-
-        if revision_status == reqwest::StatusCode::NOT_MODIFIED {
+        let revision_outcome = fetch_remote_policy_revision(&client, daemon, previous_revision.as_deref()).await?;
+        let Some(remote_revision) = revision_outcome else {
             println!(
                 "{}",
                 serde_json::to_string_pretty(&json!({
                     "status": "not_modified",
-                    "path": output.display().to_string(),
+                    "path": options.output.display().to_string(),
                     "policy_revision": previous_revision,
                     "attempts": attempt,
                 }))?
             );
             return Ok(());
+        };
+        if let Some(payload) = sync_policy_snapshot_attempt(&sync_ctx, attempt, &remote_revision).await? {
+            println!("{}", payload);
+            return Ok(());
         }
+    }
+}
 
-        let revision_etag = etag_revision(revision_response.headers());
-        let revision_body = revision_response
-            .text()
-            .await
-            .context("failed reading policy revision response body")?;
-        if !revision_status.is_success() {
-            if revision_body.trim().is_empty() {
-                return Err(anyhow!(
-                    "policy revision request failed with status {}",
-                    revision_status
-                ));
-            }
-            return Err(anyhow!(
-                "policy revision request failed with status {}: {}",
-                revision_status,
-                revision_body
-            ));
-        }
+struct PolicySyncAttemptCtx<'a> {
+    client: &'a Client,
+    daemon: &'a str,
+    output: &'a Path,
+    previous_revision: Option<&'a str>,
+    options: &'a PolicySyncOptions<'a>,
+}
 
-        let revision_json: serde_json::Value = serde_json::from_str(&revision_body)
-            .context("daemon returned non-json policy revision response")?;
-        let remote_revision = policy_revision_from_json(&revision_json)
-            .or(revision_etag)
-            .ok_or_else(|| anyhow!("policy revision response missing 'policy_revision'"))?;
+async fn sync_policy_snapshot_attempt(
+    ctx: &PolicySyncAttemptCtx<'_>,
+    attempt: usize,
+    remote_revision: &str,
+) -> Result<Option<String>> {
+    let mut snapshot = fetch_policy_snapshot_response(ctx.client, ctx.daemon, remote_revision).await?;
+    if should_retry_after_precondition_failure(
+        &snapshot,
+        attempt,
+        ctx.options.retries,
+        remote_revision,
+    )? {
+        return Ok(None);
+    }
+    ensure_snapshot_success(snapshot.status, &snapshot.body)?;
+    let snapshot_json = parse_snapshot_json(&snapshot.body)?;
+    let snapshot_revision = resolve_snapshot_revision(&snapshot_json, snapshot.etag.take())?;
+    if should_retry_after_revision_mismatch(
+        remote_revision,
+        &snapshot_revision,
+        attempt,
+        ctx.options.retries,
+    )? {
+        return Ok(None);
+    }
+    let signature_check = verify_sync_snapshot_signature(
+        ctx.options.verify,
+        remote_revision,
+        &snapshot_json,
+        ctx.options.key,
+        ctx.options.allow_unsigned,
+    )?;
+    write_json_atomic(ctx.output, &snapshot_json).await?;
+    let payload = sync_success_payload(
+        ctx.output,
+        ctx.previous_revision,
+        remote_revision,
+        attempt,
+        signature_check.as_ref(),
+    )?;
+    Ok(Some(payload))
+}
 
-        let snapshot_response = with_optional_etag_preconditions(
-            with_daemon_auth(client.get(format!("{}/policy/snapshot", daemon))),
-            Some(&remote_revision),
-            None,
-        )
+fn verify_sync_snapshot_signature(
+    verify: bool,
+    remote_revision: &str,
+    snapshot_json: &serde_json::Value,
+    key: Option<&str>,
+    allow_unsigned: bool,
+) -> Result<Option<PolicySignatureCheck>> {
+    if !verify {
+        return Ok(None);
+    }
+    let check = verify_policy_signature_fields(
+        remote_revision,
+        policy_signature_from_json(snapshot_json).as_deref(),
+        policy_signature_algorithm_from_json(snapshot_json).as_deref(),
+        key,
+        allow_unsigned,
+    )?;
+    if !check.verified && check.status != "unsigned" {
+        return Err(anyhow!(
+            "policy snapshot signature verification failed (received='{}', expected='{}')",
+            check.received_signature.as_deref().unwrap_or(""),
+            check.expected_signature.as_deref().unwrap_or("")
+        ));
+    }
+    Ok(Some(check))
+}
+
+fn sync_success_payload(
+    output: &Path,
+    previous_revision: Option<&str>,
+    remote_revision: &str,
+    attempt: usize,
+    signature_check: Option<&PolicySignatureCheck>,
+) -> Result<String> {
+    let mut sync_payload = json!({
+        "status": "synced",
+        "path": output.display().to_string(),
+        "previous_policy_revision": previous_revision,
+        "policy_revision": remote_revision,
+        "attempts": attempt,
+    });
+    if let Some(check) = signature_check {
+        sync_payload["signature_verification"] = policy_signature_check_json(check);
+    }
+    Ok(serde_json::to_string_pretty(&sync_payload)?)
+}
+
+struct PolicySnapshotResponse {
+    status: reqwest::StatusCode,
+    etag: Option<String>,
+    body: String,
+}
+
+async fn fetch_remote_policy_revision(
+    client: &Client,
+    daemon: &str,
+    previous_revision: Option<&str>,
+) -> Result<Option<String>> {
+    let mut revision_request = with_daemon_auth(client.get(format!("{}/policy/revision", daemon)));
+    if let Some(previous_revision) = previous_revision {
+        revision_request =
+            with_optional_etag_preconditions(revision_request, None, Some(previous_revision));
+    }
+
+    let revision_response = revision_request
         .send()
         .await
-        .with_context(|| format!("failed querying policy snapshot at {}", daemon))?;
-        let snapshot_status = snapshot_response.status();
-        let snapshot_etag = etag_revision(snapshot_response.headers());
-        let snapshot_body = snapshot_response
-            .text()
-            .await
-            .context("failed reading policy snapshot response body")?;
+        .with_context(|| format!("failed querying policy revision at {}", daemon))?;
+    let revision_status = revision_response.status();
+    if revision_status == reqwest::StatusCode::NOT_MODIFIED {
+        return Ok(None);
+    }
 
-        if snapshot_status == reqwest::StatusCode::PRECONDITION_FAILED {
-            if attempt <= retries {
-                continue;
-            }
-            let current_revision = snapshot_etag
-                .or_else(|| policy_revision_from_raw_json(&snapshot_body).ok().flatten());
-            if snapshot_body.trim().is_empty() {
-                if let Some(current_revision) = current_revision {
-                    return Err(anyhow!(
-                        "policy snapshot precondition failed after {} attempts; current revision '{}'",
-                        attempt,
-                        current_revision
-                    ));
-                }
-                return Err(anyhow!(
-                    "policy snapshot precondition failed after {} attempts",
-                    attempt
-                ));
-            }
-            if let Some(current_revision) = current_revision {
-                return Err(anyhow!(
-                    "policy snapshot precondition failed after {} attempts (current revision '{}'): {}",
-                    attempt,
-                    current_revision,
-                    snapshot_body
-                ));
-            }
-            return Err(anyhow!(
-                "policy snapshot precondition failed after {} attempts: {}",
-                attempt,
-                snapshot_body
-            ));
-        }
+    let revision_etag = etag_revision(revision_response.headers());
+    let revision_body = revision_response
+        .text()
+        .await
+        .context("failed reading policy revision response body")?;
+    ensure_http_success(revision_status, &revision_body, "policy revision request")?;
+    let revision_json = parse_revision_json(&revision_body)?;
+    let remote_revision = resolve_policy_revision(
+        &revision_json,
+        revision_etag,
+        "policy revision response missing 'policy_revision'",
+    )?;
+    Ok(Some(remote_revision))
+}
 
-        if !snapshot_status.is_success() {
-            if snapshot_body.trim().is_empty() {
-                return Err(anyhow!(
-                    "policy snapshot request failed with status {}",
-                    snapshot_status
-                ));
-            }
-            return Err(anyhow!(
-                "policy snapshot request failed with status {}: {}",
-                snapshot_status,
-                snapshot_body
-            ));
-        }
+async fn fetch_policy_snapshot_response(
+    client: &Client,
+    daemon: &str,
+    remote_revision: &str,
+) -> Result<PolicySnapshotResponse> {
+    let snapshot_response = with_optional_etag_preconditions(
+        with_daemon_auth(client.get(format!("{}/policy/snapshot", daemon))),
+        Some(remote_revision),
+        None,
+    )
+    .send()
+    .await
+    .with_context(|| format!("failed querying policy snapshot at {}", daemon))?;
+    let snapshot_status = snapshot_response.status();
+    let snapshot_etag = etag_revision(snapshot_response.headers());
+    let snapshot_body = snapshot_response
+        .text()
+        .await
+        .context("failed reading policy snapshot response body")?;
+    Ok(PolicySnapshotResponse {
+        status: snapshot_status,
+        etag: snapshot_etag,
+        body: snapshot_body,
+    })
+}
 
-        let snapshot_json: serde_json::Value = serde_json::from_str(&snapshot_body)
-            .context("daemon returned non-json policy snapshot response")?;
-        let snapshot_revision = policy_revision_from_json(&snapshot_json)
-            .or(snapshot_etag)
-            .ok_or_else(|| anyhow!("policy snapshot response missing 'policy_revision'"))?;
-        if snapshot_revision != remote_revision {
-            if attempt <= retries {
-                continue;
-            }
+fn should_retry_after_precondition_failure(
+    snapshot: &PolicySnapshotResponse,
+    attempt: usize,
+    retries: usize,
+    remote_revision: &str,
+) -> Result<bool> {
+    if snapshot.status != reqwest::StatusCode::PRECONDITION_FAILED {
+        return Ok(false);
+    }
+    if attempt <= retries {
+        return Ok(true);
+    }
+    let current_revision = snapshot
+        .etag
+        .clone()
+        .or_else(|| policy_revision_from_raw_json(&snapshot.body).ok().flatten());
+    if snapshot.body.trim().is_empty() {
+        if let Some(current_revision) = current_revision {
             return Err(anyhow!(
-                "policy snapshot revision mismatch after {} attempts (revision endpoint='{}', snapshot='{}')",
+                "policy snapshot precondition failed after {} attempts (revision endpoint='{}', current='{}')",
                 attempt,
                 remote_revision,
-                snapshot_revision
+                current_revision
             ));
         }
-
-        let signature_check = if verify {
-            let check = verify_policy_signature_fields(
-                &remote_revision,
-                policy_signature_from_json(&snapshot_json).as_deref(),
-                policy_signature_algorithm_from_json(&snapshot_json).as_deref(),
-                key,
-                allow_unsigned,
-            )?;
-            if !check.verified && check.status != "unsigned" {
-                return Err(anyhow!(
-                    "policy snapshot signature verification failed (received='{}', expected='{}')",
-                    check.received_signature.as_deref().unwrap_or(""),
-                    check.expected_signature.as_deref().unwrap_or("")
-                ));
-            }
-            Some(check)
-        } else {
-            None
-        };
-
-        write_json_atomic(output, &snapshot_json).await?;
-        let mut payload = json!({
-            "status": "synced",
-            "path": output.display().to_string(),
-            "previous_policy_revision": previous_revision,
-            "policy_revision": remote_revision,
-            "attempts": attempt,
-        });
-        if let Some(check) = signature_check.as_ref() {
-            payload["signature_verification"] = policy_signature_check_json(check);
-        }
-        println!("{}", serde_json::to_string_pretty(&payload)?);
-        return Ok(());
+        return Err(anyhow!(
+            "policy snapshot precondition failed after {} attempts (revision endpoint='{}')",
+            attempt,
+            remote_revision
+        ));
     }
+    if let Some(current_revision) = current_revision {
+        return Err(anyhow!(
+            "policy snapshot precondition failed after {} attempts (revision endpoint='{}', current='{}'): {}",
+            attempt,
+            remote_revision,
+            current_revision,
+            snapshot.body
+        ));
+    }
+    Err(anyhow!(
+        "policy snapshot precondition failed after {} attempts (revision endpoint='{}'): {}",
+        attempt,
+        remote_revision,
+        snapshot.body
+    ))
+}
+
+fn should_retry_after_revision_mismatch(
+    remote_revision: &str,
+    snapshot_revision: &str,
+    attempt: usize,
+    retries: usize,
+) -> Result<bool> {
+    if snapshot_revision == remote_revision {
+        return Ok(false);
+    }
+    if attempt <= retries {
+        return Ok(true);
+    }
+    Err(anyhow!(
+        "policy snapshot revision mismatch after {} attempts (revision endpoint='{}', snapshot='{}')",
+        attempt,
+        remote_revision,
+        snapshot_revision
+    ))
+}
+
+fn parse_revision_json(raw: &str) -> Result<serde_json::Value> {
+    serde_json::from_str(raw).context("daemon returned non-json policy revision response")
+}
+
+fn parse_snapshot_json(raw: &str) -> Result<serde_json::Value> {
+    serde_json::from_str(raw).context("daemon returned non-json policy snapshot response")
+}
+
+fn resolve_policy_revision(
+    payload: &serde_json::Value,
+    etag: Option<String>,
+    missing_message: &str,
+) -> Result<String> {
+    policy_revision_from_json(payload)
+        .or(etag)
+        .ok_or_else(|| anyhow!(missing_message.to_string()))
+}
+
+fn resolve_snapshot_revision(payload: &serde_json::Value, etag: Option<String>) -> Result<String> {
+    resolve_policy_revision(payload, etag, "policy snapshot response missing 'policy_revision'")
+}
+
+fn ensure_snapshot_success(status: reqwest::StatusCode, body: &str) -> Result<()> {
+    ensure_http_success(status, body, "policy snapshot request")
 }
 
 async fn verify_policy_revision_signature(
@@ -1207,79 +1474,29 @@ async fn verify_policy_revision_signature(
     key: Option<&str>,
     allow_unsigned: bool,
 ) -> Result<()> {
-    let client = Client::new();
-    let response = with_daemon_auth(client.get(format!("{}/policy/revision", daemon)))
-        .send()
-        .await
-        .with_context(|| format!("failed querying policy revision at {}", daemon))?;
-    let status = response.status();
-    let body = response
-        .text()
-        .await
-        .context("failed reading policy revision response body")?;
-    if !status.is_success() {
-        if body.trim().is_empty() {
-            return Err(anyhow!(
-                "policy revision request failed with status {}",
-                status
-            ));
-        }
-        return Err(anyhow!(
-            "policy revision request failed with status {}: {}",
-            status,
-            body
-        ));
-    }
-
-    let payload: serde_json::Value =
-        serde_json::from_str(&body).context("daemon returned non-json policy revision response")?;
-    let policy_revision = policy_revision_from_json(&payload)
-        .ok_or_else(|| anyhow!("policy revision response missing 'policy_revision'"))?;
-    let check = verify_policy_signature_fields(
+    let verification_payload = fetch_policy_revision_payload(daemon).await?;
+    let policy_revision = resolve_revision_from_payload(
+        &verification_payload,
+        "policy revision response missing 'policy_revision'",
+    )?;
+    let verification_check = verify_policy_signature_fields(
         &policy_revision,
-        policy_signature_from_json(&payload).as_deref(),
-        policy_signature_algorithm_from_json(&payload).as_deref(),
+        policy_signature_from_json(&verification_payload).as_deref(),
+        policy_signature_algorithm_from_json(&verification_payload).as_deref(),
         key,
         allow_unsigned,
     )?;
+    print_policy_signature_check(&policy_revision, &verification_check)?;
 
-    println!(
-        "{}",
-        serde_json::to_string_pretty(&json!({
-            "status": check.status,
-            "verified": check.verified,
-            "policy_revision": policy_revision,
-            "signature_algorithm": check.signature_algorithm,
-            "received_signature": check.received_signature,
-            "expected_signature": check.expected_signature,
-        }))?
-    );
-
-    if check.verified || check.status == "unsigned" {
+    if verification_check.verified || verification_check.status == "unsigned" {
         Ok(())
     } else {
         Err(anyhow!("policy signature verification failed"))
     }
 }
 
-fn default_local_policy_snapshot_path() -> PathBuf {
-    if let Ok(raw) = std::env::var("ANNA_POLICY_LOCAL_SNAPSHOT_FILE") {
-        let trimmed = raw.trim();
-        if !trimmed.is_empty() {
-            return PathBuf::from(trimmed);
-        }
-    }
-    if let Ok(home) = std::env::var("HOME") {
-        let trimmed = home.trim();
-        if !trimmed.is_empty() {
-            return PathBuf::from(trimmed).join(".anna/policy.snapshot.json");
-        }
-    }
-    PathBuf::from("policy.snapshot.json")
-}
-
 async fn read_local_policy_revision(path: &Path) -> Result<Option<String>> {
-    let raw = match tokio::fs::read_to_string(path).await {
+    let snapshot_raw = match tokio::fs::read_to_string(path).await {
         Ok(v) => v,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(err) => {
@@ -1288,41 +1505,14 @@ async fn read_local_policy_revision(path: &Path) -> Result<Option<String>> {
             });
         }
     };
-    policy_revision_from_raw_json(&raw)
+    policy_revision_from_raw_json(&snapshot_raw)
         .with_context(|| format!("failed parsing local policy snapshot '{}'", path.display()))
 }
 
 fn policy_revision_from_raw_json(raw: &str) -> Result<Option<String>> {
-    let parsed: serde_json::Value =
+    let parsed_snapshot: serde_json::Value =
         serde_json::from_str(raw).context("policy snapshot is not valid json")?;
-    Ok(policy_revision_from_json(&parsed))
-}
-
-fn policy_revision_from_json(value: &serde_json::Value) -> Option<String> {
-    value
-        .get("policy_revision")
-        .and_then(|v| v.as_str())
-        .map(str::trim)
-        .filter(|v| !v.is_empty())
-        .map(ToOwned::to_owned)
-}
-
-fn policy_signature_from_json(value: &serde_json::Value) -> Option<String> {
-    value
-        .get("policy_signature")
-        .and_then(|v| v.as_str())
-        .map(str::trim)
-        .filter(|v| !v.is_empty())
-        .map(ToOwned::to_owned)
-}
-
-fn policy_signature_algorithm_from_json(value: &serde_json::Value) -> Option<String> {
-    value
-        .get("policy_signature_algorithm")
-        .and_then(|v| v.as_str())
-        .map(str::trim)
-        .filter(|v| !v.is_empty())
-        .map(ToOwned::to_owned)
+    Ok(policy_revision_from_json(&parsed_snapshot))
 }
 
 #[derive(Debug, Clone)]
@@ -1351,55 +1541,110 @@ fn verify_policy_signature_fields(
     key: Option<&str>,
     allow_unsigned: bool,
 ) -> Result<PolicySignatureCheck> {
-    let signature = signature.map(str::trim).filter(|v| !v.is_empty());
-    if signature.is_none() {
-        if allow_unsigned {
-            return Ok(PolicySignatureCheck {
-                status: "unsigned",
-                verified: false,
-                signature_algorithm: None,
-                received_signature: None,
-                expected_signature: None,
-            });
-        }
-        return Err(anyhow!(
-            "policy revision is unsigned; set --allow-unsigned to ignore"
-        ));
-    }
-
-    let signature_algorithm = signature_algorithm
-        .map(str::trim)
-        .filter(|v| !v.is_empty())
-        .unwrap_or("hmac-sha256")
-        .to_string();
-    if !signature_algorithm.eq_ignore_ascii_case("hmac-sha256") {
-        return Err(anyhow!(
-            "unsupported policy signature algorithm '{}'",
-            signature_algorithm
-        ));
-    }
-
-    let key = resolve_policy_verify_key(key).ok_or_else(|| {
+    let received_signature = require_received_signature(signature, allow_unsigned)?;
+    let Some(received_signature) = received_signature else {
+        return Ok(unsigned_signature_status());
+    };
+    let signature_algorithm = parse_signature_algorithm(signature_algorithm)?;
+    let signing_key = resolve_policy_verify_key(key).ok_or_else(|| {
         anyhow!(
             "missing verification key; pass --key or set ANNA_POLICY_VERIFY_KEY / ANNA_POLICY_SIGNING_KEY"
         )
     })?;
-    let expected_signature = sign_policy_revision_hmac_sha256(revision, &key)
+    let expected_signature = sign_policy_revision_hmac_sha256(revision, &signing_key)
         .ok_or_else(|| anyhow!("failed to compute policy signature"))?;
-    let received_signature = signature.unwrap_or_default().to_string();
-    let verified = verify_policy_revision_hmac_sha256(revision, &received_signature, &key)
+    let verified = verify_policy_revision_hmac_sha256(revision, &received_signature, &signing_key)
         .ok_or_else(|| anyhow!("policy signature is not valid hexadecimal"))?;
     Ok(PolicySignatureCheck {
-        status: if verified {
-            "verified"
-        } else {
-            "invalid_signature"
-        },
+        status: signature_status_from_verified(verified),
         verified,
         signature_algorithm: Some(signature_algorithm),
         received_signature: Some(received_signature),
         expected_signature: Some(expected_signature),
     })
+}
+
+async fn fetch_policy_revision_payload(daemon: &str) -> Result<serde_json::Value> {
+    let verify_client = Client::new();
+    let verify_response = with_daemon_auth(verify_client.get(format!("{}/policy/revision", daemon)))
+        .send()
+        .await
+        .with_context(|| format!("failed querying policy revision at {}", daemon))?;
+    let verify_status = verify_response.status();
+    let verify_body = verify_response
+        .text()
+        .await
+        .context("failed reading policy revision response body")?;
+    ensure_http_success(verify_status, &verify_body, "policy revision request")?;
+    parse_revision_json(&verify_body)
+}
+
+fn resolve_revision_from_payload(payload: &serde_json::Value, missing_message: &str) -> Result<String> {
+    resolve_policy_revision(payload, None, missing_message)
+}
+
+fn print_policy_signature_check(revision: &str, check: &PolicySignatureCheck) -> Result<()> {
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&json!({
+            "status": check.status,
+            "verified": check.verified,
+            "policy_revision": revision,
+            "signature_algorithm": check.signature_algorithm,
+            "received_signature": check.received_signature,
+            "expected_signature": check.expected_signature,
+        }))?
+    );
+    Ok(())
+}
+
+fn require_received_signature(
+    signature: Option<&str>,
+    allow_unsigned: bool,
+) -> Result<Option<String>> {
+    let signature = signature.map(str::trim).filter(|v| !v.is_empty());
+    if let Some(signature) = signature {
+        return Ok(Some(signature.to_string()));
+    }
+    if allow_unsigned {
+        return Ok(None);
+    }
+    Err(anyhow!(
+        "policy revision is unsigned; set --allow-unsigned to ignore"
+    ))
+}
+
+fn parse_signature_algorithm(signature_algorithm: Option<&str>) -> Result<String> {
+    let parsed_algorithm = signature_algorithm
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .unwrap_or("hmac-sha256")
+        .to_string();
+    if parsed_algorithm.eq_ignore_ascii_case("hmac-sha256") {
+        return Ok(parsed_algorithm);
+    }
+    Err(anyhow!(
+        "unsupported policy signature algorithm '{}'",
+        parsed_algorithm
+    ))
+}
+
+fn unsigned_signature_status() -> PolicySignatureCheck {
+    PolicySignatureCheck {
+        status: "unsigned",
+        verified: false,
+        signature_algorithm: None,
+        received_signature: None,
+        expected_signature: None,
+    }
+}
+
+fn signature_status_from_verified(verified: bool) -> &'static str {
+    if verified {
+        "verified"
+    } else {
+        "invalid_signature"
+    }
 }
 
 fn resolve_policy_verify_key(key: Option<&str>) -> Option<String> {
@@ -1420,31 +1665,6 @@ fn resolve_policy_verify_key(key: Option<&str>) -> Option<String> {
         })
 }
 
-fn etag_revision(headers: &reqwest::header::HeaderMap) -> Option<String> {
-    headers
-        .get(reqwest::header::ETAG)
-        .and_then(|v| v.to_str().ok())
-        .and_then(normalize_etag_value)
-}
-
-fn normalize_etag_value(value: &str) -> Option<String> {
-    let mut trimmed = value.trim();
-    if trimmed.is_empty() || trimmed == "*" {
-        return None;
-    }
-    if let Some(weak) = trimmed
-        .strip_prefix("W/")
-        .or_else(|| trimmed.strip_prefix("w/"))
-    {
-        trimmed = weak.trim();
-    }
-    let normalized = trimmed.trim_matches('"').trim();
-    if normalized.is_empty() || normalized == "*" {
-        return None;
-    }
-    Some(normalized.to_string())
-}
-
 async fn write_json_atomic(path: &Path, value: &serde_json::Value) -> Result<()> {
     if let Some(parent) = path.parent() {
         tokio::fs::create_dir_all(parent).await.with_context(|| {
@@ -1454,9 +1674,10 @@ async fn write_json_atomic(path: &Path, value: &serde_json::Value) -> Result<()>
             )
         })?;
     }
-    let raw = serde_json::to_string_pretty(value).context("serialize policy snapshot json")?;
+    let serialized_json =
+        serde_json::to_string_pretty(value).context("serialize policy snapshot json")?;
     let tmp = temp_json_path(path);
-    tokio::fs::write(&tmp, raw).await.with_context(|| {
+    tokio::fs::write(&tmp, serialized_json).await.with_context(|| {
         format!(
             "failed writing local policy snapshot temp '{}'",
             tmp.display()
@@ -1486,75 +1707,88 @@ async fn wait_for_workflow(
     poll_ms: u64,
     timeout_sec: Option<u64>,
 ) -> Result<()> {
-    let client = Client::new();
+    let wait_client = Client::new();
     let daemon = normalize_daemon_url(daemon);
     let started = Instant::now();
     let timeout = timeout_sec.map(Duration::from_secs);
     let mut previous_status = String::new();
 
     loop {
-        if let Some(limit) = timeout
-            && started.elapsed() >= limit
-        {
+        if let Some(limit_sec) = wait_timeout_secs(started, timeout) {
             return Err(anyhow!(
                 "timeout waiting for workflow '{}' after {}s",
                 id,
-                limit.as_secs()
+                limit_sec
             ));
         }
 
-        let response = with_daemon_auth(client.get(format!("{}/workflow/{}", daemon, id)))
-            .send()
-            .await
-            .with_context(|| format!("failed querying workflow '{}' at {}", id, daemon))?;
-        let status_code = response.status();
-        let body = response
-            .text()
-            .await
-            .context("failed reading workflow status response")?;
-        if !status_code.is_success() {
-            if body.trim().is_empty() {
-                return Err(anyhow!(
-                    "request failed with status {} while waiting for '{}'",
-                    status_code,
-                    id
-                ));
-            }
-            return Err(anyhow!(
-                "request failed with status {} while waiting for '{}': {}",
-                status_code,
-                id,
-                body
-            ));
+        let status_payload = fetch_workflow_status_payload(&wait_client, &daemon, id).await?;
+        let workflow_status = workflow_status_value(&status_payload);
+
+        if workflow_status != previous_status {
+            println!("status={}", workflow_status);
+            previous_status = workflow_status.to_owned();
         }
 
-        let parsed: serde_json::Value =
-            serde_json::from_str(&body).context("daemon returned non-json workflow status")?;
-        let status = parsed
-            .get("status")
-            .and_then(|v| v.as_str())
-            .unwrap_or("unknown")
-            .to_string();
-
-        if status != previous_status {
-            println!("status={}", status);
-            previous_status = status.clone();
-        }
-
-        if is_terminal_status(&status) {
-            println!("{}", serde_json::to_string_pretty(&parsed)?);
-            if status == "done" {
-                return Ok(());
-            }
-            return Err(anyhow!(
-                "workflow '{}' finished with non-success status '{}'",
-                id,
-                status
-            ));
+        if let Some(terminal_result) = handle_terminal_status(id, &workflow_status, &status_payload)? {
+            return terminal_result;
         }
 
         sleep(Duration::from_millis(poll_ms)).await;
     }
+}
+
+async fn fetch_workflow_status_payload(client: &Client, daemon: &str, id: &str) -> Result<serde_json::Value> {
+    let workflow_response = with_daemon_auth(client.get(format!("{}/workflow/{}", daemon, id)))
+        .send()
+        .await
+        .with_context(|| format!("failed querying workflow '{}' at {}", id, daemon))?;
+    let status_code = workflow_response.status();
+    let workflow_body = workflow_response
+        .text()
+        .await
+        .context("failed reading workflow status response")?;
+    ensure_http_success(
+        status_code,
+        &workflow_body,
+        &format!("request while waiting for '{}'", id),
+    )?;
+    serde_json::from_str(&workflow_body).context("daemon returned non-json workflow status")
+}
+
+fn workflow_status_value(status_payload: &serde_json::Value) -> String {
+    status_payload
+        .get("status")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown")
+        .to_string()
+}
+
+fn handle_terminal_status(
+    id: &str,
+    workflow_status: &str,
+    status_payload: &serde_json::Value,
+) -> Result<Option<Result<()>>> {
+    if !is_terminal_status(workflow_status) {
+        return Ok(None);
+    }
+    println!("{}", serde_json::to_string_pretty(status_payload)?);
+    if workflow_status == "done" {
+        return Ok(Some(Ok(())));
+    }
+    Ok(Some(Err(anyhow!(
+        "workflow '{}' finished with non-success status '{}'",
+        id,
+        workflow_status
+    ))))
+}
+
+fn wait_timeout_secs(started: Instant, timeout: Option<Duration>) -> Option<u64> {
+    let limit = timeout?;
+    if started.elapsed() >= limit {
+        return Some(limit.as_secs());
+    }
+    None
 }
 
 fn is_terminal_status(status: &str) -> bool {
@@ -1567,11 +1801,13 @@ fn is_terminal_status(status: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        is_terminal_status, normalize_etag_value, policy_revision_from_json,
-        policy_signature_algorithm_from_json, policy_signature_from_json,
-        resolve_inline_or_file_key, resolve_policy_verify_key, verify_policy_signature_fields,
+        is_terminal_status, resolve_inline_or_file_key, resolve_policy_verify_key,
+        verify_policy_signature_fields,
     };
-    use anna_rs::policy_crypto::{constant_time_eq, decode_hex, sign_policy_revision_hmac_sha256};
+    use anna_rs::policy_sync::{
+        normalize_etag_value, policy_revision_from_json, policy_signature_algorithm_from_json,
+        policy_signature_from_json,
+    };
     use serde_json::json;
 
     #[test]
@@ -1600,11 +1836,11 @@ mod tests {
 
     #[test]
     fn policy_revision_from_json_reads_non_empty_value() {
-        let value = json!({
+        let revision_payload = json!({
             "policy_revision": "abc123",
         });
         assert_eq!(
-            policy_revision_from_json(&value),
+            policy_revision_from_json(&revision_payload),
             Some("abc123".to_string())
         );
         let missing = json!({});
@@ -1615,11 +1851,11 @@ mod tests {
 
     #[test]
     fn policy_signature_from_json_reads_non_empty_value() {
-        let value = json!({
+        let signature_payload = json!({
             "policy_signature": "sig-abc",
         });
         assert_eq!(
-            policy_signature_from_json(&value),
+            policy_signature_from_json(&signature_payload),
             Some("sig-abc".to_string())
         );
         assert_eq!(policy_signature_from_json(&json!({})), None);
@@ -1631,30 +1867,20 @@ mod tests {
 
     #[test]
     fn policy_signature_algorithm_from_json_reads_non_empty_value() {
-        let value = json!({
+        let algorithm_payload = json!({
             "policy_signature_algorithm": "hmac-sha256",
         });
         assert_eq!(
-            policy_signature_algorithm_from_json(&value),
+            policy_signature_algorithm_from_json(&algorithm_payload),
             Some("hmac-sha256".to_string())
         );
         assert_eq!(policy_signature_algorithm_from_json(&json!({})), None);
     }
 
     #[test]
-    fn sign_policy_revision_hmac_sha256_is_stable_and_keyed() {
-        let first = sign_policy_revision_hmac_sha256("rev-1", "secret-a").expect("signature");
-        let same = sign_policy_revision_hmac_sha256("rev-1", "secret-a").expect("signature");
-        let different = sign_policy_revision_hmac_sha256("rev-1", "secret-b").expect("signature");
-        assert_eq!(first, same);
-        assert_ne!(first, different);
-        assert_eq!(first.len(), 64);
-    }
-
-    #[test]
     fn resolve_policy_verify_key_prefers_explicit_input() {
-        let key = resolve_policy_verify_key(Some("  my-key  "));
-        assert_eq!(key, Some("my-key".to_string()));
+        let explicit_key = resolve_policy_verify_key(Some("  my-key  "));
+        assert_eq!(explicit_key, Some("my-key".to_string()));
     }
 
     #[test]
@@ -1665,11 +1891,11 @@ mod tests {
             rand::random::<u32>()
         ));
         std::fs::write(&path, "  file-key  \n").expect("write key file");
-        let key = resolve_inline_or_file_key(None, Some(&path))
+        let file_key = resolve_inline_or_file_key(None, Some(&path))
             .expect("resolve key")
             .expect("key should exist");
-        assert_eq!(key, "file-key");
-        let _ = std::fs::remove_file(&path);
+        assert_eq!(file_key, "file-key");
+        std::fs::remove_file(&path).expect("remove key file");
     }
 
     #[test]
@@ -1691,11 +1917,4 @@ mod tests {
         assert!(!invalid.verified);
     }
 
-    #[test]
-    fn decode_hex_and_constant_time_eq_work_for_mixed_case_input() {
-        let mixed = decode_hex("Aa10").expect("mixed case hex");
-        let lower = decode_hex("aa10").expect("lower hex");
-        assert!(constant_time_eq(&mixed, &lower));
-        assert!(decode_hex("xyz").is_none());
-    }
 }

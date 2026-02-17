@@ -598,7 +598,51 @@ impl HitlHandler for DaemonHitl {
     }
 }
 
+struct DaemonEnvConfig {
+    state_file: Option<PathBuf>,
+    policy_snapshot_file: Option<PathBuf>,
+    registry_file: Option<PathBuf>,
+    node_id: String,
+    trigger_lease: Option<TriggerLeaseConfig>,
+    audit_log: Option<AuditLogConfig>,
+    chat_reload_interval: Option<Duration>,
+}
+
+struct DaemonRuntimeConfig {
+    policy_signing_key: Option<String>,
+    chat_intents: HashMap<String, ChatIntentConfig>,
+    retention: RetentionConfig,
+    node_capabilities: HashSet<String>,
+    owner_policy: OwnerConcurrencyPolicy,
+}
+
+struct DaemonSeedState {
+    sessions_seed: HashMap<String, SessionInfo>,
+    hitl_seed: HashMap<String, HitlPending>,
+}
+
+struct DaemonInit {
+    env: DaemonEnvConfig,
+    runtime: DaemonRuntimeConfig,
+    seed: DaemonSeedState,
+}
+
 pub async fn run_daemon(bind: &str, plays_dir: PathBuf) -> Result<()> {
+    let daemon_init = load_daemon_init().await?;
+    let app_state_daemon = build_daemon_app_state(plays_dir, &daemon_init);
+    tokio::spawn(trigger_scheduler_loop(app_state_daemon.clone()));
+    spawn_optional_daemon_tasks(
+        app_state_daemon.clone(),
+        daemon_init.env.state_file.clone(),
+        daemon_init.env.policy_snapshot_file.clone(),
+        daemon_init.env.chat_reload_interval,
+    );
+    log_daemon_startup(&app_state_daemon, &daemon_init);
+    emit_daemon_started_event(bind, &app_state_daemon, &daemon_init).await;
+    serve_daemon(bind, app_state_daemon).await
+}
+
+async fn load_daemon_init() -> Result<DaemonInit> {
     let state_file = daemon_state_file();
     let policy_snapshot_file = daemon_policy_snapshot_file();
     let registry_file = flow_registry_file();
@@ -615,78 +659,111 @@ pub async fn run_daemon(bind: &str, plays_dir: PathBuf) -> Result<()> {
         Some(path) => load_daemon_state(path).await?,
         None => (HashMap::new(), HashMap::new()),
     };
+    Ok(DaemonInit {
+        env: DaemonEnvConfig {
+            state_file,
+            policy_snapshot_file,
+            registry_file,
+            node_id,
+            trigger_lease,
+            audit_log,
+            chat_reload_interval,
+        },
+        runtime: DaemonRuntimeConfig {
+            policy_signing_key,
+            chat_intents,
+            retention,
+            node_capabilities,
+            owner_policy,
+        },
+        seed: DaemonSeedState {
+            sessions_seed,
+            hitl_seed,
+        },
+    })
+}
 
-    let hitl = Arc::new(RwLock::new(hitl_seed));
+fn build_daemon_app_state(plays_dir: PathBuf, init: &DaemonInit) -> AppState {
+    let hitl = Arc::new(RwLock::new(init.seed.hitl_seed.clone()));
     let executor = Executor::new().with_hitl_handler(Arc::new(DaemonHitl {
         pending: hitl.clone(),
-        max_hitl: retention.max_hitl,
+        max_hitl: init.runtime.retention.max_hitl,
     }));
     let offline_mode = executor.offline_mode();
     let allowed_providers = executor.allowed_providers_set();
-    let chat_intents_state = Arc::new(RwLock::new(chat_intents.clone()));
+    let chat_intents_state = Arc::new(RwLock::new(init.runtime.chat_intents.clone()));
     let trigger_leader_state = Arc::new(RwLock::new(initial_trigger_leader_state(
-        &node_id,
-        trigger_lease.as_ref(),
+        &init.env.node_id,
+        init.env.trigger_lease.as_ref(),
     )));
-    let app_state_daemon = AppState {
+    AppState {
         executor,
         plays_dir,
-        registry_file: registry_file.clone(),
+        registry_file: init.env.registry_file.clone(),
         chat_intents: chat_intents_state,
-        trigger_lease: trigger_lease.clone(),
+        trigger_lease: init.env.trigger_lease.clone(),
         trigger_leader_state,
-        audit_log: audit_log.clone(),
-        policy_signing_key,
+        audit_log: init.env.audit_log.clone(),
+        policy_signing_key: init.runtime.policy_signing_key.clone(),
         offline_mode,
-        node_capabilities: node_capabilities.clone(),
-        allowed_providers: allowed_providers.clone(),
-        owner_policy: owner_policy.clone(),
-        sessions: Arc::new(RwLock::new(sessions_seed)),
+        node_capabilities: init.runtime.node_capabilities.clone(),
+        allowed_providers,
+        owner_policy: init.runtime.owner_policy.clone(),
+        sessions: Arc::new(RwLock::new(init.seed.sessions_seed.clone())),
         handles: Arc::new(RwLock::new(HashMap::new())),
-        hitl: hitl.clone(),
+        hitl,
         auth_token: daemon_auth_token(),
-        retention,
-    };
-    tokio::spawn(trigger_scheduler_loop(app_state_daemon.clone()));
-    spawn_optional_daemon_tasks(
-        app_state_daemon.clone(),
-        state_file.clone(),
-        policy_snapshot_file.clone(),
-        chat_reload_interval,
-    );
+        retention: init.runtime.retention,
+    }
+}
+
+fn log_daemon_startup(state: &AppState, init: &DaemonInit) {
     let startup_log_context = StartupLogContext {
-        registry_file: registry_file.as_ref(),
-        chat_intents: &chat_intents,
-        trigger_lease: trigger_lease.as_ref(),
-        node_id: &node_id,
-        audit_log: audit_log.as_ref(),
-        offline_mode,
-        node_capabilities: &node_capabilities,
-        allowed_providers: allowed_providers.as_ref(),
-        owner_policy: &owner_policy,
+        registry_file: init.env.registry_file.as_ref(),
+        chat_intents: &init.runtime.chat_intents,
+        trigger_lease: init.env.trigger_lease.as_ref(),
+        node_id: &init.env.node_id,
+        audit_log: init.env.audit_log.as_ref(),
+        offline_mode: state.offline_mode,
+        node_capabilities: &init.runtime.node_capabilities,
+        allowed_providers: state.allowed_providers.as_ref(),
+        owner_policy: &init.runtime.owner_policy,
     };
     log_daemon_startup_config(&startup_log_context);
-    let startup_policy_core = build_policy_core(&app_state_daemon).await;
+}
+
+async fn emit_daemon_started_event(bind: &str, state: &AppState, init: &DaemonInit) {
+    let startup_policy_core = build_policy_core(state).await;
     let (startup_policy_revision, _policy_signature) =
-        policy_revision_and_signature(&startup_policy_core, app_state_daemon.policy_signing_key.as_deref());
+        policy_revision_and_signature(&startup_policy_core, state.policy_signing_key.as_deref());
     emit_audit_event(
-        &app_state_daemon,
+        state,
         "daemon_started",
         json!({
             "bind": bind,
-            "registry_enabled": app_state_daemon.registry_file.is_some(),
-            "auth_enabled": app_state_daemon.auth_token.is_some(),
-            "offline_mode": app_state_daemon.offline_mode,
-            "chat_intents_count": chat_intents.len(),
-            "trigger_lease_enabled": trigger_lease.is_some(),
+            "registry_enabled": state.registry_file.is_some(),
+            "auth_enabled": state.auth_token.is_some(),
+            "offline_mode": state.offline_mode,
+            "chat_intents_count": init.runtime.chat_intents.len(),
+            "trigger_lease_enabled": init.env.trigger_lease.is_some(),
             "policy_revision": startup_policy_revision,
-            "allowed_providers": sorted_set_values(app_state_daemon.allowed_providers.as_ref()),
-            "node_capabilities": sorted_set_values(Some(&app_state_daemon.node_capabilities)),
+            "allowed_providers": sorted_set_values(state.allowed_providers.as_ref()),
+            "node_capabilities": sorted_set_values(Some(&state.node_capabilities)),
         }),
     )
     .await;
+}
 
-    let app = Router::new()
+async fn serve_daemon(bind: &str, state: AppState) -> Result<()> {
+    let app = daemon_router(state);
+    let listener = tokio::net::TcpListener::bind(bind).await?;
+    println!("anna-rs daemon listening on http://{}", bind);
+    axum::serve(listener, app).await?;
+    Ok(())
+}
+
+fn daemon_router(state: AppState) -> Router {
+    Router::new()
         .route("/health", get(health))
         .route("/policy", get(policy))
         .route("/policy/revision", get(policy_revision))
@@ -709,12 +786,7 @@ pub async fn run_daemon(bind: &str, plays_dir: PathBuf) -> Result<()> {
         .route("/hitl", get(list_hitl))
         .route("/hitl/{id}/resolve", post(resolve_hitl))
         .route("/ws", get(ws_logs))
-        .with_state(app_state_daemon);
-
-    let listener = tokio::net::TcpListener::bind(bind).await?;
-    println!("anna-rs daemon listening on http://{}", bind);
-    axum::serve(listener, app).await?;
-    Ok(())
+        .with_state(state)
 }
 
 fn spawn_optional_daemon_tasks(
@@ -1068,91 +1140,117 @@ async fn list_workflows_meta(
     if let Some(resp) = ensure_authorized(&state, &headers) {
         return resp;
     }
-    let workflow_entries =
-        match find_workflow_entries_with_registry(&state.plays_dir, state.registry_file.as_deref())
-            .await
-        {
-            Ok(v) => v,
-            Err(err) => {
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("failed listing workflows: {}", err),
-                )
-                    .into_response();
-            }
-        };
-    let tag_filter = query.tag.as_deref().map(|v| v.trim().to_ascii_lowercase());
-    let owner_filter = query
-        .owner
-        .as_deref()
-        .map(|v| v.trim().to_ascii_lowercase());
-    let capability_filter = query
-        .capability
-        .as_deref()
-        .map(|v| v.trim().to_ascii_lowercase());
-    let available_filter = query.available;
+    let workflow_entries = match workflow_entries_for_meta_or_response(&state).await {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
+    let filters = workflow_meta_filters_from_query(&query);
     let sessions_guard_meta_read = state.sessions.read().await;
     let (running_by_workflow, running_by_owner) = build_running_indexes(&sessions_guard_meta_read);
     drop(sessions_guard_meta_read);
 
     let mut out = workflow_entries
         .into_iter()
-        .map(|entry| {
-            let running = running_by_workflow
-                .get(&entry.workflow_name)
-                .copied()
-                .unwrap_or(0);
-            let owner_running = owner_key(entry.owner.as_deref())
-                .and_then(|key| running_by_owner.get(&key).copied())
-                .unwrap_or(0);
-            let owner_max_concurrency =
-                owner_limit_for(entry.owner.as_deref(), &state.owner_policy);
-            let readiness = evaluate_flow_readiness(
-                &entry,
-                &state.node_capabilities,
-                state.allowed_providers.as_ref(),
-                flow_readiness_runtime(running, None, owner_running, owner_max_concurrency),
-            );
-            WorkflowMetaResponse {
-                id: workflow_public_id(&entry),
-                workflow: entry.workflow_name,
-                file: entry.file_name,
-                path: entry.path.display().to_string(),
-                tags: entry.tags,
-                required_capabilities: entry.required_capabilities,
-                required_providers: entry.required_providers,
-                owner: entry.owner,
-                version: entry.version,
-                max_concurrency: entry.max_concurrency,
-                running: readiness.running,
-                concurrency_blocked: readiness.concurrency_blocked,
-                owner_max_concurrency: readiness.owner_max_concurrency.map(|v| v as u32),
-                owner_running: readiness.owner_running,
-                owner_concurrency_blocked: readiness.owner_concurrency_blocked,
-                available: readiness.can_run(),
-                missing_capabilities: readiness.missing_capabilities,
-                missing_providers: readiness.missing_providers,
-                trigger_webhook: entry.trigger_webhook,
-                trigger_watch: entry.trigger_watch,
-                trigger_cron: entry.trigger_cron,
-                trigger_interval: entry.trigger_interval,
-            }
-        })
-        .filter(|item| {
-            matches_workflow_meta_filters(
-                item,
-                tag_filter.as_deref(),
-                owner_filter.as_deref(),
-                capability_filter.as_deref(),
-                available_filter,
-            )
-        })
+        .map(|entry| build_workflow_meta_item(entry, &state, &running_by_workflow, &running_by_owner))
+        .filter(|item| matches_workflow_meta_filters_for_query(item, &filters))
         .collect::<Vec<_>>();
     out.sort_by(|a, b| a.id.cmp(&b.id));
     if let Some(limit) = query.limit {
         out.truncate(limit);
     }
     Json(out).into_response()
+}
+
+#[derive(Default)]
+struct WorkflowMetaFilters {
+    tag_filter: Option<String>,
+    owner_filter: Option<String>,
+    capability_filter: Option<String>,
+    available_filter: Option<bool>,
+}
+
+async fn workflow_entries_for_meta_or_response(
+    state: &AppState,
+) -> std::result::Result<Vec<WorkflowEntry>, axum::response::Response> {
+    match find_workflow_entries_with_registry(&state.plays_dir, state.registry_file.as_deref()).await {
+        Ok(v) => Ok(v),
+        Err(err) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("failed listing workflows: {}", err),
+        )
+            .into_response()),
+    }
+}
+
+fn workflow_meta_filters_from_query(query: &WorkflowsMetaQuery) -> WorkflowMetaFilters {
+    WorkflowMetaFilters {
+        tag_filter: query.tag.as_deref().map(|v| v.trim().to_ascii_lowercase()),
+        owner_filter: query.owner.as_deref().map(|v| v.trim().to_ascii_lowercase()),
+        capability_filter: query
+            .capability
+            .as_deref()
+            .map(|v| v.trim().to_ascii_lowercase()),
+        available_filter: query.available,
+    }
+}
+
+fn build_workflow_meta_item(
+    entry: WorkflowEntry,
+    state: &AppState,
+    running_by_workflow: &HashMap<String, usize>,
+    running_by_owner: &HashMap<String, usize>,
+) -> WorkflowMetaResponse {
+    let running = running_by_workflow
+        .get(&entry.workflow_name)
+        .copied()
+        .unwrap_or(0);
+    let owner_running = owner_key(entry.owner.as_deref())
+        .and_then(|key| running_by_owner.get(&key).copied())
+        .unwrap_or(0);
+    let owner_max_concurrency = owner_limit_for(entry.owner.as_deref(), &state.owner_policy);
+    let meta_readiness = evaluate_flow_readiness(
+        &entry,
+        &state.node_capabilities,
+        state.allowed_providers.as_ref(),
+        flow_readiness_runtime(running, None, owner_running, owner_max_concurrency),
+    );
+    WorkflowMetaResponse {
+        id: workflow_public_id(&entry),
+        workflow: entry.workflow_name,
+        file: entry.file_name,
+        path: entry.path.display().to_string(),
+        tags: entry.tags,
+        required_capabilities: entry.required_capabilities,
+        required_providers: entry.required_providers,
+        owner: entry.owner,
+        version: entry.version,
+        max_concurrency: entry.max_concurrency,
+        running: meta_readiness.running,
+        concurrency_blocked: meta_readiness.concurrency_blocked,
+        owner_max_concurrency: meta_readiness.owner_max_concurrency.map(|v| v as u32),
+        owner_running: meta_readiness.owner_running,
+        owner_concurrency_blocked: meta_readiness.owner_concurrency_blocked,
+        available: meta_readiness.can_run(),
+        missing_capabilities: meta_readiness.missing_capabilities,
+        missing_providers: meta_readiness.missing_providers,
+        trigger_webhook: entry.trigger_webhook,
+        trigger_watch: entry.trigger_watch,
+        trigger_cron: entry.trigger_cron,
+        trigger_interval: entry.trigger_interval,
+    }
+}
+
+fn matches_workflow_meta_filters_for_query(
+    item: &WorkflowMetaResponse,
+    filters: &WorkflowMetaFilters,
+) -> bool {
+    matches_workflow_meta_filters(
+        item,
+        filters.tag_filter.as_deref(),
+        filters.owner_filter.as_deref(),
+        filters.capability_filter.as_deref(),
+        filters.available_filter,
+    )
 }
 
 async fn list_sessions(
@@ -1877,55 +1975,15 @@ async fn trigger_hook(
     if let Some(response) = reject_hook_on_follower(&state, &hook_path).await {
         return response;
     }
-    let hook_entries =
-        match find_workflow_entries_with_registry(&state.plays_dir, state.registry_file.as_deref())
-            .await
-        {
-            Ok(v) => v,
-            Err(err) => {
-                emit_audit_event(
-                    &state,
-                    "hook_scan_failed",
-                    json!({
-                        "hook": hook_path.clone(),
-                        "error": err.to_string(),
-                    }),
-                )
-                .await;
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("failed scanning workflows: {}", err),
-                )
-                    .into_response();
-            }
-        };
-
+    let hook_entries = match hook_entries_or_response(&state, &hook_path).await {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
     let hook_outcomes_summary = collect_hook_outcomes(&state, hook_entries, &hook_path).await;
-
-    if hook_outcomes_summary.is_empty() {
-        emit_audit_event(
-            &state,
-            "hook_no_match",
-            json!({
-                "hook": hook_path.clone(),
-            }),
-        )
-        .await;
-        return (StatusCode::NOT_FOUND, "no workflows for hook").into_response();
+    if let Some(response) = hook_no_match_response_or_none(&state, &hook_path, &hook_outcomes_summary).await {
+        return response;
     }
-    emit_audit_event(
-        &state,
-        "hook_triggered",
-        json!({
-            "hook": hook_path.clone(),
-            "launched": hook_outcomes_summary.launched.len(),
-            "skipped_running": hook_outcomes_summary.skipped_running.len(),
-            "skipped_capability": hook_outcomes_summary.skipped_capability.len(),
-            "skipped_provider": hook_outcomes_summary.skipped_provider.len(),
-            "skipped_concurrency": hook_outcomes_summary.skipped_concurrency.len(),
-        }),
-    )
-    .await;
+    emit_hook_triggered_event(&state, &hook_path, &hook_outcomes_summary).await;
     (
         StatusCode::ACCEPTED,
         Json(HookTriggerResponse {
@@ -1938,6 +1996,66 @@ async fn trigger_hook(
         }),
     )
         .into_response()
+}
+
+async fn hook_entries_or_response(
+    state: &AppState,
+    hook_path: &str,
+) -> std::result::Result<Vec<WorkflowEntry>, axum::response::Response> {
+    match find_workflow_entries_with_registry(&state.plays_dir, state.registry_file.as_deref()).await {
+        Ok(v) => Ok(v),
+        Err(err) => {
+            emit_audit_event(
+                state,
+                "hook_scan_failed",
+                json!({
+                    "hook": hook_path,
+                    "error": err.to_string(),
+                }),
+            )
+            .await;
+            Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("failed scanning workflows: {}", err),
+            )
+                .into_response())
+        }
+    }
+}
+
+async fn hook_no_match_response_or_none(
+    state: &AppState,
+    hook_path: &str,
+    outcomes: &HookOutcomes,
+) -> Option<axum::response::Response> {
+    if !outcomes.is_empty() {
+        return None;
+    }
+    emit_audit_event(
+        state,
+        "hook_no_match",
+        json!({
+            "hook": hook_path,
+        }),
+    )
+    .await;
+    Some((StatusCode::NOT_FOUND, "no workflows for hook").into_response())
+}
+
+async fn emit_hook_triggered_event(state: &AppState, hook_path: &str, outcomes: &HookOutcomes) {
+    emit_audit_event(
+        state,
+        "hook_triggered",
+        json!({
+            "hook": hook_path,
+            "launched": outcomes.launched.len(),
+            "skipped_running": outcomes.skipped_running.len(),
+            "skipped_capability": outcomes.skipped_capability.len(),
+            "skipped_provider": outcomes.skipped_provider.len(),
+            "skipped_concurrency": outcomes.skipped_concurrency.len(),
+        }),
+    )
+    .await;
 }
 
 struct HookOutcomes {
@@ -2204,46 +2322,39 @@ async fn trigger_scheduler_loop(state: AppState) {
 
 async fn scheduler_should_run(state: &AppState) -> bool {
     let previous = state.trigger_leader_state.read().await.clone();
+    let snapshot = refresh_trigger_leader_snapshot(state, &previous).await;
+    emit_trigger_leader_transition_if_changed(state, &previous, &snapshot).await;
+    let is_leader = snapshot.is_leader;
+    *state.trigger_leader_state.write().await = snapshot;
+    is_leader
+}
 
+async fn refresh_trigger_leader_snapshot(
+    state: &AppState,
+    previous: &TriggerLeaderState,
+) -> TriggerLeaderState {
     let Some(config) = state.trigger_lease.as_ref() else {
-        let next = TriggerLeaderState {
-            enabled: false,
-            is_leader: true,
-            node_id: previous.node_id.clone(),
-            holder: Some(previous.node_id.clone()),
-            expires_at: None,
-            lease_file: None,
-        };
-        if trigger_leader_state_changed(&previous, &next) {
-            emit_audit_event(
-                state,
-                trigger_leader_transition_event(&previous, &next),
-                json!({
-                    "previous": {
-                        "enabled": previous.enabled,
-                        "is_leader": previous.is_leader,
-                        "node_id": previous.node_id.clone(),
-                        "holder": previous.holder.clone(),
-                        "expires_at": previous.expires_at,
-                        "lease_file": previous.lease_file.clone(),
-                    },
-                    "next": {
-                        "enabled": next.enabled,
-                        "is_leader": next.is_leader,
-                        "node_id": next.node_id.clone(),
-                        "holder": next.holder.clone(),
-                        "expires_at": next.expires_at,
-                        "lease_file": next.lease_file.clone(),
-                    },
-                }),
-            )
-            .await;
-        }
-        *state.trigger_leader_state.write().await = next;
-        return true;
+        return disabled_trigger_leader_snapshot(previous);
     };
+    refresh_trigger_leader_snapshot_with_config(state, config).await
+}
 
-    let snapshot = match resolve_trigger_leadership(config).await {
+fn disabled_trigger_leader_snapshot(previous: &TriggerLeaderState) -> TriggerLeaderState {
+    TriggerLeaderState {
+        enabled: false,
+        is_leader: true,
+        node_id: previous.node_id.clone(),
+        holder: Some(previous.node_id.clone()),
+        expires_at: None,
+        lease_file: None,
+    }
+}
+
+async fn refresh_trigger_leader_snapshot_with_config(
+    state: &AppState,
+    config: &TriggerLeaseConfig,
+) -> TriggerLeaderState {
+    match resolve_trigger_leadership(config).await {
         Ok(v) => v,
         Err(err) => {
             eprintln!(
@@ -2270,37 +2381,44 @@ async fn scheduler_should_run(state: &AppState) -> bool {
                 lease_file: Some(config.lease_file.display().to_string()),
             }
         }
-    };
-
-    if trigger_leader_state_changed(&previous, &snapshot) {
-        emit_audit_event(
-            state,
-            trigger_leader_transition_event(&previous, &snapshot),
-            json!({
-                "previous": {
-                    "enabled": previous.enabled,
-                    "is_leader": previous.is_leader,
-                    "node_id": previous.node_id.clone(),
-                    "holder": previous.holder.clone(),
-                    "expires_at": previous.expires_at,
-                    "lease_file": previous.lease_file.clone(),
-                },
-                "next": {
-                    "enabled": snapshot.enabled,
-                    "is_leader": snapshot.is_leader,
-                    "node_id": snapshot.node_id.clone(),
-                    "holder": snapshot.holder.clone(),
-                    "expires_at": snapshot.expires_at,
-                    "lease_file": snapshot.lease_file.clone(),
-                },
-            }),
-        )
-        .await;
     }
+}
 
-    let is_leader = snapshot.is_leader;
-    *state.trigger_leader_state.write().await = snapshot;
-    is_leader
+async fn emit_trigger_leader_transition_if_changed(
+    state: &AppState,
+    previous: &TriggerLeaderState,
+    next: &TriggerLeaderState,
+) {
+    if !trigger_leader_state_changed(previous, next) {
+        return;
+    }
+    emit_audit_event(
+        state,
+        trigger_leader_transition_event(previous, next),
+        trigger_leader_transition_payload(previous, next),
+    )
+    .await;
+}
+
+fn trigger_leader_transition_payload(previous: &TriggerLeaderState, next: &TriggerLeaderState) -> Value {
+    json!({
+        "previous": {
+            "enabled": previous.enabled,
+            "is_leader": previous.is_leader,
+            "node_id": previous.node_id.clone(),
+            "holder": previous.holder.clone(),
+            "expires_at": previous.expires_at,
+            "lease_file": previous.lease_file.clone(),
+        },
+        "next": {
+            "enabled": next.enabled,
+            "is_leader": next.is_leader,
+            "node_id": next.node_id.clone(),
+            "holder": next.holder.clone(),
+            "expires_at": next.expires_at,
+            "lease_file": next.lease_file.clone(),
+        },
+    })
 }
 
 fn trigger_leader_state_changed(previous: &TriggerLeaderState, next: &TriggerLeaderState) -> bool {
@@ -4182,94 +4300,113 @@ async fn find_workflow_entries_with_registry(
     registry_file: Option<&FsPath>,
 ) -> Result<Vec<WorkflowEntry>> {
     if let Some(registry_path) = registry_file {
-        let loaded_registry_entries = load_flow_registry(registry_path).await?;
-        let mut registry_workflow_entries = Vec::new();
-        for spec in loaded_registry_entries {
-            let registry_workflow_path = resolve_registry_workflow_path(root, &spec.path);
-            let registry_workflow = Workflow::load(&registry_workflow_path).with_context(|| {
-                format!(
-                    "flow registry '{}' entry '{}' points to invalid workflow '{}'",
-                    registry_path.display(),
-                    spec.flow_id,
-                    registry_workflow_path.display()
-                )
-            })?;
-            let file_name = registry_workflow_path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .map(|s| s.to_string())
-                .ok_or_else(|| {
-                    anyhow::anyhow!("invalid workflow filename in '{}'", registry_workflow_path.display())
-                })?;
-            let registry_required_providers = collect_required_providers(&registry_workflow);
-            registry_workflow_entries.push(WorkflowEntry {
-                file_name,
-                flow_id: Some(spec.flow_id),
-                workflow_name: registry_workflow.name,
-                path: registry_workflow_path,
-                tags: spec.tags,
-                required_capabilities: spec.required_capabilities,
-                required_providers: registry_required_providers,
-                owner: spec.owner,
-                version: spec.version,
-                max_concurrency: spec.max_concurrency,
-                trigger_webhook: registry_workflow.trigger.webhook,
-                trigger_watch: registry_workflow.trigger.watch,
-                trigger_cron: registry_workflow.trigger.cron,
-                trigger_interval: registry_workflow.trigger.interval,
-                workflow_workdir: registry_workflow.workdir,
-            });
-        }
-        return Ok(registry_workflow_entries);
+        return find_workflow_entries_from_registry(root, registry_path).await;
     }
+    find_workflow_entries_from_directory(root).await
+}
 
+async fn find_workflow_entries_from_registry(
+    root: &FsPath,
+    registry_path: &FsPath,
+) -> Result<Vec<WorkflowEntry>> {
+    let loaded_registry_entries = load_flow_registry(registry_path).await?;
+    let mut registry_workflow_entries = Vec::new();
+    for spec in loaded_registry_entries {
+        registry_workflow_entries.push(workflow_entry_from_registry_spec(root, registry_path, spec)?);
+    }
+    Ok(registry_workflow_entries)
+}
+
+fn workflow_entry_from_registry_spec(
+    root: &FsPath,
+    registry_path: &FsPath,
+    spec: FlowRegistryEntry,
+) -> Result<WorkflowEntry> {
+    let registry_workflow_path = resolve_registry_workflow_path(root, &spec.path);
+    let registry_workflow = Workflow::load(&registry_workflow_path).with_context(|| {
+        format!(
+            "flow registry '{}' entry '{}' points to invalid workflow '{}'",
+            registry_path.display(),
+            spec.flow_id,
+            registry_workflow_path.display()
+        )
+    })?;
+    let file_name = workflow_file_name_or_error(&registry_workflow_path)?;
+    let registry_required_providers = collect_required_providers(&registry_workflow);
+    Ok(WorkflowEntry {
+        file_name,
+        flow_id: Some(spec.flow_id),
+        workflow_name: registry_workflow.name,
+        path: registry_workflow_path,
+        tags: spec.tags,
+        required_capabilities: spec.required_capabilities,
+        required_providers: registry_required_providers,
+        owner: spec.owner,
+        version: spec.version,
+        max_concurrency: spec.max_concurrency,
+        trigger_webhook: registry_workflow.trigger.webhook,
+        trigger_watch: registry_workflow.trigger.watch,
+        trigger_cron: registry_workflow.trigger.cron,
+        trigger_interval: registry_workflow.trigger.interval,
+        workflow_workdir: registry_workflow.workdir,
+    })
+}
+
+fn workflow_file_name_or_error(workflow_path: &FsPath) -> Result<String> {
+    workflow_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .map(|s| s.to_string())
+        .ok_or_else(|| anyhow::anyhow!("invalid workflow filename in '{}'", workflow_path.display()))
+}
+
+async fn find_workflow_entries_from_directory(root: &FsPath) -> Result<Vec<WorkflowEntry>> {
     let mut discovered_workflow_entries = Vec::new();
     let mut root_dir_reader = tokio::fs::read_dir(root).await?;
     while let Some(entry) = root_dir_reader.next_entry().await? {
         let workflow_path = entry.path();
-        if !workflow_path.is_file() {
-            continue;
+        if let Some(discovered_entry) = discovered_workflow_entry_or_none(workflow_path) {
+            discovered_workflow_entries.push(discovered_entry);
         }
-        if !workflow_path
-            .extension()
-            .and_then(|e| e.to_str())
-            .map(|e| e == "anna")
-            .unwrap_or(false)
-        {
-            continue;
-        }
-        let Some(file_name) = workflow_path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .map(|s| s.to_string())
-        else {
-            continue;
-        };
-
-        let discovered_workflow = match Workflow::load(&workflow_path) {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-        let discovered_required_providers = collect_required_providers(&discovered_workflow);
-        discovered_workflow_entries.push(WorkflowEntry {
-            file_name,
-            flow_id: None,
-            workflow_name: discovered_workflow.name,
-            path: workflow_path,
-            tags: vec![],
-            required_capabilities: vec![],
-            required_providers: discovered_required_providers,
-            owner: None,
-            version: None,
-            max_concurrency: None,
-            trigger_webhook: discovered_workflow.trigger.webhook,
-            trigger_watch: discovered_workflow.trigger.watch,
-            trigger_cron: discovered_workflow.trigger.cron,
-            trigger_interval: discovered_workflow.trigger.interval,
-            workflow_workdir: discovered_workflow.workdir,
-        });
     }
     Ok(discovered_workflow_entries)
+}
+
+fn discovered_workflow_entry_or_none(workflow_path: PathBuf) -> Option<WorkflowEntry> {
+    if !workflow_path.is_file() || !workflow_has_anna_extension(&workflow_path) {
+        return None;
+    }
+    let workflow_file_name = workflow_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .map(|s| s.to_string())?;
+    let discovered_workflow = Workflow::load(&workflow_path).ok()?;
+    let discovered_required_providers = collect_required_providers(&discovered_workflow);
+    Some(WorkflowEntry {
+        file_name: workflow_file_name,
+        flow_id: None,
+        workflow_name: discovered_workflow.name,
+        path: workflow_path,
+        tags: vec![],
+        required_capabilities: vec![],
+        required_providers: discovered_required_providers,
+        owner: None,
+        version: None,
+        max_concurrency: None,
+        trigger_webhook: discovered_workflow.trigger.webhook,
+        trigger_watch: discovered_workflow.trigger.watch,
+        trigger_cron: discovered_workflow.trigger.cron,
+        trigger_interval: discovered_workflow.trigger.interval,
+        workflow_workdir: discovered_workflow.workdir,
+    })
+}
+
+fn workflow_has_anna_extension(workflow_path: &FsPath) -> bool {
+    workflow_path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e == "anna")
+        .unwrap_or(false)
 }
 
 async fn resolve_registered_workflow_entry_with_registry(
@@ -4304,71 +4441,14 @@ async fn launch_workflow_from_entry(
     entry: &WorkflowEntry,
     trigger_source: &str,
 ) -> Result<TriggerLaunchOutcome> {
-    let (running, owner_running) = running_counts_for_entry(state, entry).await;
-    let owner_limit_launch = owner_limit_for(entry.owner.as_deref(), &state.owner_policy);
-    let readiness_launch = evaluate_flow_readiness(
-        entry,
-        &state.node_capabilities,
-        state.allowed_providers.as_ref(),
-        flow_readiness_runtime(running, Some(1), owner_running, owner_limit_launch),
-    );
-    if !readiness_launch.missing_capabilities.is_empty() {
-        println!(
-            "anna-rs daemon trigger={} workflow='{}' skipped: missing capabilities [{}]",
-            trigger_source,
-            entry.workflow_name,
-            readiness_launch.missing_capabilities.join(", ")
-        );
-        return Ok(TriggerLaunchOutcome::SkippedCapability(
-            readiness_launch.missing_capabilities,
-        ));
-    }
-    if !readiness_launch.missing_providers.is_empty() {
-        println!(
-            "anna-rs daemon trigger={} workflow='{}' skipped: blocked providers [{}]",
-            trigger_source,
-            entry.workflow_name,
-            readiness_launch.missing_providers.join(", ")
-        );
-        return Ok(TriggerLaunchOutcome::SkippedProvider(
-            readiness_launch.missing_providers,
-        ));
+    let trigger_readiness = flow_readiness_for_entry(state, entry, Some(1)).await;
+    if let Some(outcome) =
+        trigger_skip_outcome_or_none(trigger_source, &entry.workflow_name, trigger_readiness)
+    {
+        return Ok(outcome);
     }
 
-    if readiness_launch.owner_concurrency_blocked {
-        println!(
-            "anna-rs daemon trigger={} workflow='{}' skipped: owner limit running={} max={}",
-            trigger_source,
-            entry.workflow_name,
-            readiness_launch.owner_running,
-            readiness_launch.owner_max_concurrency.unwrap_or(0)
-        );
-        return Ok(TriggerLaunchOutcome::SkippedConcurrency {
-            running: readiness_launch.owner_running,
-            max_concurrency: readiness_launch.owner_max_concurrency.unwrap_or(0),
-        });
-    }
-
-    if readiness_launch.concurrency_blocked {
-        let readiness_max_concurrency = readiness_launch.max_concurrency.unwrap_or(1);
-        if readiness_max_concurrency == 1 {
-            println!(
-                "anna-rs daemon trigger={} workflow='{}' skipped: already running",
-                trigger_source, entry.workflow_name
-            );
-            return Ok(TriggerLaunchOutcome::SkippedRunning);
-        }
-        println!(
-            "anna-rs daemon trigger={} workflow='{}' skipped: concurrency limit running={} max={}",
-            trigger_source, entry.workflow_name, readiness_launch.running, readiness_max_concurrency
-        );
-        return Ok(TriggerLaunchOutcome::SkippedConcurrency {
-            running: readiness_launch.running,
-            max_concurrency: readiness_max_concurrency,
-        });
-    }
-
-    let mut workflow_to_launch = Workflow::load(&entry.path)?;
+    let mut workflow_to_launch = load_workflow_with_default_workdir(state, entry)?;
     if workflow_to_launch.workdir.is_none() {
         workflow_to_launch.workdir = Some(state.plays_dir.display().to_string());
     }
@@ -4407,75 +4487,15 @@ async fn launch_registered_entry_with_options(
     options: RunRegisteredOptions,
     launch_source: &str,
 ) -> std::result::Result<String, axum::response::Response> {
-    let (running, owner_running) = running_counts_for_entry(state, entry).await;
-    let owner_limit_registered_launch = owner_limit_for(entry.owner.as_deref(), &state.owner_policy);
-    let readiness_registered_launch = evaluate_flow_readiness(
-        entry,
-        &state.node_capabilities,
-        state.allowed_providers.as_ref(),
-        flow_readiness_runtime(running, None, owner_running, owner_limit_registered_launch),
-    );
-    if !readiness_registered_launch.missing_capabilities.is_empty() {
-        return Err((
-            StatusCode::FORBIDDEN,
-            format!(
-                "workflow '{}' requires missing capabilities: {}",
-                requested_name,
-                readiness_registered_launch.missing_capabilities.join(", ")
-            ),
-        )
-            .into_response());
-    }
-    if !readiness_registered_launch.missing_providers.is_empty() {
-        return Err((
-            StatusCode::FORBIDDEN,
-            format!(
-                "workflow '{}' requires blocked providers: {}",
-                requested_name,
-                readiness_registered_launch.missing_providers.join(", ")
-            ),
-        )
-            .into_response());
-    }
-    if readiness_registered_launch.owner_concurrency_blocked {
-        return Err((
-            StatusCode::TOO_MANY_REQUESTS,
-            format!(
-                "workflow '{}' owner concurrency limit reached: owner='{}' running={} max_concurrency={}",
-                requested_name,
-                entry.owner.as_deref().unwrap_or(""),
-                readiness_registered_launch.owner_running,
-                readiness_registered_launch.owner_max_concurrency.unwrap_or(0)
-            ),
-        )
-            .into_response());
-    }
-    if readiness_registered_launch.concurrency_blocked {
-        return Err((
-            StatusCode::TOO_MANY_REQUESTS,
-            format!(
-                "workflow '{}' concurrency limit reached: running={} max_concurrency={}",
-                requested_name,
-                readiness_registered_launch.running,
-                readiness_registered_launch.max_concurrency.unwrap_or(0)
-            ),
-        )
-            .into_response());
+    let registered_readiness = flow_readiness_for_entry(state, entry, None).await;
+    if let Some(response) =
+        registered_skip_response_or_none(requested_name, entry, &registered_readiness)
+    {
+        return Err(response);
     }
 
-    let mut loaded_workflow_registered = match Workflow::load(&entry.path) {
-        Ok(v) => v,
-        Err(err) => {
-            return Err((
-                StatusCode::BAD_REQUEST,
-                format!("invalid workflow '{}': {}", entry.path.display(), err),
-            )
-                .into_response());
-        }
-    };
-    if loaded_workflow_registered.workdir.is_none() {
-        loaded_workflow_registered.workdir = Some(state.plays_dir.display().to_string());
-    }
+    let mut loaded_workflow_registered =
+        load_registered_workflow_or_response(state, entry)?;
     loaded_workflow_registered.vars.extend(options.vars);
 
     match launch_workflow(
@@ -4494,6 +4514,249 @@ async fn launch_registered_entry_with_options(
         )
             .into_response()),
     }
+}
+
+async fn flow_readiness_for_entry(
+    state: &AppState,
+    entry: &WorkflowEntry,
+    requested_concurrency: Option<usize>,
+) -> FlowReadiness {
+    let (running, owner_running) = running_counts_for_entry(state, entry).await;
+    let entry_owner_limit = owner_limit_for(entry.owner.as_deref(), &state.owner_policy);
+    evaluate_flow_readiness(
+        entry,
+        &state.node_capabilities,
+        state.allowed_providers.as_ref(),
+        flow_readiness_runtime(
+            running,
+            requested_concurrency,
+            owner_running,
+            entry_owner_limit,
+        ),
+    )
+}
+
+fn trigger_skip_outcome_or_none(
+    trigger_source: &str,
+    workflow_name: &str,
+    flow_readiness: FlowReadiness,
+) -> Option<TriggerLaunchOutcome> {
+    if let Some(skipped_by_capabilities) = trigger_skipped_capability_outcome(
+        trigger_source,
+        workflow_name,
+        &flow_readiness.missing_capabilities,
+    ) {
+        return Some(skipped_by_capabilities);
+    }
+    if let Some(skipped_by_providers) = trigger_skipped_provider_outcome(
+        trigger_source,
+        workflow_name,
+        &flow_readiness.missing_providers,
+    ) {
+        return Some(skipped_by_providers);
+    }
+    if let Some(skipped_by_owner_limit) =
+        trigger_skipped_owner_concurrency_outcome(trigger_source, workflow_name, &flow_readiness)
+    {
+        return Some(skipped_by_owner_limit);
+    }
+    trigger_skipped_workflow_concurrency_outcome(trigger_source, workflow_name, &flow_readiness)
+}
+
+fn trigger_skipped_capability_outcome(
+    trigger_source: &str,
+    workflow_name: &str,
+    missing_capabilities: &[String],
+) -> Option<TriggerLaunchOutcome> {
+    if missing_capabilities.is_empty() {
+        return None;
+    }
+    println!(
+        "anna-rs daemon trigger={} workflow='{}' skipped: missing capabilities [{}]",
+        trigger_source,
+        workflow_name,
+        missing_capabilities.join(", ")
+    );
+    Some(TriggerLaunchOutcome::SkippedCapability(
+        missing_capabilities.to_vec(),
+    ))
+}
+
+fn trigger_skipped_provider_outcome(
+    trigger_source: &str,
+    workflow_name: &str,
+    missing_providers: &[String],
+) -> Option<TriggerLaunchOutcome> {
+    if missing_providers.is_empty() {
+        return None;
+    }
+    println!(
+        "anna-rs daemon trigger={} workflow='{}' skipped: blocked providers [{}]",
+        trigger_source,
+        workflow_name,
+        missing_providers.join(", ")
+    );
+    Some(TriggerLaunchOutcome::SkippedProvider(missing_providers.to_vec()))
+}
+
+fn trigger_skipped_owner_concurrency_outcome(
+    trigger_source: &str,
+    workflow_name: &str,
+    flow_readiness: &FlowReadiness,
+) -> Option<TriggerLaunchOutcome> {
+    if !flow_readiness.owner_concurrency_blocked {
+        return None;
+    }
+    let owner_concurrency_cap = flow_readiness.owner_max_concurrency.unwrap_or(0);
+    println!(
+        "anna-rs daemon trigger={} workflow='{}' skipped: owner limit running={} max={}",
+        trigger_source, workflow_name, flow_readiness.owner_running, owner_concurrency_cap
+    );
+    Some(TriggerLaunchOutcome::SkippedConcurrency {
+        running: flow_readiness.owner_running,
+        max_concurrency: owner_concurrency_cap,
+    })
+}
+
+fn trigger_skipped_workflow_concurrency_outcome(
+    trigger_source: &str,
+    workflow_name: &str,
+    flow_readiness: &FlowReadiness,
+) -> Option<TriggerLaunchOutcome> {
+    if !flow_readiness.concurrency_blocked {
+        return None;
+    }
+    let workflow_concurrency_cap = flow_readiness.max_concurrency.unwrap_or(1);
+    if workflow_concurrency_cap == 1 {
+        println!(
+            "anna-rs daemon trigger={} workflow='{}' skipped: already running",
+            trigger_source, workflow_name
+        );
+        return Some(TriggerLaunchOutcome::SkippedRunning);
+    }
+    println!(
+        "anna-rs daemon trigger={} workflow='{}' skipped: concurrency limit running={} max={}",
+        trigger_source, workflow_name, flow_readiness.running, workflow_concurrency_cap
+    );
+    Some(TriggerLaunchOutcome::SkippedConcurrency {
+        running: flow_readiness.running,
+        max_concurrency: workflow_concurrency_cap,
+    })
+}
+
+fn registered_skip_response_or_none(
+    requested_name: &str,
+    entry: &WorkflowEntry,
+    readiness: &FlowReadiness,
+) -> Option<axum::response::Response> {
+    if let Some(resp) = registered_capability_response_or_none(requested_name, &readiness.missing_capabilities)
+    {
+        return Some(resp);
+    }
+    if let Some(resp) = registered_provider_response_or_none(requested_name, &readiness.missing_providers) {
+        return Some(resp);
+    }
+    if let Some(resp) = registered_owner_limit_response_or_none(requested_name, entry, readiness) {
+        return Some(resp);
+    }
+    registered_concurrency_response_or_none(requested_name, readiness)
+}
+
+fn registered_capability_response_or_none(
+    requested_name: &str,
+    missing_capabilities: &[String],
+) -> Option<axum::response::Response> {
+    if missing_capabilities.is_empty() {
+        return None;
+    }
+    Some((
+        StatusCode::FORBIDDEN,
+        format!(
+            "workflow '{}' requires missing capabilities: {}",
+            requested_name,
+            missing_capabilities.join(", ")
+        ),
+    )
+        .into_response())
+}
+
+fn registered_provider_response_or_none(
+    requested_name: &str,
+    missing_providers: &[String],
+) -> Option<axum::response::Response> {
+    if missing_providers.is_empty() {
+        return None;
+    }
+    Some((
+        StatusCode::FORBIDDEN,
+        format!(
+            "workflow '{}' requires blocked providers: {}",
+            requested_name,
+            missing_providers.join(", ")
+        ),
+    )
+        .into_response())
+}
+
+fn registered_owner_limit_response_or_none(
+    requested_name: &str,
+    entry: &WorkflowEntry,
+    readiness: &FlowReadiness,
+) -> Option<axum::response::Response> {
+    if !readiness.owner_concurrency_blocked {
+        return None;
+    }
+    Some((
+        StatusCode::TOO_MANY_REQUESTS,
+        format!(
+            "workflow '{}' owner concurrency limit reached: owner='{}' running={} max_concurrency={}",
+            requested_name,
+            entry.owner.as_deref().unwrap_or(""),
+            readiness.owner_running,
+            readiness.owner_max_concurrency.unwrap_or(0)
+        ),
+    )
+        .into_response())
+}
+
+fn registered_concurrency_response_or_none(
+    requested_name: &str,
+    readiness: &FlowReadiness,
+) -> Option<axum::response::Response> {
+    if !readiness.concurrency_blocked {
+        return None;
+    }
+    Some((
+        StatusCode::TOO_MANY_REQUESTS,
+        format!(
+            "workflow '{}' concurrency limit reached: running={} max_concurrency={}",
+            requested_name,
+            readiness.running,
+            readiness.max_concurrency.unwrap_or(0)
+        ),
+    )
+        .into_response())
+}
+
+fn load_workflow_with_default_workdir(state: &AppState, entry: &WorkflowEntry) -> Result<Workflow> {
+    let mut loaded_workflow = Workflow::load(&entry.path)?;
+    if loaded_workflow.workdir.is_none() {
+        loaded_workflow.workdir = Some(state.plays_dir.display().to_string());
+    }
+    Ok(loaded_workflow)
+}
+
+fn load_registered_workflow_or_response(
+    state: &AppState,
+    entry: &WorkflowEntry,
+) -> std::result::Result<Workflow, axum::response::Response> {
+    load_workflow_with_default_workdir(state, entry).map_err(|err| {
+        (
+            StatusCode::BAD_REQUEST,
+            format!("invalid workflow '{}': {}", entry.path.display(), err),
+        )
+            .into_response()
+    })
 }
 
 fn parse_run_registered_options(body: &str) -> Result<RunRegisteredOptions> {
@@ -4517,6 +4780,29 @@ fn parse_chat_run_request(body: &str) -> Result<ChatRunRequest> {
     Ok(chat_run_parsed)
 }
 
+#[derive(Clone)]
+struct WorkflowLaunchRuntime {
+    request_id: String,
+    runtime_session_id: String,
+    workflow_name: String,
+    owner: Option<String>,
+    launch_source: String,
+    max_iterations: Option<u32>,
+}
+
+impl WorkflowLaunchRuntime {
+    fn new(workflow_name: String, owner: Option<String>, launch_source: &str, max_iterations: Option<u32>) -> Self {
+        Self {
+            request_id: crate::session::gen_session_id(),
+            runtime_session_id: crate::session::gen_session_id(),
+            workflow_name,
+            owner,
+            launch_source: launch_source.to_string(),
+            max_iterations,
+        }
+    }
+}
+
 async fn launch_workflow(
     state: &AppState,
     workflow: Workflow,
@@ -4524,121 +4810,160 @@ async fn launch_workflow(
     owner: Option<String>,
     launch_source: &str,
 ) -> Result<String> {
-    let new_req_id = crate::session::gen_session_id();
-    let runtime_session_id = crate::session::gen_session_id();
-    let workflow_name = workflow.name.clone();
-    let owner_for_audit = owner.clone();
+    let launch_runtime = WorkflowLaunchRuntime::new(
+        workflow.name.clone(),
+        owner,
+        launch_source,
+        max_iterations,
+    );
+    insert_running_session_for_launch(state, &launch_runtime).await;
+    emit_workflow_launch_event(state, &launch_runtime).await;
+
+    let launch_request_id = launch_runtime.request_id.clone();
+    let state_for_task = state.clone();
+    let runtime_for_task = launch_runtime.clone();
+    let handle = tokio::spawn(async move {
+        run_workflow_launch_task(state_for_task, workflow, runtime_for_task).await;
+    });
+    state
+        .handles
+        .write()
+        .await
+        .insert(launch_request_id.clone(), handle);
+    Ok(launch_request_id)
+}
+
+async fn insert_running_session_for_launch(state: &AppState, launch_runtime: &WorkflowLaunchRuntime) {
     let launched_at_unix = now_unix_secs();
-    {
-        let mut sessions_guard_launch_insert = state.sessions.write().await;
-        sessions_guard_launch_insert.insert(
-            new_req_id.clone(),
-            SessionInfo {
-                id: new_req_id.clone(),
-                status: "running".to_string(),
-                workflow: workflow_name.clone(),
-                owner: owner.clone(),
-                created_at: launched_at_unix,
-                updated_at: launched_at_unix,
-                runtime_session_id: Some(runtime_session_id.clone()),
-                outputs: HashMap::new(),
-                errors: Vec::new(),
-            },
-        );
-        prune_sessions_in_place(&mut sessions_guard_launch_insert, state.retention.max_sessions);
-    }
+    let mut sessions_guard_launch_insert = state.sessions.write().await;
+    sessions_guard_launch_insert.insert(
+        launch_runtime.request_id.clone(),
+        SessionInfo {
+            id: launch_runtime.request_id.clone(),
+            status: "running".to_string(),
+            workflow: launch_runtime.workflow_name.clone(),
+            owner: launch_runtime.owner.clone(),
+            created_at: launched_at_unix,
+            updated_at: launched_at_unix,
+            runtime_session_id: Some(launch_runtime.runtime_session_id.clone()),
+            outputs: HashMap::new(),
+            errors: Vec::new(),
+        },
+    );
+    prune_sessions_in_place(&mut sessions_guard_launch_insert, state.retention.max_sessions);
+}
+
+async fn emit_workflow_launch_event(state: &AppState, launch_runtime: &WorkflowLaunchRuntime) {
     emit_audit_event(
         state,
         "workflow_launched",
         json!({
-            "request_id": new_req_id.clone(),
-            "runtime_session_id": runtime_session_id.clone(),
-            "workflow": workflow_name.clone(),
-            "owner": owner_for_audit.clone(),
-            "source": launch_source,
-            "max_iterations": max_iterations,
+            "request_id": launch_runtime.request_id.clone(),
+            "runtime_session_id": launch_runtime.runtime_session_id.clone(),
+            "workflow": launch_runtime.workflow_name.clone(),
+            "owner": launch_runtime.owner.clone(),
+            "source": launch_runtime.launch_source.clone(),
+            "max_iterations": launch_runtime.max_iterations,
         }),
     )
     .await;
+}
 
-    let state_for_task = state.clone();
-    let req_id_for_task = new_req_id.clone();
-    let workflow_name_for_task = workflow.name.clone();
-    let source_for_task = launch_source.to_string();
-    let owner_for_task = owner.clone();
-    let runtime_for_task = runtime_session_id.clone();
+async fn run_workflow_launch_task(state: AppState, workflow: Workflow, launch_runtime: WorkflowLaunchRuntime) {
     let started = Instant::now();
-    let handle = tokio::spawn(async move {
-        let run = state_for_task
-            .executor
-            .run(
-                &workflow,
-                RunConfig {
-                    max_iterations,
-                    session_id_override: Some(runtime_for_task.clone()),
-                },
-            )
-            .await;
-        let elapsed_ms = started.elapsed().as_millis() as u64;
+    let run_result = state
+        .executor
+        .run(
+            &workflow,
+            RunConfig {
+                max_iterations: launch_runtime.max_iterations,
+                session_id_override: Some(launch_runtime.runtime_session_id.clone()),
+            },
+        )
+        .await;
+    let elapsed_ms = started.elapsed().as_millis() as u64;
 
-        let mut sessions_guard_task_update = state_for_task.sessions.write().await;
-        let event_data = match run {
-            Ok(result) => {
-                let runtime_id = result.session_id.clone();
-                let outputs_count = result.outputs.len();
-                let errors_count = result.errors.len();
-                if let Some(info) = sessions_guard_task_update.get_mut(&req_id_for_task) {
-                    info.status = "done".to_string();
-                    info.updated_at = now_unix_secs();
-                    info.runtime_session_id = Some(runtime_id.clone());
-                    info.outputs = result.outputs;
-                    info.errors = result.errors;
-                }
-                json!({
-                    "request_id": req_id_for_task.clone(),
-                    "runtime_session_id": runtime_id,
-                    "workflow": workflow_name_for_task,
-                    "owner": owner_for_task,
-                    "source": source_for_task,
-                    "status": "done",
-                    "elapsed_ms": elapsed_ms,
-                    "outputs_count": outputs_count,
-                    "errors_count": errors_count,
-                })
-            }
-            Err(err) => {
-                let message = err.to_string();
-                if let Some(info) = sessions_guard_task_update.get_mut(&req_id_for_task) {
-                    info.status = "failed".to_string();
-                    info.updated_at = now_unix_secs();
-                    info.errors.push(message.clone());
-                }
-                json!({
-                    "request_id": req_id_for_task.clone(),
-                    "runtime_session_id": runtime_for_task,
-                    "workflow": workflow_name_for_task,
-                    "owner": owner_for_task,
-                    "source": source_for_task,
-                    "status": "failed",
-                    "elapsed_ms": elapsed_ms,
-                    "error": message,
-                })
-            }
-        };
-        prune_sessions_in_place(
-            &mut sessions_guard_task_update,
-            state_for_task.retention.max_sessions,
-        );
-        drop(sessions_guard_task_update);
-        emit_audit_event(&state_for_task, "workflow_finished", event_data).await;
-        state_for_task
-            .handles
-            .write()
-            .await
-            .remove(&req_id_for_task);
-    });
-    state.handles.write().await.insert(new_req_id.clone(), handle);
-    Ok(new_req_id)
+    let mut sessions_guard_task_update = state.sessions.write().await;
+    let event_data = build_workflow_finished_event_data(
+        &mut sessions_guard_task_update,
+        &launch_runtime,
+        run_result,
+        elapsed_ms,
+    );
+    prune_sessions_in_place(&mut sessions_guard_task_update, state.retention.max_sessions);
+    drop(sessions_guard_task_update);
+
+    emit_audit_event(&state, "workflow_finished", event_data).await;
+    state
+        .handles
+        .write()
+        .await
+        .remove(&launch_runtime.request_id);
+}
+
+fn build_workflow_finished_event_data(
+    sessions: &mut HashMap<String, SessionInfo>,
+    launch_runtime: &WorkflowLaunchRuntime,
+    run_result: Result<crate::result::RunResult>,
+    elapsed_ms: u64,
+) -> Value {
+    match run_result {
+        Ok(result) => build_workflow_finished_success_event(sessions, launch_runtime, result, elapsed_ms),
+        Err(err) => build_workflow_finished_error_event(sessions, launch_runtime, err, elapsed_ms),
+    }
+}
+
+fn build_workflow_finished_success_event(
+    sessions: &mut HashMap<String, SessionInfo>,
+    launch_runtime: &WorkflowLaunchRuntime,
+    result: crate::result::RunResult,
+    elapsed_ms: u64,
+) -> Value {
+    let runtime_id = result.session_id.clone();
+    let outputs_count = result.outputs.len();
+    let errors_count = result.errors.len();
+    if let Some(info) = sessions.get_mut(&launch_runtime.request_id) {
+        info.status = "done".to_string();
+        info.updated_at = now_unix_secs();
+        info.runtime_session_id = Some(runtime_id.clone());
+        info.outputs = result.outputs;
+        info.errors = result.errors;
+    }
+    json!({
+        "request_id": launch_runtime.request_id.clone(),
+        "runtime_session_id": runtime_id,
+        "workflow": launch_runtime.workflow_name.clone(),
+        "owner": launch_runtime.owner.clone(),
+        "source": launch_runtime.launch_source.clone(),
+        "status": "done",
+        "elapsed_ms": elapsed_ms,
+        "outputs_count": outputs_count,
+        "errors_count": errors_count,
+    })
+}
+
+fn build_workflow_finished_error_event(
+    sessions: &mut HashMap<String, SessionInfo>,
+    launch_runtime: &WorkflowLaunchRuntime,
+    err: anyhow::Error,
+    elapsed_ms: u64,
+) -> Value {
+    let message = err.to_string();
+    if let Some(info) = sessions.get_mut(&launch_runtime.request_id) {
+        info.status = "failed".to_string();
+        info.updated_at = now_unix_secs();
+        info.errors.push(message.clone());
+    }
+    json!({
+        "request_id": launch_runtime.request_id.clone(),
+        "runtime_session_id": launch_runtime.runtime_session_id.clone(),
+        "workflow": launch_runtime.workflow_name.clone(),
+        "owner": launch_runtime.owner.clone(),
+        "source": launch_runtime.launch_source.clone(),
+        "status": "failed",
+        "elapsed_ms": elapsed_ms,
+        "error": message,
+    })
 }
 
 #[cfg(test)]
