@@ -17,7 +17,7 @@ use chrono::{DateTime, Utc};
 use cron::Schedule;
 use humantime::parse_duration;
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path as FsPath, PathBuf};
@@ -479,6 +479,42 @@ struct ChatIntentGuardrailOutcome {
     effective_max_iterations: Option<u32>,
 }
 
+struct ChatIntentCheckRenderContext {
+    normalized_intent: String,
+    caller: Option<String>,
+    requested_max_iterations: Option<u32>,
+    guardrails: ChatIntentGuardrailOutcome,
+    readiness: FlowReadiness,
+}
+
+struct BlockedChatIntentContext<'a> {
+    intent: &'a str,
+    raw_intent: &'a str,
+    workflow_name: &'a str,
+    caller: Option<String>,
+    reasons: Vec<String>,
+    requested_max_iterations: Option<u32>,
+}
+
+struct LaunchChatIntentContext {
+    intent: String,
+    caller_identity: Option<String>,
+    workflow_name: String,
+    workflow_reference: String,
+    vars: HashMap<String, String>,
+    effective_max_iterations: Option<u32>,
+}
+
+struct ChatIntentRunResolution {
+    request: ChatRunRequest,
+    intent: String,
+    rule: ChatIntentConfig,
+    workflow_entry: WorkflowEntry,
+}
+
+const CHAT_GATEWAY_DISABLED_MESSAGE: &str =
+    "chat gateway disabled: set ANNA_CHAT_INTENTS or ANNA_CHAT_INTENTS_FILE";
+
 #[derive(Debug, Clone)]
 struct TriggerLeaseConfig {
     node_id: String,
@@ -592,7 +628,7 @@ pub async fn run_daemon(bind: &str, plays_dir: PathBuf) -> Result<()> {
         &node_id,
         trigger_lease.as_ref(),
     )));
-    let state = AppState {
+    let app_state_daemon = AppState {
         executor,
         plays_dir,
         registry_file: registry_file.clone(),
@@ -611,100 +647,41 @@ pub async fn run_daemon(bind: &str, plays_dir: PathBuf) -> Result<()> {
         auth_token: daemon_auth_token(),
         retention,
     };
-    tokio::spawn(trigger_scheduler_loop(state.clone()));
-    if let Some(path) = state_file {
-        println!(
-            "anna-rs daemon state persistence enabled at {}",
-            path.display()
-        );
-        tokio::spawn(state_persist_loop(state.clone(), path));
-    }
-    if let Some(path) = policy_snapshot_file {
-        println!(
-            "anna-rs policy snapshot persistence enabled at {}",
-            path.display()
-        );
-        tokio::spawn(policy_snapshot_persist_loop(state.clone(), path));
-    }
-    if let Some(path) = registry_file {
-        println!("anna-rs flow registry enabled at {}", path.display());
-    }
-    if !chat_intents.is_empty() {
-        let mut routes = chat_intents
-            .iter()
-            .map(|(intent, rule)| format!("{}={}", intent, rule.workflow))
-            .collect::<Vec<_>>();
-        routes.sort();
-        println!("anna-rs chat intents: {}", routes.join(","));
-    }
-    match trigger_lease.as_ref() {
-        Some(lease) => {
-            println!(
-                "anna-rs trigger lease: file={} ttl={}s node_id={}",
-                lease.lease_file.display(),
-                lease.ttl_sec,
-                lease.node_id
-            );
-        }
-        None => {
-            println!("anna-rs trigger lease: disabled node_id={}", node_id);
-        }
-    }
-    if let Some(audit) = audit_log.as_ref() {
-        println!("anna-rs audit log enabled at {}", audit.path.display());
-    }
-    if offline_mode {
-        println!("anna-rs offline mode enabled (deterministic provider ceiling active)");
-    }
-    if chat_intents_file().is_some() {
-        if let Some(interval) = chat_reload_interval {
-            println!(
-                "anna-rs chat intents hot reload enabled (interval={}s)",
-                interval.as_secs()
-            );
-            tokio::spawn(chat_intents_reload_loop(state.clone(), interval));
-        } else {
-            println!("anna-rs chat intents hot reload disabled");
-        }
-    }
-    if !node_capabilities.is_empty() {
-        let mut capabilities = node_capabilities.iter().cloned().collect::<Vec<_>>();
-        capabilities.sort();
-        println!("anna-rs node capabilities: {}", capabilities.join(","));
-    }
-    if let Some(allowed) = allowed_providers {
-        let mut providers = allowed.into_iter().collect::<Vec<_>>();
-        providers.sort();
-        println!("anna-rs allowed providers policy: {}", providers.join(","));
-    }
-    if !owner_policy.per_owner.is_empty() || owner_policy.default_limit.is_some() {
-        let mut entries = owner_policy
-            .per_owner
-            .iter()
-            .map(|(owner, limit)| format!("{}={}", owner, limit))
-            .collect::<Vec<_>>();
-        entries.sort();
-        if let Some(default_limit) = owner_policy.default_limit {
-            entries.push(format!("*={}", default_limit));
-        }
-        println!("anna-rs owner concurrency policy: {}", entries.join(","));
-    }
-    let policy_core = build_policy_core(&state).await;
+    tokio::spawn(trigger_scheduler_loop(app_state_daemon.clone()));
+    spawn_optional_daemon_tasks(
+        app_state_daemon.clone(),
+        state_file.clone(),
+        policy_snapshot_file.clone(),
+        chat_reload_interval,
+    );
+    let startup_log_context = StartupLogContext {
+        registry_file: registry_file.as_ref(),
+        chat_intents: &chat_intents,
+        trigger_lease: trigger_lease.as_ref(),
+        node_id: &node_id,
+        audit_log: audit_log.as_ref(),
+        offline_mode,
+        node_capabilities: &node_capabilities,
+        allowed_providers: allowed_providers.as_ref(),
+        owner_policy: &owner_policy,
+    };
+    log_daemon_startup_config(&startup_log_context);
+    let startup_policy_core = build_policy_core(&app_state_daemon).await;
     let (startup_policy_revision, _policy_signature) =
-        policy_revision_and_signature(&policy_core, state.policy_signing_key.as_deref());
+        policy_revision_and_signature(&startup_policy_core, app_state_daemon.policy_signing_key.as_deref());
     emit_audit_event(
-        &state,
+        &app_state_daemon,
         "daemon_started",
         json!({
             "bind": bind,
-            "registry_enabled": state.registry_file.is_some(),
-            "auth_enabled": state.auth_token.is_some(),
-            "offline_mode": state.offline_mode,
+            "registry_enabled": app_state_daemon.registry_file.is_some(),
+            "auth_enabled": app_state_daemon.auth_token.is_some(),
+            "offline_mode": app_state_daemon.offline_mode,
             "chat_intents_count": chat_intents.len(),
             "trigger_lease_enabled": trigger_lease.is_some(),
             "policy_revision": startup_policy_revision,
-            "allowed_providers": sorted_set_values(state.allowed_providers.as_ref()),
-            "node_capabilities": sorted_set_values(Some(&state.node_capabilities)),
+            "allowed_providers": sorted_set_values(app_state_daemon.allowed_providers.as_ref()),
+            "node_capabilities": sorted_set_values(Some(&app_state_daemon.node_capabilities)),
         }),
     )
     .await;
@@ -732,12 +709,138 @@ pub async fn run_daemon(bind: &str, plays_dir: PathBuf) -> Result<()> {
         .route("/hitl", get(list_hitl))
         .route("/hitl/{id}/resolve", post(resolve_hitl))
         .route("/ws", get(ws_logs))
-        .with_state(state);
+        .with_state(app_state_daemon);
 
     let listener = tokio::net::TcpListener::bind(bind).await?;
     println!("anna-rs daemon listening on http://{}", bind);
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+fn spawn_optional_daemon_tasks(
+    state: AppState,
+    state_file: Option<PathBuf>,
+    policy_snapshot_file: Option<PathBuf>,
+    chat_reload_interval: Option<Duration>,
+) {
+    if let Some(path) = state_file {
+        println!(
+            "anna-rs daemon state persistence enabled at {}",
+            path.display()
+        );
+        tokio::spawn(state_persist_loop(state.clone(), path));
+    }
+    if let Some(path) = policy_snapshot_file {
+        println!(
+            "anna-rs policy snapshot persistence enabled at {}",
+            path.display()
+        );
+        tokio::spawn(policy_snapshot_persist_loop(state.clone(), path));
+    }
+    if chat_intents_file().is_some() {
+        if let Some(interval) = chat_reload_interval {
+            println!(
+                "anna-rs chat intents hot reload enabled (interval={}s)",
+                interval.as_secs()
+            );
+            tokio::spawn(chat_intents_reload_loop(state, interval));
+        } else {
+            println!("anna-rs chat intents hot reload disabled");
+        }
+    }
+}
+
+struct StartupLogContext<'a> {
+    registry_file: Option<&'a PathBuf>,
+    chat_intents: &'a HashMap<String, ChatIntentConfig>,
+    trigger_lease: Option<&'a TriggerLeaseConfig>,
+    node_id: &'a str,
+    audit_log: Option<&'a AuditLogConfig>,
+    offline_mode: bool,
+    node_capabilities: &'a HashSet<String>,
+    allowed_providers: Option<&'a HashSet<String>>,
+    owner_policy: &'a OwnerConcurrencyPolicy,
+}
+
+fn log_daemon_startup_config(ctx: &StartupLogContext<'_>) {
+    if let Some(path) = ctx.registry_file {
+        println!("anna-rs flow registry enabled at {}", path.display());
+    }
+    if !ctx.chat_intents.is_empty() {
+        let mut routes = ctx
+            .chat_intents
+            .iter()
+            .map(|(intent, rule)| format!("{}={}", intent, rule.workflow))
+            .collect::<Vec<_>>();
+        routes.sort();
+        let chat_routes_joined = routes.join(",");
+        println!("anna-rs chat intents: {chat_routes_joined}");
+    }
+    match ctx.trigger_lease {
+        Some(lease) => {
+            println!(
+                "anna-rs trigger lease: file={} ttl={}s node_id={}",
+                lease.lease_file.display(),
+                lease.ttl_sec,
+                lease.node_id
+            );
+        }
+        None => {
+            println!("anna-rs trigger lease: disabled node_id={}", ctx.node_id);
+        }
+    }
+    if let Some(audit) = ctx.audit_log {
+        println!("anna-rs audit log enabled at {}", audit.path.display());
+    }
+    if ctx.offline_mode {
+        println!("anna-rs offline mode enabled (deterministic provider ceiling active)");
+    }
+    log_node_capabilities(ctx.node_capabilities);
+    log_allowed_providers_policy(ctx.allowed_providers);
+    log_owner_concurrency_policy(ctx.owner_policy);
+}
+
+fn log_node_capabilities(node_capabilities: &HashSet<String>) {
+    if node_capabilities.is_empty() {
+        return;
+    }
+    let mut capabilities = Vec::with_capacity(node_capabilities.len());
+    for capability in node_capabilities {
+        capabilities.push(capability.to_owned());
+    }
+    capabilities.sort();
+    let node_caps_joined = capabilities.join(",");
+    println!("anna-rs node capabilities: {node_caps_joined}");
+}
+
+fn log_allowed_providers_policy(allowed_providers: Option<&HashSet<String>>) {
+    let Some(allowed) = allowed_providers else {
+        return;
+    };
+    let mut providers = Vec::with_capacity(allowed.len());
+    for provider in allowed {
+        providers.push(provider.to_owned());
+    }
+    providers.sort();
+    let providers_joined = providers.join(",");
+    println!("anna-rs allowed providers policy: {providers_joined}");
+}
+
+fn log_owner_concurrency_policy(owner_policy: &OwnerConcurrencyPolicy) {
+    if owner_policy.per_owner.is_empty() && owner_policy.default_limit.is_none() {
+        return;
+    }
+    let mut entries = owner_policy
+        .per_owner
+        .iter()
+        .map(|(owner, limit)| format!("{}={}", owner, limit))
+        .collect::<Vec<_>>();
+    entries.sort();
+    if let Some(default_limit) = owner_policy.default_limit {
+        entries.push(format!("*={}", default_limit));
+    }
+    let owner_limits_joined = entries.join(",");
+    println!("anna-rs owner concurrency policy: {owner_limits_joined}");
 }
 
 async fn health() -> Json<HealthResponse> {
@@ -749,9 +852,9 @@ async fn policy(State(state): State<AppState>, headers: HeaderMap) -> impl IntoR
         return resp;
     }
 
-    let policy_core = build_policy_core(&state).await;
+    let policy_core_body = build_policy_core(&state).await;
     let (policy_revision, policy_signature) =
-        policy_revision_and_signature(&policy_core, state.policy_signing_key.as_deref());
+        policy_revision_and_signature(&policy_core_body, state.policy_signing_key.as_deref());
     if !if_match_allows(&headers, &policy_revision) {
         return precondition_failed_with_etag(&policy_revision);
     }
@@ -759,27 +862,10 @@ async fn policy(State(state): State<AppState>, headers: HeaderMap) -> impl IntoR
         return not_modified_with_etag(&policy_revision);
     }
 
-    let mut node_capabilities = state.node_capabilities.iter().cloned().collect::<Vec<_>>();
-    node_capabilities.sort();
-    let mut allowed_providers = state
-        .allowed_providers
-        .as_ref()
-        .map(|set| set.iter().cloned().collect::<Vec<_>>())
-        .unwrap_or_default();
-    allowed_providers.sort();
-    let mut owner_limits = state
-        .owner_policy
-        .per_owner
-        .iter()
-        .map(|(owner, max_concurrency)| OwnerLimitEntry {
-            owner: owner.clone(),
-            max_concurrency: *max_concurrency,
-        })
-        .collect::<Vec<_>>();
-    owner_limits.sort_by(|a, b| a.owner.cmp(&b.owner));
+    let (node_caps_sorted, allowed_provider_list, owner_limits) = policy_response_vectors(&state);
 
     let chat_intents_count = state.chat_intents.read().await.len();
-    let trigger_leader_state = state.trigger_leader_state.read().await.clone();
+    let trigger_leader_snapshot = state.trigger_leader_state.read().await.clone();
     let etag_revision = policy_revision.clone();
 
     let mut response = Json(PolicyResponse {
@@ -794,15 +880,15 @@ async fn policy(State(state): State<AppState>, headers: HeaderMap) -> impl IntoR
             .map(|_| "hmac-sha256".to_string()),
         chat_gateway_enabled: chat_intents_count > 0,
         chat_intents_count,
-        trigger_leader_election_enabled: trigger_leader_state.enabled,
-        trigger_scheduler_leader: trigger_leader_state.is_leader,
-        trigger_scheduler_node_id: trigger_leader_state.node_id,
-        trigger_scheduler_holder: trigger_leader_state.holder,
-        trigger_scheduler_expires_at: trigger_leader_state.expires_at,
-        trigger_lease_file: trigger_leader_state.lease_file,
-        node_capabilities,
+        trigger_leader_election_enabled: trigger_leader_snapshot.enabled,
+        trigger_scheduler_leader: trigger_leader_snapshot.is_leader,
+        trigger_scheduler_node_id: trigger_leader_snapshot.node_id,
+        trigger_scheduler_holder: trigger_leader_snapshot.holder,
+        trigger_scheduler_expires_at: trigger_leader_snapshot.expires_at,
+        trigger_lease_file: trigger_leader_snapshot.lease_file,
+        node_capabilities: node_caps_sorted,
         provider_restriction_enabled: state.allowed_providers.is_some(),
-        allowed_providers,
+        allowed_providers: allowed_provider_list,
         owner_limits,
         owner_default_limit: state.owner_policy.default_limit,
         retention_max_sessions: state.retention.max_sessions,
@@ -813,18 +899,53 @@ async fn policy(State(state): State<AppState>, headers: HeaderMap) -> impl IntoR
     response
 }
 
+fn policy_response_vectors(
+    state: &AppState,
+) -> (Vec<String>, Vec<String>, Vec<OwnerLimitEntry>) {
+    let mut node_caps_sorted = Vec::with_capacity(state.node_capabilities.len());
+    for capability in &state.node_capabilities {
+        node_caps_sorted.push(capability.to_owned());
+    }
+    node_caps_sorted.sort();
+
+    let mut allowed_provider_list = state
+        .allowed_providers
+        .as_ref()
+        .map(|set| {
+            let mut provider_values = Vec::with_capacity(set.len());
+            for value in set {
+                provider_values.push(value.to_owned());
+            }
+            provider_values
+        })
+        .unwrap_or_default();
+    allowed_provider_list.sort();
+
+    let mut owner_limits = state
+        .owner_policy
+        .per_owner
+        .iter()
+        .map(|(owner, max_concurrency)| OwnerLimitEntry {
+            owner: owner.clone(),
+            max_concurrency: *max_concurrency,
+        })
+        .collect::<Vec<_>>();
+    owner_limits.sort_by(|a, b| a.owner.cmp(&b.owner));
+    (node_caps_sorted, allowed_provider_list, owner_limits)
+}
+
 async fn policy_revision(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
     if let Some(resp) = ensure_authorized(&state, &headers) {
         return resp;
     }
-    let policy_core = build_policy_core(&state).await;
+    let policy_core_revision = build_policy_core(&state).await;
     let (policy_revision, policy_signature) =
-        policy_revision_and_signature(&policy_core, state.policy_signing_key.as_deref());
+        policy_revision_and_signature(&policy_core_revision, state.policy_signing_key.as_deref());
     if if_none_match_matches(&headers, &policy_revision) {
         return not_modified_with_etag(&policy_revision);
     }
-    let etag_revision = policy_revision.clone();
-    let mut response = Json(PolicyRevisionResponse {
+    let revision_etag = policy_revision.clone();
+    let mut http_response_revision = Json(PolicyRevisionResponse {
         policy_revision,
         signed: policy_signature.is_some(),
         policy_signature,
@@ -834,26 +955,26 @@ async fn policy_revision(State(state): State<AppState>, headers: HeaderMap) -> i
             .map(|_| "hmac-sha256".to_string()),
     })
     .into_response();
-    set_etag_header(&mut response, &etag_revision);
-    response
+    set_etag_header(&mut http_response_revision, &revision_etag);
+    http_response_revision
 }
 
 async fn policy_snapshot(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
     if let Some(resp) = ensure_authorized(&state, &headers) {
         return resp;
     }
-    let policy_core = build_policy_core(&state).await;
+    let policy_core_snapshot = build_policy_core(&state).await;
     let (policy_revision, _policy_signature) =
-        policy_revision_and_signature(&policy_core, state.policy_signing_key.as_deref());
+        policy_revision_and_signature(&policy_core_snapshot, state.policy_signing_key.as_deref());
     if !if_match_allows(&headers, &policy_revision) {
         return precondition_failed_with_etag(&policy_revision);
     }
     if if_none_match_matches(&headers, &policy_revision) {
         return not_modified_with_etag(&policy_revision);
     }
-    let mut response = Json(build_policy_snapshot(&state).await).into_response();
-    set_etag_header(&mut response, &policy_revision);
-    response
+    let mut http_response_snapshot = Json(build_policy_snapshot(&state).await).into_response();
+    set_etag_header(&mut http_response_snapshot, &policy_revision);
+    http_response_snapshot
 }
 
 async fn llm_adapters(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
@@ -893,7 +1014,7 @@ async fn stats(State(state): State<AppState>, headers: HeaderMap) -> impl IntoRe
     }
 
     let sessions = state.sessions.read().await;
-    let hitl = state.hitl.read().await;
+    let hitl_entries = state.hitl.read().await;
 
     let sessions_total = sessions.len();
     let sessions_running = sessions.values().filter(|v| v.status == "running").count();
@@ -902,9 +1023,15 @@ async fn stats(State(state): State<AppState>, headers: HeaderMap) -> impl IntoRe
     let sessions_other =
         sessions_total.saturating_sub(sessions_running + sessions_done + sessions_failed);
 
-    let hitl_total = hitl.len();
-    let hitl_pending = hitl.values().filter(|v| v.status == "pending").count();
-    let hitl_resolved = hitl.values().filter(|v| v.status == "resolved").count();
+    let hitl_total = hitl_entries.len();
+    let hitl_pending = hitl_entries
+        .values()
+        .filter(|v| v.status == "pending")
+        .count();
+    let hitl_resolved = hitl_entries
+        .values()
+        .filter(|v| v.status == "resolved")
+        .count();
 
     Json(StatsResponse {
         sessions_total,
@@ -941,7 +1068,7 @@ async fn list_workflows_meta(
     if let Some(resp) = ensure_authorized(&state, &headers) {
         return resp;
     }
-    let entries =
+    let workflow_entries =
         match find_workflow_entries_with_registry(&state.plays_dir, state.registry_file.as_deref())
             .await
         {
@@ -964,11 +1091,11 @@ async fn list_workflows_meta(
         .as_deref()
         .map(|v| v.trim().to_ascii_lowercase());
     let available_filter = query.available;
-    let sessions = state.sessions.read().await;
-    let (running_by_workflow, running_by_owner) = build_running_indexes(&sessions);
-    drop(sessions);
+    let sessions_guard_meta_read = state.sessions.read().await;
+    let (running_by_workflow, running_by_owner) = build_running_indexes(&sessions_guard_meta_read);
+    drop(sessions_guard_meta_read);
 
-    let mut out = entries
+    let mut out = workflow_entries
         .into_iter()
         .map(|entry| {
             let running = running_by_workflow
@@ -984,10 +1111,7 @@ async fn list_workflows_meta(
                 &entry,
                 &state.node_capabilities,
                 state.allowed_providers.as_ref(),
-                running,
-                None,
-                owner_running,
-                owner_max_concurrency,
+                flow_readiness_runtime(running, None, owner_running, owner_max_concurrency),
             );
             WorkflowMetaResponse {
                 id: workflow_public_id(&entry),
@@ -1051,11 +1175,11 @@ async fn list_sessions(
         items.retain(|v| status_matches(&v.status, filter));
     }
     if let Some(owner_filter) = query.owner.as_deref() {
-        let owner_filter = owner_filter.trim();
+        let owner_filter_value = owner_filter.trim();
         items.retain(|v| {
             v.owner
                 .as_deref()
-                .map(|owner| owner.eq_ignore_ascii_case(owner_filter))
+                .map(|owner| owner.eq_ignore_ascii_case(owner_filter_value))
                 .unwrap_or(false)
         });
     }
@@ -1078,45 +1202,16 @@ async fn start_workflow(
     if let Some(resp) = ensure_authorized(&state, &headers) {
         return resp;
     }
-    let mut workflow: Workflow = match serde_yaml::from_str(&body) {
+    let mut workflow = match parse_workflow_body_or_response(&body) {
         Ok(v) => v,
-        Err(err) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                format!("invalid workflow yaml: {}", err),
-            )
-                .into_response();
-        }
+        Err(resp) => return resp,
     };
-    if let Err(err) = workflow.validate() {
-        return (
-            StatusCode::BAD_REQUEST,
-            format!("workflow validation failed: {}", err),
-        )
-            .into_response();
-    }
 
     if workflow.workdir.is_none() {
         workflow.workdir = Some(state.plays_dir.display().to_string());
     }
-    if let Some(allowed) = state.allowed_providers.as_ref() {
-        let required = collect_required_providers(&workflow);
-        let mut missing = required
-            .into_iter()
-            .filter(|provider| !allowed.contains(provider))
-            .collect::<Vec<_>>();
-        missing.sort();
-        missing.dedup();
-        if !missing.is_empty() {
-            return (
-                StatusCode::FORBIDDEN,
-                format!(
-                    "workflow requires blocked providers: {}",
-                    missing.join(", ")
-                ),
-            )
-                .into_response();
-        }
+    if let Err(resp) = validate_allowed_providers_or_response(&workflow, state.allowed_providers.as_ref()) {
+        return resp;
     }
 
     let req_id = match launch_workflow(&state, workflow, None, None, "api_workflow_body").await {
@@ -1139,6 +1234,33 @@ async fn start_workflow(
         .into_response()
 }
 
+fn validate_allowed_providers_or_response(
+    workflow: &Workflow,
+    allowed_providers: Option<&HashSet<String>>,
+) -> std::result::Result<(), axum::response::Response> {
+    let Some(allowed_providers_set) = allowed_providers else {
+        return Ok(());
+    };
+    let required_providers = collect_required_providers(workflow);
+    let mut missing_required_providers = required_providers
+        .into_iter()
+        .filter(|provider| !allowed_providers_set.contains(provider))
+        .collect::<Vec<_>>();
+    missing_required_providers.sort();
+    missing_required_providers.dedup();
+    if missing_required_providers.is_empty() {
+        return Ok(());
+    }
+    Err((
+        StatusCode::FORBIDDEN,
+        format!(
+            "workflow requires blocked providers: {}",
+            missing_required_providers.join(", ")
+        ),
+    )
+        .into_response())
+}
+
 async fn check_workflow_body(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1148,45 +1270,17 @@ async fn check_workflow_body(
         return resp;
     }
 
-    let workflow: Workflow = match serde_yaml::from_str(&body) {
+    let parsed_workflow_check = match parse_workflow_body_or_response(&body) {
         Ok(v) => v,
-        Err(err) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                format!("invalid workflow yaml: {}", err),
-            )
-                .into_response();
-        }
+        Err(resp) => return resp,
     };
-    if let Err(err) = workflow.validate() {
-        return (
-            StatusCode::BAD_REQUEST,
-            format!("workflow validation failed: {}", err),
-        )
-            .into_response();
-    }
-
-    let mut required_providers = collect_required_providers(&workflow);
-    let mut missing_providers = state
-        .allowed_providers
-        .as_ref()
-        .map(|allowed| {
-            required_providers
-                .iter()
-                .filter(|provider| !allowed.contains(*provider))
-                .cloned()
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
-    required_providers.sort();
-    required_providers.dedup();
-    missing_providers.sort();
-    missing_providers.dedup();
+    let (required_providers, missing_providers) =
+        collect_provider_restrictions(&parsed_workflow_check, state.allowed_providers.as_ref());
 
     (
         StatusCode::OK,
         Json(RawFlowCheckResponse {
-            workflow: workflow.name,
+            workflow: parsed_workflow_check.name,
             can_run: missing_providers.is_empty(),
             provider_restriction_enabled: state.allowed_providers.is_some(),
             required_providers,
@@ -1194,6 +1288,48 @@ async fn check_workflow_body(
         }),
     )
         .into_response()
+}
+
+fn parse_workflow_body_or_response(body: &str) -> std::result::Result<Workflow, axum::response::Response> {
+    let parsed_workflow: Workflow = match serde_yaml::from_str(body) {
+        Ok(v) => v,
+        Err(err) => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!("invalid workflow yaml: {}", err),
+            )
+                .into_response());
+        }
+    };
+    if let Err(err) = parsed_workflow.validate() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("workflow validation failed: {}", err),
+        )
+            .into_response());
+    }
+    Ok(parsed_workflow)
+}
+
+fn collect_provider_restrictions(
+    workflow: &Workflow,
+    allowed_providers: Option<&HashSet<String>>,
+) -> (Vec<String>, Vec<String>) {
+    let mut workflow_required_providers = collect_required_providers(workflow);
+    let mut missing_providers = allowed_providers
+        .map(|allowed| {
+            workflow_required_providers
+                .iter()
+                .filter(|provider| !allowed.contains(*provider))
+                .cloned()
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    workflow_required_providers.sort();
+    workflow_required_providers.dedup();
+    missing_providers.sort();
+    missing_providers.dedup();
+    (workflow_required_providers, missing_providers)
 }
 
 async fn run_registered_workflow(
@@ -1209,24 +1345,11 @@ async fn run_registered_workflow(
         Ok(v) => v,
         Err(err) => return (StatusCode::BAD_REQUEST, err.to_string()).into_response(),
     };
-    let entry = match resolve_registered_workflow_entry_with_registry(
-        &state.plays_dir,
-        state.registry_file.as_deref(),
-        &name,
-    )
-    .await
-    {
-        Ok(Some(v)) => v,
-        Ok(None) => return (StatusCode::NOT_FOUND, "workflow not found").into_response(),
-        Err(err) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("failed resolving workflow: {}", err),
-            )
-                .into_response();
-        }
+    let entry = match resolve_registered_entry_or_response(&state, &name).await {
+        Ok(v) => v,
+        Err(resp) => return resp,
     };
-    let req_id = match launch_registered_entry_with_options(
+    let launched_req_id_named = match launch_registered_entry_with_options(
         &state,
         &entry,
         &name,
@@ -1242,11 +1365,255 @@ async fn run_registered_workflow(
     (
         StatusCode::ACCEPTED,
         Json(StartWorkflowResponse {
-            id: req_id,
+            id: launched_req_id_named,
             status: "running".to_string(),
         }),
     )
         .into_response()
+}
+
+async fn resolve_registered_entry_or_response(
+    state: &AppState,
+    name: &str,
+) -> std::result::Result<WorkflowEntry, axum::response::Response> {
+    match resolve_registered_workflow_entry_with_registry(
+        &state.plays_dir,
+        state.registry_file.as_deref(),
+        name,
+    )
+    .await
+    {
+        Ok(Some(v)) => Ok(v),
+        Ok(None) => Err((StatusCode::NOT_FOUND, "workflow not found").into_response()),
+        Err(err) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("failed resolving workflow: {}", err),
+        )
+            .into_response()),
+    }
+}
+
+fn ensure_chat_gateway_enabled_or_response(
+    chat_intents: &HashMap<String, ChatIntentConfig>,
+) -> std::result::Result<(), axum::response::Response> {
+    if chat_intents.is_empty() {
+        return Err((StatusCode::SERVICE_UNAVAILABLE, CHAT_GATEWAY_DISABLED_MESSAGE).into_response());
+    }
+    Ok(())
+}
+
+fn resolve_chat_intent_rule_or_response(
+    chat_intents: &HashMap<String, ChatIntentConfig>,
+    raw_intent: &str,
+) -> std::result::Result<(String, ChatIntentConfig), axum::response::Response> {
+    let normalized_intent = raw_intent.trim().to_ascii_lowercase();
+    match chat_intents.get(&normalized_intent).cloned() {
+        Some(rule) => Ok((normalized_intent, rule)),
+        None => Err((
+            StatusCode::NOT_FOUND,
+            format!("chat intent '{}' is not configured", raw_intent),
+        )
+            .into_response()),
+    }
+}
+
+async fn resolve_chat_intent_workflow_or_response(
+    state: &AppState,
+    raw_intent: &str,
+    rule: &ChatIntentConfig,
+) -> std::result::Result<WorkflowEntry, axum::response::Response> {
+    match resolve_registered_workflow_entry_with_registry(
+        &state.plays_dir,
+        state.registry_file.as_deref(),
+        &rule.workflow,
+    )
+    .await
+    {
+        Ok(Some(v)) => Ok(v),
+        Ok(None) => Err((
+            StatusCode::NOT_FOUND,
+            format!(
+                "chat intent '{}' maps to missing workflow '{}'",
+                raw_intent, rule.workflow
+            ),
+        )
+            .into_response()),
+        Err(err) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("failed resolving chat intent workflow: {}", err),
+        )
+            .into_response()),
+    }
+}
+
+fn chat_intent_check_response(
+    workflow_entry: &WorkflowEntry,
+    rule: &ChatIntentConfig,
+    render_context: ChatIntentCheckRenderContext,
+) -> axum::response::Response {
+    let can_run =
+        render_context.readiness.can_run() && render_context.guardrails.reasons.is_empty();
+    (
+        StatusCode::OK,
+        Json(ChatIntentCheckResponse {
+            intent: render_context.normalized_intent,
+            workflow: workflow_entry.workflow_name.clone(),
+            can_run,
+            caller: render_context.caller,
+            guardrail_reasons: render_context.guardrails.reasons,
+            running: render_context.readiness.running,
+            requested_max_iterations: render_context.requested_max_iterations,
+            effective_max_iterations: render_context.guardrails.effective_max_iterations,
+            max_iterations_cap: rule.max_iterations_cap,
+            max_concurrency: render_context.readiness.max_concurrency.map(|v| v as u32),
+            concurrency_blocked: render_context.readiness.concurrency_blocked,
+            owner_running: render_context.readiness.owner_running,
+            owner_max_concurrency: render_context
+                .readiness
+                .owner_max_concurrency
+                .map(|v| v as u32),
+            owner_concurrency_blocked: render_context.readiness.owner_concurrency_blocked,
+            missing_capabilities: render_context.readiness.missing_capabilities,
+            missing_providers: render_context.readiness.missing_providers,
+        }),
+    )
+        .into_response()
+}
+
+async fn blocked_chat_intent_response(
+    state: &AppState,
+    blocked_context: BlockedChatIntentContext<'_>,
+) -> axum::response::Response {
+    emit_audit_event(
+        state,
+        "chat_intent_blocked",
+        json!({
+            "intent": blocked_context.intent,
+            "workflow": blocked_context.workflow_name,
+            "caller": blocked_context.caller,
+            "reasons": blocked_context.reasons,
+            "requested_max_iterations": blocked_context.requested_max_iterations,
+        }),
+    )
+    .await;
+    (
+        StatusCode::FORBIDDEN,
+        format!(
+            "chat intent '{}' blocked by guardrails: {}",
+            blocked_context.raw_intent,
+            blocked_context.reasons.join("; ")
+        ),
+    )
+        .into_response()
+}
+
+async fn launch_chat_intent_response(
+    state: &AppState,
+    workflow_entry: &WorkflowEntry,
+    launch_context: LaunchChatIntentContext,
+) -> std::result::Result<axum::response::Response, axum::response::Response> {
+    let run_options = RunRegisteredOptions {
+        vars: launch_context.vars,
+        max_iterations: launch_context.effective_max_iterations,
+    };
+    let launch_source = format!("chat_intent:{}", launch_context.intent);
+    let launched_req_id_chat = launch_registered_entry_with_options(
+        state,
+        workflow_entry,
+        &launch_context.workflow_reference,
+        run_options,
+        &launch_source,
+    )
+    .await?;
+    emit_audit_event(
+        state,
+        "chat_intent_launched",
+        json!({
+            "intent": launch_context.intent.clone(),
+            "workflow": launch_context.workflow_name.clone(),
+            "caller": launch_context.caller_identity,
+            "request_id": launched_req_id_chat.clone(),
+            "effective_max_iterations": launch_context.effective_max_iterations,
+        }),
+    )
+    .await;
+
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(ChatRunResponse {
+            intent: launch_context.intent,
+            workflow: launch_context.workflow_name,
+            id: launched_req_id_chat,
+            status: "running".to_string(),
+            effective_max_iterations: launch_context.effective_max_iterations,
+        }),
+    )
+        .into_response())
+}
+
+async fn build_chat_intent_launch_context_or_response(
+    state: &AppState,
+    run_resolution: ChatIntentRunResolution,
+    caller_identity: Option<String>,
+) -> std::result::Result<(WorkflowEntry, LaunchChatIntentContext), axum::response::Response> {
+    let ChatIntentRunResolution {
+        request,
+        intent,
+        rule,
+        workflow_entry,
+    } = run_resolution;
+    let run_guardrails = evaluate_chat_intent_guardrails(
+        &rule,
+        &workflow_entry,
+        request.max_iterations,
+        caller_identity.as_deref(),
+    );
+    if !run_guardrails.reasons.is_empty() {
+        return Err(
+            blocked_chat_intent_response(
+                state,
+                BlockedChatIntentContext {
+                    intent: &intent,
+                    raw_intent: &request.intent,
+                    workflow_name: &workflow_entry.workflow_name,
+                    caller: caller_identity,
+                    reasons: run_guardrails.reasons,
+                    requested_max_iterations: request.max_iterations,
+                },
+            )
+            .await,
+        );
+    }
+    let launch_context = LaunchChatIntentContext {
+        intent,
+        caller_identity,
+        workflow_name: workflow_entry.workflow_name.clone(),
+        workflow_reference: rule.workflow,
+        vars: request.vars,
+        effective_max_iterations: run_guardrails.effective_max_iterations,
+    };
+    Ok((workflow_entry, launch_context))
+}
+
+async fn resolve_chat_intent_run_context_or_response(
+    state: &AppState,
+    raw_body: &str,
+    chat_intents_run_route: &HashMap<String, ChatIntentConfig>,
+) -> std::result::Result<ChatIntentRunResolution, axum::response::Response> {
+    let request = match parse_chat_run_request(raw_body) {
+        Ok(v) => v,
+        Err(err) => return Err((StatusCode::BAD_REQUEST, err.to_string()).into_response()),
+    };
+    let (intent, rule) =
+        resolve_chat_intent_rule_or_response(chat_intents_run_route, &request.intent)?;
+    let workflow_entry =
+        resolve_chat_intent_workflow_or_response(state, &request.intent, &rule).await?;
+    Ok(ChatIntentRunResolution {
+        request,
+        intent,
+        rule,
+        workflow_entry,
+    })
 }
 
 async fn list_chat_intents(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
@@ -1254,8 +1621,8 @@ async fn list_chat_intents(State(state): State<AppState>, headers: HeaderMap) ->
         return resp;
     }
 
-    let chat_intents = state.chat_intents.read().await.clone();
-    let mut intents = chat_intents
+    let chat_intents_map = state.chat_intents.read().await.clone();
+    let mut intents = chat_intents_map
         .iter()
         .map(|(intent, rule)| ChatIntentRoute {
             intent: intent.clone(),
@@ -1288,87 +1655,46 @@ async fn check_chat_intent(
         return resp;
     }
     let caller = request_caller(&headers);
-    let chat_intents = state.chat_intents.read().await.clone();
-    if chat_intents.is_empty() {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            "chat gateway disabled: set ANNA_CHAT_INTENTS or ANNA_CHAT_INTENTS_FILE",
-        )
-            .into_response();
+    let chat_intents_check_route = state.chat_intents.read().await.clone();
+    if let Err(resp) = ensure_chat_gateway_enabled_or_response(&chat_intents_check_route) {
+        return resp;
     }
-
-    let normalized_intent = intent.trim().to_ascii_lowercase();
-    let Some(rule) = chat_intents.get(&normalized_intent).cloned() else {
-        return (
-            StatusCode::NOT_FOUND,
-            format!("chat intent '{}' is not configured", intent),
-        )
-            .into_response();
+    let (normalized_intent, rule) =
+        match resolve_chat_intent_rule_or_response(&chat_intents_check_route, &intent) {
+        Ok(v) => v,
+        Err(resp) => return resp,
     };
-
-    let entry = match resolve_registered_workflow_entry_with_registry(
-        &state.plays_dir,
-        state.registry_file.as_deref(),
-        &rule.workflow,
-    )
-    .await
-    {
-        Ok(Some(v)) => v,
-        Ok(None) => {
-            return (
-                StatusCode::NOT_FOUND,
-                format!(
-                    "chat intent '{}' maps to missing workflow '{}'",
-                    intent, rule.workflow
-                ),
-            )
-                .into_response();
-        }
-        Err(err) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("failed resolving chat intent workflow: {}", err),
-            )
-                .into_response();
-        }
+    let workflow_entry_check_route =
+        match resolve_chat_intent_workflow_or_response(&state, &intent, &rule).await {
+        Ok(v) => v,
+        Err(resp) => return resp,
     };
-    let guardrails =
-        evaluate_chat_intent_guardrails(&rule, &entry, query.max_iterations, caller.as_deref());
-
-    let (running, owner_running) = running_counts_for_entry(&state, &entry).await;
-    let owner_max_concurrency = owner_limit_for(entry.owner.as_deref(), &state.owner_policy);
-    let readiness = evaluate_flow_readiness(
-        &entry,
+    let guardrails = evaluate_chat_intent_guardrails(
+        &rule,
+        &workflow_entry_check_route,
+        query.max_iterations,
+        caller.as_deref(),
+    );
+    let (running, owner_running) = running_counts_for_entry(&state, &workflow_entry_check_route).await;
+    let owner_limit = owner_limit_for(workflow_entry_check_route.owner.as_deref(), &state.owner_policy);
+    let flow_readiness = evaluate_flow_readiness(
+        &workflow_entry_check_route,
         &state.node_capabilities,
         state.allowed_providers.as_ref(),
-        running,
-        None,
-        owner_running,
-        owner_max_concurrency,
+        flow_readiness_runtime(running, None, owner_running, owner_limit),
     );
-    let can_run = readiness.can_run() && guardrails.reasons.is_empty();
-    (
-        StatusCode::OK,
-        Json(ChatIntentCheckResponse {
-            intent: normalized_intent,
-            workflow: entry.workflow_name,
-            can_run,
-            caller,
-            guardrail_reasons: guardrails.reasons,
-            running: readiness.running,
-            requested_max_iterations: query.max_iterations,
-            effective_max_iterations: guardrails.effective_max_iterations,
-            max_iterations_cap: rule.max_iterations_cap,
-            max_concurrency: readiness.max_concurrency.map(|v| v as u32),
-            concurrency_blocked: readiness.concurrency_blocked,
-            owner_running: readiness.owner_running,
-            owner_max_concurrency: readiness.owner_max_concurrency.map(|v| v as u32),
-            owner_concurrency_blocked: readiness.owner_concurrency_blocked,
-            missing_capabilities: readiness.missing_capabilities,
-            missing_providers: readiness.missing_providers,
-        }),
+    let render_context = ChatIntentCheckRenderContext {
+        normalized_intent,
+        caller,
+        requested_max_iterations: query.max_iterations,
+        guardrails,
+        readiness: flow_readiness,
+    };
+    chat_intent_check_response(
+        &workflow_entry_check_route,
+        &rule,
+        render_context,
     )
-        .into_response()
 }
 
 async fn run_chat_intent(
@@ -1379,124 +1705,32 @@ async fn run_chat_intent(
     if let Some(resp) = ensure_authorized(&state, &headers) {
         return resp;
     }
-    let caller = request_caller(&headers);
+    let caller_identity = request_caller(&headers);
 
-    let chat_intents = state.chat_intents.read().await.clone();
-    if chat_intents.is_empty() {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            "chat gateway disabled: set ANNA_CHAT_INTENTS or ANNA_CHAT_INTENTS_FILE",
-        )
-            .into_response();
+    let chat_intents_run_route = state.chat_intents.read().await.clone();
+    if let Err(resp) = ensure_chat_gateway_enabled_or_response(&chat_intents_run_route) {
+        return resp;
     }
 
-    let request = match parse_chat_run_request(&body) {
-        Ok(v) => v,
-        Err(err) => return (StatusCode::BAD_REQUEST, err.to_string()).into_response(),
-    };
-    let intent = request.intent.trim().to_ascii_lowercase();
-    let Some(rule) = chat_intents.get(&intent).cloned() else {
-        return (
-            StatusCode::NOT_FOUND,
-            format!("chat intent '{}' is not configured", request.intent),
-        )
-            .into_response();
-    };
-
-    let entry = match resolve_registered_workflow_entry_with_registry(
-        &state.plays_dir,
-        state.registry_file.as_deref(),
-        &rule.workflow,
-    )
-    .await
-    {
-        Ok(Some(v)) => v,
-        Ok(None) => {
-            return (
-                StatusCode::NOT_FOUND,
-                format!(
-                    "chat intent '{}' maps to missing workflow '{}'",
-                    request.intent, rule.workflow
-                ),
-            )
-                .into_response();
-        }
-        Err(err) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("failed resolving chat intent workflow: {}", err),
-            )
-                .into_response();
-        }
-    };
-    let guardrails =
-        evaluate_chat_intent_guardrails(&rule, &entry, request.max_iterations, caller.as_deref());
-    if !guardrails.reasons.is_empty() {
-        emit_audit_event(
-            &state,
-            "chat_intent_blocked",
-            json!({
-                "intent": intent.clone(),
-                "workflow": entry.workflow_name.clone(),
-                "caller": caller.clone(),
-                "reasons": guardrails.reasons.clone(),
-                "requested_max_iterations": request.max_iterations,
-            }),
-        )
-        .await;
-        return (
-            StatusCode::FORBIDDEN,
-            format!(
-                "chat intent '{}' blocked by guardrails: {}",
-                request.intent,
-                guardrails.reasons.join("; ")
-            ),
-        )
-            .into_response();
-    }
-
-    let workflow = entry.workflow_name.clone();
-    let options = RunRegisteredOptions {
-        vars: request.vars,
-        max_iterations: guardrails.effective_max_iterations,
-    };
-    let launch_source = format!("chat_intent:{}", intent);
-    let req_id = match launch_registered_entry_with_options(
+    let run_resolution =
+        match resolve_chat_intent_run_context_or_response(&state, &body, &chat_intents_run_route).await {
+            Ok(v) => v,
+            Err(resp) => return resp,
+        };
+    let (workflow_entry_run_route, launch_context) = match build_chat_intent_launch_context_or_response(
         &state,
-        &entry,
-        &rule.workflow,
-        options,
-        &launch_source,
+        run_resolution,
+        caller_identity,
     )
     .await
     {
         Ok(v) => v,
         Err(resp) => return resp,
     };
-    emit_audit_event(
-        &state,
-        "chat_intent_launched",
-        json!({
-            "intent": intent.clone(),
-            "workflow": workflow.clone(),
-            "caller": caller.clone(),
-            "request_id": req_id.clone(),
-            "effective_max_iterations": guardrails.effective_max_iterations,
-        }),
-    )
-    .await;
-
-    (
-        StatusCode::ACCEPTED,
-        Json(ChatRunResponse {
-            intent,
-            workflow,
-            id: req_id,
-            status: "running".to_string(),
-            effective_max_iterations: guardrails.effective_max_iterations,
-        }),
-    )
-        .into_response()
+    match launch_chat_intent_response(&state, &workflow_entry_run_route, launch_context).await {
+        Ok(resp) => resp,
+        Err(resp) => return resp,
+    }
 }
 
 async fn check_registered_workflow(
@@ -1508,52 +1742,39 @@ async fn check_registered_workflow(
         return resp;
     }
 
-    let entry = match resolve_registered_workflow_entry_with_registry(
-        &state.plays_dir,
-        state.registry_file.as_deref(),
-        &name,
-    )
-    .await
-    {
-        Ok(Some(v)) => v,
-        Ok(None) => return (StatusCode::NOT_FOUND, "workflow not found").into_response(),
-        Err(err) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("failed resolving workflow: {}", err),
-            )
-                .into_response();
-        }
+    let workflow_entry_registered_check = match resolve_registered_entry_or_response(&state, &name).await {
+        Ok(v) => v,
+        Err(resp) => return resp,
     };
 
-    let (running, owner_running) = running_counts_for_entry(&state, &entry).await;
-    let owner_max_concurrency = owner_limit_for(entry.owner.as_deref(), &state.owner_policy);
-    let readiness = evaluate_flow_readiness(
-        &entry,
+    let (running, owner_running) = running_counts_for_entry(&state, &workflow_entry_registered_check).await;
+    let owner_limit_registered =
+        owner_limit_for(workflow_entry_registered_check.owner.as_deref(), &state.owner_policy);
+    let flow_readiness_registered = evaluate_flow_readiness(
+        &workflow_entry_registered_check,
         &state.node_capabilities,
         state.allowed_providers.as_ref(),
-        running,
-        None,
-        owner_running,
-        owner_max_concurrency,
+        flow_readiness_runtime(running, None, owner_running, owner_limit_registered),
     );
     (
         StatusCode::OK,
         Json(FlowCheckResponse {
-            id: workflow_public_id(&entry),
-            workflow: entry.workflow_name,
-            file: entry.file_name,
-            path: entry.path.display().to_string(),
-            owner: entry.owner,
-            can_run: readiness.can_run(),
-            running: readiness.running,
-            max_concurrency: readiness.max_concurrency.map(|v| v as u32),
-            concurrency_blocked: readiness.concurrency_blocked,
-            owner_running: readiness.owner_running,
-            owner_max_concurrency: readiness.owner_max_concurrency.map(|v| v as u32),
-            owner_concurrency_blocked: readiness.owner_concurrency_blocked,
-            missing_capabilities: readiness.missing_capabilities,
-            missing_providers: readiness.missing_providers,
+            id: workflow_public_id(&workflow_entry_registered_check),
+            workflow: workflow_entry_registered_check.workflow_name,
+            file: workflow_entry_registered_check.file_name,
+            path: workflow_entry_registered_check.path.display().to_string(),
+            owner: workflow_entry_registered_check.owner,
+            can_run: flow_readiness_registered.can_run(),
+            running: flow_readiness_registered.running,
+            max_concurrency: flow_readiness_registered.max_concurrency.map(|v| v as u32),
+            concurrency_blocked: flow_readiness_registered.concurrency_blocked,
+            owner_running: flow_readiness_registered.owner_running,
+            owner_max_concurrency: flow_readiness_registered
+                .owner_max_concurrency
+                .map(|v| v as u32),
+            owner_concurrency_blocked: flow_readiness_registered.owner_concurrency_blocked,
+            missing_capabilities: flow_readiness_registered.missing_capabilities,
+            missing_providers: flow_readiness_registered.missing_providers,
         }),
     )
         .into_response()
@@ -1567,8 +1788,8 @@ async fn workflow_status(
     if let Some(resp) = ensure_authorized(&state, &headers) {
         return resp;
     }
-    let sessions = state.sessions.read().await;
-    match sessions.get(&id) {
+    let sessions_guard_status = state.sessions.read().await;
+    match sessions_guard_status.get(&id) {
         Some(info) => (StatusCode::OK, Json(info.clone())).into_response(),
         None => (StatusCode::NOT_FOUND, "session not found").into_response(),
     }
@@ -1583,26 +1804,14 @@ async fn stop_workflow(
         return resp;
     }
     let mut handles = state.handles.write().await;
-    let stopped = if let Some(handle) = handles.remove(&id) {
-        handle.abort();
-        true
-    } else {
-        false
-    };
+    let stopped = stop_workflow_task_if_running(&mut handles, &id);
     drop(handles);
 
-    let mut sessions = state.sessions.write().await;
-    if sessions.contains_key(&id) {
-        let updated = {
-            let info = sessions
-                .get_mut(&id)
-                .expect("session exists after contains_key check");
-            info.status = if stopped { "stopped" } else { "not_running" }.to_string();
-            info.updated_at = now_unix_secs();
-            info.clone()
-        };
-        prune_sessions_in_place(&mut sessions, state.retention.max_sessions);
-        drop(sessions);
+    let mut sessions_guard_mut = state.sessions.write().await;
+    if let Some(updated) =
+        update_stopped_session(&mut sessions_guard_mut, &id, stopped, state.retention.max_sessions)
+    {
+        drop(sessions_guard_mut);
         emit_audit_event(
             &state,
             "workflow_stop",
@@ -1616,7 +1825,7 @@ async fn stop_workflow(
         .await;
         return (StatusCode::OK, Json(updated)).into_response();
     }
-    drop(sessions);
+    drop(sessions_guard_mut);
 
     emit_audit_event(
         &state,
@@ -1630,6 +1839,32 @@ async fn stop_workflow(
     (StatusCode::NOT_FOUND, "session not found").into_response()
 }
 
+fn stop_workflow_task_if_running(
+    handles: &mut HashMap<String, JoinHandle<()>>,
+    request_id: &str,
+) -> bool {
+    if let Some(handle) = handles.remove(request_id) {
+        handle.abort();
+        true
+    } else {
+        false
+    }
+}
+
+fn update_stopped_session(
+    sessions: &mut HashMap<String, SessionInfo>,
+    request_id: &str,
+    stopped: bool,
+    max_sessions: usize,
+) -> Option<SessionInfo> {
+    let info = sessions.get_mut(request_id)?;
+    info.status = if stopped { "stopped" } else { "not_running" }.to_string();
+    info.updated_at = now_unix_secs();
+    let updated = info.clone();
+    prune_sessions_in_place(sessions, max_sessions);
+    Some(updated)
+}
+
 async fn trigger_hook(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1639,34 +1874,10 @@ async fn trigger_hook(
         return resp;
     }
     let hook_path = format!("/{}", name.trim_matches('/'));
-    let leader_state = state.trigger_leader_state.read().await.clone();
-    if leader_state.enabled && !leader_state.is_leader {
-        emit_audit_event(
-            &state,
-            "hook_rejected_not_leader",
-            json!({
-                "hook": hook_path.clone(),
-                "node_id": leader_state.node_id.clone(),
-                "leader": leader_state.holder.clone(),
-                "expires_at": leader_state.expires_at,
-            }),
-        )
-        .await;
-        return (
-            StatusCode::CONFLICT,
-            format!(
-                "hook '{}' rejected on follower node '{}' (leader='{}')",
-                hook_path,
-                leader_state.node_id,
-                leader_state
-                    .holder
-                    .clone()
-                    .unwrap_or_else(|| "unknown".to_string())
-            ),
-        )
-            .into_response();
+    if let Some(response) = reject_hook_on_follower(&state, &hook_path).await {
+        return response;
     }
-    let entries =
+    let hook_entries =
         match find_workflow_entries_with_registry(&state.plays_dir, state.registry_file.as_deref())
             .await
         {
@@ -1689,58 +1900,9 @@ async fn trigger_hook(
             }
         };
 
-    let mut launched = Vec::new();
-    let mut skipped_running = Vec::new();
-    let mut skipped_capability = Vec::new();
-    let mut skipped_provider = Vec::new();
-    let mut skipped_concurrency = Vec::new();
-    for entry in entries {
-        if let Some(webhook) = entry.trigger_webhook.as_deref()
-            && webhook.trim() == hook_path
-        {
-            match launch_workflow_from_entry(&state, &entry, "webhook").await {
-                Ok(TriggerLaunchOutcome::Launched(session_id)) => {
-                    launched.push(HookLaunchedWorkflow {
-                        workflow: entry.workflow_name,
-                        session_id,
-                    })
-                }
-                Ok(TriggerLaunchOutcome::SkippedRunning) => {
-                    skipped_running.push(entry.workflow_name)
-                }
-                Ok(TriggerLaunchOutcome::SkippedCapability(missing_capabilities)) => {
-                    skipped_capability.push(HookSkippedCapability {
-                        workflow: entry.workflow_name,
-                        missing_capabilities,
-                    });
-                }
-                Ok(TriggerLaunchOutcome::SkippedProvider(missing_providers)) => {
-                    skipped_provider.push(HookSkippedProvider {
-                        workflow: entry.workflow_name,
-                        missing_providers,
-                    });
-                }
-                Ok(TriggerLaunchOutcome::SkippedConcurrency {
-                    running,
-                    max_concurrency,
-                }) => {
-                    skipped_concurrency.push(HookSkippedConcurrency {
-                        workflow: entry.workflow_name,
-                        running,
-                        max_concurrency,
-                    });
-                }
-                Err(_) => {}
-            }
-        }
-    }
+    let hook_outcomes_summary = collect_hook_outcomes(&state, hook_entries, &hook_path).await;
 
-    if launched.is_empty()
-        && skipped_running.is_empty()
-        && skipped_capability.is_empty()
-        && skipped_provider.is_empty()
-        && skipped_concurrency.is_empty()
-    {
+    if hook_outcomes_summary.is_empty() {
         emit_audit_event(
             &state,
             "hook_no_match",
@@ -1756,11 +1918,11 @@ async fn trigger_hook(
         "hook_triggered",
         json!({
             "hook": hook_path.clone(),
-            "launched": launched.len(),
-            "skipped_running": skipped_running.len(),
-            "skipped_capability": skipped_capability.len(),
-            "skipped_provider": skipped_provider.len(),
-            "skipped_concurrency": skipped_concurrency.len(),
+            "launched": hook_outcomes_summary.launched.len(),
+            "skipped_running": hook_outcomes_summary.skipped_running.len(),
+            "skipped_capability": hook_outcomes_summary.skipped_capability.len(),
+            "skipped_provider": hook_outcomes_summary.skipped_provider.len(),
+            "skipped_concurrency": hook_outcomes_summary.skipped_concurrency.len(),
         }),
     )
     .await;
@@ -1768,14 +1930,133 @@ async fn trigger_hook(
         StatusCode::ACCEPTED,
         Json(HookTriggerResponse {
             hook: hook_path,
-            launched,
-            skipped_running,
-            skipped_capability,
-            skipped_provider,
-            skipped_concurrency,
+            launched: hook_outcomes_summary.launched,
+            skipped_running: hook_outcomes_summary.skipped_running,
+            skipped_capability: hook_outcomes_summary.skipped_capability,
+            skipped_provider: hook_outcomes_summary.skipped_provider,
+            skipped_concurrency: hook_outcomes_summary.skipped_concurrency,
         }),
     )
         .into_response()
+}
+
+struct HookOutcomes {
+    launched: Vec<HookLaunchedWorkflow>,
+    skipped_running: Vec<String>,
+    skipped_capability: Vec<HookSkippedCapability>,
+    skipped_provider: Vec<HookSkippedProvider>,
+    skipped_concurrency: Vec<HookSkippedConcurrency>,
+}
+
+impl HookOutcomes {
+    fn new() -> Self {
+        Self {
+            launched: Vec::new(),
+            skipped_running: Vec::new(),
+            skipped_capability: Vec::new(),
+            skipped_provider: Vec::new(),
+            skipped_concurrency: Vec::new(),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.launched.is_empty()
+            && self.skipped_running.is_empty()
+            && self.skipped_capability.is_empty()
+            && self.skipped_provider.is_empty()
+            && self.skipped_concurrency.is_empty()
+    }
+}
+
+async fn reject_hook_on_follower(state: &AppState, hook_path: &str) -> Option<axum::response::Response> {
+    let leader_state = state.trigger_leader_state.read().await.clone();
+    if !leader_state.enabled || leader_state.is_leader {
+        return None;
+    }
+    emit_audit_event(
+        state,
+        "hook_rejected_not_leader",
+        json!({
+            "hook": hook_path.to_string(),
+            "node_id": leader_state.node_id.clone(),
+            "leader": leader_state.holder.clone(),
+            "expires_at": leader_state.expires_at,
+        }),
+    )
+    .await;
+    Some(
+        (
+            StatusCode::CONFLICT,
+            format!(
+                "hook '{}' rejected on follower node '{}' (leader='{}')",
+                hook_path,
+                leader_state.node_id,
+                leader_state
+                    .holder
+                    .clone()
+                    .unwrap_or_else(|| "unknown".to_string())
+            ),
+        )
+            .into_response(),
+    )
+}
+
+async fn collect_hook_outcomes(
+    state: &AppState,
+    entries: Vec<WorkflowEntry>,
+    hook_path: &str,
+) -> HookOutcomes {
+    let mut outcomes = HookOutcomes::new();
+    for entry in entries {
+        let Some(webhook) = entry.trigger_webhook.as_deref() else {
+            continue;
+        };
+        if webhook.trim() != hook_path {
+            continue;
+        }
+        let launch = launch_workflow_from_entry(state, &entry, "webhook").await;
+        apply_hook_launch_outcome(&mut outcomes, entry.workflow_name, launch);
+    }
+    outcomes
+}
+
+fn apply_hook_launch_outcome(
+    outcomes: &mut HookOutcomes,
+    workflow_name: String,
+    launch: Result<TriggerLaunchOutcome>,
+) {
+    match launch {
+        Ok(TriggerLaunchOutcome::Launched(session_id)) => {
+            outcomes.launched.push(HookLaunchedWorkflow {
+                workflow: workflow_name,
+                session_id,
+            });
+        }
+        Ok(TriggerLaunchOutcome::SkippedRunning) => outcomes.skipped_running.push(workflow_name),
+        Ok(TriggerLaunchOutcome::SkippedCapability(missing_capabilities)) => {
+            outcomes.skipped_capability.push(HookSkippedCapability {
+                workflow: workflow_name,
+                missing_capabilities,
+            });
+        }
+        Ok(TriggerLaunchOutcome::SkippedProvider(missing_providers)) => {
+            outcomes.skipped_provider.push(HookSkippedProvider {
+                workflow: workflow_name,
+                missing_providers,
+            });
+        }
+        Ok(TriggerLaunchOutcome::SkippedConcurrency {
+            running,
+            max_concurrency,
+        }) => {
+            outcomes.skipped_concurrency.push(HookSkippedConcurrency {
+                workflow: workflow_name,
+                running,
+                max_concurrency,
+            });
+        }
+        Err(_) => {}
+    }
 }
 
 async fn workflow_logs(
@@ -1786,14 +2067,14 @@ async fn workflow_logs(
     if let Some(resp) = ensure_authorized(&state, &headers) {
         return resp;
     }
-    let sessions = state.sessions.read().await;
-    let Some(info) = sessions.get(&id) else {
+    let sessions_guard_logs = state.sessions.read().await;
+    let Some(info) = sessions_guard_logs.get(&id) else {
         return (StatusCode::NOT_FOUND, "session not found").into_response();
     };
     let Some(runtime_id) = info.runtime_session_id.clone() else {
         return (StatusCode::CONFLICT, "runtime session not available yet").into_response();
     };
-    drop(sessions);
+    drop(sessions_guard_logs);
 
     match read_session_logs(&runtime_id).await {
         Ok(logs) => (StatusCode::OK, Json(logs)).into_response(),
@@ -1814,7 +2095,7 @@ async fn list_hitl(
         return resp;
     }
 
-    let mut out = state
+    let mut hitl_items = state
         .hitl
         .read()
         .await
@@ -1822,19 +2103,19 @@ async fn list_hitl(
         .cloned()
         .collect::<Vec<_>>();
     if let Some(filter) = query.status.as_deref() {
-        out.retain(|v| status_matches(&v.status, filter));
+        hitl_items.retain(|v| status_matches(&v.status, filter));
     }
     if let Some(session_filter) = query.session_id.as_deref() {
-        out.retain(|v| v.session_id == session_filter);
+        hitl_items.retain(|v| v.session_id == session_filter);
     }
     if let Some(workflow_filter) = query.workflow.as_deref() {
-        out.retain(|v| v.workflow.eq_ignore_ascii_case(workflow_filter.trim()));
+        hitl_items.retain(|v| v.workflow.eq_ignore_ascii_case(workflow_filter.trim()));
     }
-    out.sort_by_key(|v| v.created_at);
+    hitl_items.sort_by_key(|v| v.created_at);
     if let Some(limit) = query.limit {
-        out.truncate(limit);
+        hitl_items.truncate(limit);
     }
-    Json(out).into_response()
+    Json(hitl_items).into_response()
 }
 
 async fn resolve_hitl(
@@ -1851,33 +2132,33 @@ async fn resolve_hitl(
         return (StatusCode::BAD_REQUEST, "decision is required").into_response();
     }
 
-    let mut pending = state.hitl.write().await;
-    if !pending.contains_key(&id) {
+    let mut pending_hitl_map = state.hitl.write().await;
+    if !pending_hitl_map.contains_key(&id) {
         return (StatusCode::NOT_FOUND, "hitl request not found").into_response();
     }
-    let updated = {
-        let item = pending
+    let resolved_hitl = {
+        let item = pending_hitl_map
             .get_mut(&id)
             .expect("hitl request exists after contains_key check");
         item.decision = Some(decision);
         item.status = "resolved".to_string();
         item.clone()
     };
-    prune_hitl_in_place(&mut pending, state.retention.max_hitl);
-    drop(pending);
+    prune_hitl_in_place(&mut pending_hitl_map, state.retention.max_hitl);
+    drop(pending_hitl_map);
     emit_audit_event(
         &state,
         "hitl_resolved",
         json!({
-            "hitl_id": updated.id,
-            "session_id": updated.session_id,
-            "workflow": updated.workflow,
-            "stage_id": updated.stage_id,
-            "decision": updated.decision,
+            "hitl_id": resolved_hitl.id,
+            "session_id": resolved_hitl.session_id,
+            "workflow": resolved_hitl.workflow,
+            "stage_id": resolved_hitl.stage_id,
+            "decision": resolved_hitl.decision,
         }),
     )
     .await;
-    (StatusCode::OK, Json(updated)).into_response()
+    (StatusCode::OK, Json(resolved_hitl)).into_response()
 }
 
 async fn ws_logs(
@@ -1900,7 +2181,7 @@ async fn trigger_scheduler_loop(state: AppState) {
             continue;
         }
 
-        let entries = match find_workflow_entries_with_registry(
+        let trigger_entries = match find_workflow_entries_with_registry(
             &state.plays_dir,
             state.registry_file.as_deref(),
         )
@@ -1914,9 +2195,9 @@ async fn trigger_scheduler_loop(state: AppState) {
             }
         };
 
-        run_interval_triggers(&state, &entries, &mut scheduler).await;
-        run_cron_triggers(&state, &entries, &mut scheduler).await;
-        run_watch_triggers(&state, &entries, &mut scheduler).await;
+        run_interval_triggers(&state, &trigger_entries, &mut scheduler).await;
+        run_cron_triggers(&state, &trigger_entries, &mut scheduler).await;
+        run_watch_triggers(&state, &trigger_entries, &mut scheduler).await;
         sleep(Duration::from_secs(1)).await;
     }
 }
@@ -2046,10 +2327,10 @@ fn trigger_leader_transition_event(
 }
 
 async fn resolve_trigger_leadership(config: &TriggerLeaseConfig) -> Result<TriggerLeaderState> {
-    let now = now_unix_secs();
+    let lease_now_unix = now_unix_secs();
     if let Some(current) = read_trigger_lease_file(&config.lease_file).await?
         && current.holder != config.node_id
-        && current.expires_at > now
+        && current.expires_at > lease_now_unix
     {
         return Ok(TriggerLeaderState {
             enabled: true,
@@ -2063,18 +2344,18 @@ async fn resolve_trigger_leadership(config: &TriggerLeaseConfig) -> Result<Trigg
 
     let candidate = TriggerLeaseFile {
         holder: config.node_id.clone(),
-        expires_at: now.saturating_add(config.ttl_sec),
+        expires_at: lease_now_unix.saturating_add(config.ttl_sec),
     };
     write_trigger_lease_file(&config.lease_file, &candidate).await?;
 
     let observed = read_trigger_lease_file(&config.lease_file).await?;
-    let is_leader = observed
+    let lease_is_leader = observed
         .as_ref()
-        .map(|lease| lease.holder == config.node_id && lease.expires_at > now)
+        .map(|lease| lease.holder == config.node_id && lease.expires_at > lease_now_unix)
         .unwrap_or(false);
     Ok(TriggerLeaderState {
         enabled: true,
-        is_leader,
+        is_leader: lease_is_leader,
         node_id: config.node_id.clone(),
         holder: observed.as_ref().map(|lease| lease.holder.clone()),
         expires_at: observed.as_ref().map(|lease| lease.expires_at),
@@ -2136,8 +2417,8 @@ async fn run_interval_triggers(
     entries: &[WorkflowEntry],
     scheduler: &mut TriggerScheduler,
 ) {
-    let mut seen = HashSet::new();
-    let now = Instant::now();
+    let mut interval_seen_keys = HashSet::new();
+    let interval_now = Instant::now();
 
     for entry in entries {
         let Some(raw_interval) = entry.trigger_interval.as_deref() else {
@@ -2159,52 +2440,21 @@ async fn run_interval_triggers(
             }
         };
 
-        let key = trigger_key(entry, "interval", raw_interval);
-        seen.insert(key.clone());
-        let next = scheduler
+        let interval_key = trigger_key(entry, "interval", raw_interval);
+        interval_seen_keys.insert(interval_key.to_owned());
+        let interval_next_run = scheduler
             .interval_next
-            .entry(key)
-            .or_insert_with(|| now + interval);
-        if now >= *next {
-            match launch_workflow_from_entry(state, entry, "interval").await {
-                Ok(TriggerLaunchOutcome::Launched(_))
-                | Ok(TriggerLaunchOutcome::SkippedRunning) => {}
-                Ok(TriggerLaunchOutcome::SkippedCapability(missing)) => {
-                    eprintln!(
-                        "anna-rs scheduler: skipped interval trigger '{}' due to missing capabilities: {}",
-                        entry.workflow_name,
-                        missing.join(", ")
-                    );
-                }
-                Ok(TriggerLaunchOutcome::SkippedProvider(missing)) => {
-                    eprintln!(
-                        "anna-rs scheduler: skipped interval trigger '{}' due to blocked providers: {}",
-                        entry.workflow_name,
-                        missing.join(", ")
-                    );
-                }
-                Ok(TriggerLaunchOutcome::SkippedConcurrency {
-                    running,
-                    max_concurrency,
-                }) => {
-                    eprintln!(
-                        "anna-rs scheduler: skipped interval trigger '{}' due to concurrency limit running={} max={}",
-                        entry.workflow_name, running, max_concurrency
-                    );
-                }
-                Err(err) => {
-                    eprintln!(
-                        "anna-rs scheduler: failed launching interval trigger for '{}': {}",
-                        entry.path.display(),
-                        err
-                    );
-                }
-            }
-            *next = Instant::now() + interval;
+            .entry(interval_key)
+            .or_insert_with(|| interval_now + interval);
+        if interval_now >= *interval_next_run {
+            log_trigger_launch_outcome("interval", entry, launch_workflow_from_entry(state, entry, "interval").await);
+            *interval_next_run = Instant::now() + interval;
         }
     }
 
-    scheduler.interval_next.retain(|k, _| seen.contains(k));
+    scheduler
+        .interval_next
+        .retain(|k, _| interval_seen_keys.contains(k));
 }
 
 async fn run_cron_triggers(
@@ -2212,8 +2462,8 @@ async fn run_cron_triggers(
     entries: &[WorkflowEntry],
     scheduler: &mut TriggerScheduler,
 ) {
-    let mut seen = HashSet::new();
-    let now = Utc::now();
+    let mut cron_seen_keys = HashSet::new();
+    let cron_now = Utc::now();
 
     for entry in entries {
         let Some(raw_cron) = entry.trigger_cron.as_deref() else {
@@ -2236,58 +2486,25 @@ async fn run_cron_triggers(
             }
         };
 
-        let key = trigger_key(entry, "cron", raw_cron);
-        seen.insert(key.clone());
-        let next = scheduler.cron_next.entry(key).or_insert_with(|| {
+        let cron_key = trigger_key(entry, "cron", raw_cron);
+        cron_seen_keys.insert(cron_key.to_owned());
+        let cron_next_run = scheduler.cron_next.entry(cron_key).or_insert_with(|| {
             schedule
-                .after(&now)
+                .after(&cron_now)
                 .next()
-                .unwrap_or_else(|| now + chrono::Duration::days(1))
+                .unwrap_or_else(|| cron_now + chrono::Duration::days(1))
         });
 
-        if *next <= now {
-            match launch_workflow_from_entry(state, entry, "cron").await {
-                Ok(TriggerLaunchOutcome::Launched(_))
-                | Ok(TriggerLaunchOutcome::SkippedRunning) => {}
-                Ok(TriggerLaunchOutcome::SkippedCapability(missing)) => {
-                    eprintln!(
-                        "anna-rs scheduler: skipped cron trigger '{}' due to missing capabilities: {}",
-                        entry.workflow_name,
-                        missing.join(", ")
-                    );
-                }
-                Ok(TriggerLaunchOutcome::SkippedProvider(missing)) => {
-                    eprintln!(
-                        "anna-rs scheduler: skipped cron trigger '{}' due to blocked providers: {}",
-                        entry.workflow_name,
-                        missing.join(", ")
-                    );
-                }
-                Ok(TriggerLaunchOutcome::SkippedConcurrency {
-                    running,
-                    max_concurrency,
-                }) => {
-                    eprintln!(
-                        "anna-rs scheduler: skipped cron trigger '{}' due to concurrency limit running={} max={}",
-                        entry.workflow_name, running, max_concurrency
-                    );
-                }
-                Err(err) => {
-                    eprintln!(
-                        "anna-rs scheduler: failed launching cron trigger for '{}': {}",
-                        entry.path.display(),
-                        err
-                    );
-                }
-            }
-            *next = schedule
-                .after(&now)
+        if *cron_next_run <= cron_now {
+            log_trigger_launch_outcome("cron", entry, launch_workflow_from_entry(state, entry, "cron").await);
+            *cron_next_run = schedule
+                .after(&cron_now)
                 .next()
-                .unwrap_or_else(|| now + chrono::Duration::days(1));
+                .unwrap_or_else(|| cron_now + chrono::Duration::days(1));
         }
     }
 
-    scheduler.cron_next.retain(|k, _| seen.contains(k));
+    scheduler.cron_next.retain(|k, _| cron_seen_keys.contains(k));
 }
 
 async fn run_watch_triggers(
@@ -2295,7 +2512,7 @@ async fn run_watch_triggers(
     entries: &[WorkflowEntry],
     scheduler: &mut TriggerScheduler,
 ) {
-    let mut seen = HashSet::new();
+    let mut watch_seen_keys = HashSet::new();
     for entry in entries {
         let Some(raw_watch) = entry.trigger_watch.as_deref() else {
             continue;
@@ -2310,10 +2527,10 @@ async fn run_watch_triggers(
             continue;
         }
 
-        let key = trigger_key(entry, "watch", &pattern);
-        seen.insert(key.clone());
+        let watch_key = trigger_key(entry, "watch", &pattern);
+        watch_seen_keys.insert(watch_key.to_owned());
 
-        let snapshot = match collect_watch_snapshot(&pattern) {
+        let watch_snapshot = match collect_watch_snapshot(&pattern) {
             Ok(v) => v,
             Err(err) => {
                 eprintln!(
@@ -2326,51 +2543,67 @@ async fn run_watch_triggers(
             }
         };
 
-        let changed = match scheduler.watch_snapshots.get(&key) {
+        let changed = match scheduler.watch_snapshots.get(&watch_key) {
             None => false,
-            Some(previous) => previous != &snapshot,
+            Some(previous) => previous != &watch_snapshot,
         };
-        scheduler.watch_snapshots.insert(key, snapshot);
+        scheduler.watch_snapshots.insert(watch_key, watch_snapshot);
 
         if changed {
-            match launch_workflow_from_entry(state, entry, "watch").await {
-                Ok(TriggerLaunchOutcome::Launched(_))
-                | Ok(TriggerLaunchOutcome::SkippedRunning) => {}
-                Ok(TriggerLaunchOutcome::SkippedCapability(missing)) => {
-                    eprintln!(
-                        "anna-rs scheduler: skipped watch trigger '{}' due to missing capabilities: {}",
-                        entry.workflow_name,
-                        missing.join(", ")
-                    );
-                }
-                Ok(TriggerLaunchOutcome::SkippedProvider(missing)) => {
-                    eprintln!(
-                        "anna-rs scheduler: skipped watch trigger '{}' due to blocked providers: {}",
-                        entry.workflow_name,
-                        missing.join(", ")
-                    );
-                }
-                Ok(TriggerLaunchOutcome::SkippedConcurrency {
-                    running,
-                    max_concurrency,
-                }) => {
-                    eprintln!(
-                        "anna-rs scheduler: skipped watch trigger '{}' due to concurrency limit running={} max={}",
-                        entry.workflow_name, running, max_concurrency
-                    );
-                }
-                Err(err) => {
-                    eprintln!(
-                        "anna-rs scheduler: failed launching watch trigger for '{}': {}",
-                        entry.path.display(),
-                        err
-                    );
-                }
-            }
+            log_watch_launch_outcome(entry, launch_workflow_from_entry(state, entry, "watch").await);
         }
     }
 
-    scheduler.watch_snapshots.retain(|k, _| seen.contains(k));
+    scheduler
+        .watch_snapshots
+        .retain(|k, _| watch_seen_keys.contains(k));
+}
+
+fn log_watch_launch_outcome(
+    entry: &WorkflowEntry,
+    outcome: Result<TriggerLaunchOutcome>,
+) {
+    log_trigger_launch_outcome("watch", entry, outcome);
+}
+
+fn log_trigger_launch_outcome(
+    trigger_kind: &str,
+    entry: &WorkflowEntry,
+    outcome: Result<TriggerLaunchOutcome>,
+) {
+    match outcome {
+        Ok(TriggerLaunchOutcome::Launched(_)) | Ok(TriggerLaunchOutcome::SkippedRunning) => {}
+        Ok(TriggerLaunchOutcome::SkippedCapability(missing)) => {
+            eprintln!(
+                "anna-rs scheduler: skipped {trigger_kind} trigger '{}' due to missing capabilities: {}",
+                entry.workflow_name,
+                missing.join(", ")
+            );
+        }
+        Ok(TriggerLaunchOutcome::SkippedProvider(missing)) => {
+            eprintln!(
+                "anna-rs scheduler: skipped {trigger_kind} trigger '{}' due to blocked providers: {}",
+                entry.workflow_name,
+                missing.join(", ")
+            );
+        }
+        Ok(TriggerLaunchOutcome::SkippedConcurrency {
+            running,
+            max_concurrency,
+        }) => {
+            eprintln!(
+                "anna-rs scheduler: skipped {trigger_kind} trigger '{}' due to concurrency limit running={} max={}",
+                entry.workflow_name, running, max_concurrency
+            );
+        }
+        Err(err) => {
+            eprintln!(
+                "anna-rs scheduler: failed launching {trigger_kind} trigger for '{}': {}",
+                entry.path.display(),
+                err
+            );
+        }
+    }
 }
 
 fn watch_base_dir(plays_dir: &FsPath, entry: &WorkflowEntry) -> PathBuf {
@@ -2423,7 +2656,7 @@ fn missing_required_capabilities(
         return Vec::new();
     }
 
-    let mut missing = entry
+    let mut missing_capabilities_list = entry
         .required_capabilities
         .iter()
         .map(|v| v.trim())
@@ -2431,19 +2664,19 @@ fn missing_required_capabilities(
         .filter(|required| !node_capabilities.contains(&required.to_ascii_lowercase()))
         .map(ToOwned::to_owned)
         .collect::<Vec<_>>();
-    missing.sort();
-    missing.dedup();
-    missing
+    missing_capabilities_list.sort();
+    missing_capabilities_list.dedup();
+    missing_capabilities_list
 }
 
 fn collect_required_providers(workflow: &Workflow) -> Vec<String> {
-    let mut providers = HashSet::new();
+    let mut provider_set_required = HashSet::new();
     for stage in &workflow.stages {
         if stage.workflow.is_none() {
-            providers.insert(stage.provider_name().trim().to_ascii_lowercase());
+            provider_set_required.insert(stage.provider_name().trim().to_ascii_lowercase());
         }
         if stage.vote.is_some() {
-            providers.insert("llm".to_string());
+            provider_set_required.insert("llm".to_string());
         }
         if stage
             .before
@@ -2461,15 +2694,15 @@ fn collect_required_providers(workflow: &Workflow) -> Vec<String> {
                 .map(|v| !v.trim().is_empty())
                 .unwrap_or(false)
         {
-            providers.insert("shell".to_string());
+            provider_set_required.insert("shell".to_string());
         }
     }
-    let mut out = providers
+    let mut required_provider_list = provider_set_required
         .into_iter()
         .filter(|v| !v.trim().is_empty())
         .collect::<Vec<_>>();
-    out.sort();
-    out
+    required_provider_list.sort();
+    required_provider_list
 }
 
 fn missing_required_providers(
@@ -2480,16 +2713,16 @@ fn missing_required_providers(
         return Vec::new();
     };
 
-    let mut missing = entry
+    let mut missing_provider_list = entry
         .required_providers
         .iter()
         .map(|provider| provider.trim().to_ascii_lowercase())
         .filter(|provider| !provider.is_empty())
         .filter(|provider| !allowed.contains(provider))
         .collect::<Vec<_>>();
-    missing.sort();
-    missing.dedup();
-    missing
+    missing_provider_list.sort();
+    missing_provider_list.dedup();
+    missing_provider_list
 }
 
 fn normalize_max_concurrency(raw: Option<u32>) -> Option<usize> {
@@ -2500,33 +2733,55 @@ fn evaluate_flow_readiness(
     entry: &WorkflowEntry,
     node_capabilities: &HashSet<String>,
     allowed_providers: Option<&HashSet<String>>,
-    running: usize,
-    default_max_concurrency: Option<usize>,
-    owner_running: usize,
-    owner_max_concurrency: Option<usize>,
+    runtime: FlowReadinessRuntime,
 ) -> FlowReadiness {
     let missing_capabilities = missing_required_capabilities(entry, node_capabilities);
-    let missing_providers = missing_required_providers(entry, allowed_providers);
+    let blocked_provider_list = missing_required_providers(entry, allowed_providers);
     let max_concurrency = normalize_max_concurrency(entry.max_concurrency)
-        .or(default_max_concurrency.filter(|v| *v >= 1));
-    let concurrency_blocked = max_concurrency.map(|max| running >= max).unwrap_or(false);
-    let owner_concurrency_blocked = owner_max_concurrency
-        .map(|max| owner_running >= max)
+        .or(runtime.default_max_concurrency.filter(|v| *v >= 1));
+    let concurrency_blocked = max_concurrency
+        .map(|max| runtime.running >= max)
+        .unwrap_or(false);
+    let owner_concurrency_blocked = runtime
+        .owner_max_concurrency
+        .map(|max| runtime.owner_running >= max)
         .unwrap_or(false);
     FlowReadiness {
         missing_capabilities,
-        missing_providers,
+        missing_providers: blocked_provider_list,
         max_concurrency,
-        running,
+        running: runtime.running,
         concurrency_blocked,
-        owner_running,
-        owner_max_concurrency,
+        owner_running: runtime.owner_running,
+        owner_max_concurrency: runtime.owner_max_concurrency,
         owner_concurrency_blocked,
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+struct FlowReadinessRuntime {
+    running: usize,
+    default_max_concurrency: Option<usize>,
+    owner_running: usize,
+    owner_max_concurrency: Option<usize>,
+}
+
+fn flow_readiness_runtime(
+    running: usize,
+    default_max_concurrency: Option<usize>,
+    owner_running: usize,
+    owner_max_concurrency: Option<usize>,
+) -> FlowReadinessRuntime {
+    FlowReadinessRuntime {
+        running,
+        default_max_concurrency,
+        owner_running,
+        owner_max_concurrency,
+    }
+}
+
 fn collect_watch_snapshot(pattern: &str) -> Result<HashMap<String, u64>> {
-    let mut snapshot = HashMap::new();
+    let mut watch_snapshot_map = HashMap::new();
     for item in glob::glob(pattern)? {
         let path = match item {
             Ok(v) => v,
@@ -2546,9 +2801,9 @@ fn collect_watch_snapshot(pattern: &str) -> Result<HashMap<String, u64>> {
             .map(|v| v.as_nanos() as u64)
             .unwrap_or(0);
         let fingerprint = modified ^ metadata.len().rotate_left(13);
-        snapshot.insert(path.to_string_lossy().into_owned(), fingerprint);
+        watch_snapshot_map.insert(path.to_string_lossy().into_owned(), fingerprint);
     }
-    Ok(snapshot)
+    Ok(watch_snapshot_map)
 }
 
 fn trigger_key(entry: &WorkflowEntry, trigger_kind: &str, trigger_value: &str) -> String {
@@ -2578,15 +2833,15 @@ fn daemon_audit_log_config(node_id: &str) -> Option<AuditLogConfig> {
     let Ok(raw) = std::env::var("ANNA_AUDIT_LOG_FILE") else {
         return None;
     };
-    let trimmed = raw.trim();
-    if trimmed.is_empty()
-        || trimmed.eq_ignore_ascii_case("off")
-        || trimmed.eq_ignore_ascii_case("false")
+    let audit_log_value = raw.trim();
+    if audit_log_value.is_empty()
+        || audit_log_value.eq_ignore_ascii_case("off")
+        || audit_log_value.eq_ignore_ascii_case("false")
     {
         return None;
     }
     Some(AuditLogConfig {
-        path: PathBuf::from(trimmed),
+        path: PathBuf::from(audit_log_value),
         node_id: node_id.to_string(),
     })
 }
@@ -2595,22 +2850,26 @@ fn daemon_policy_signing_key() -> Option<String> {
     let Ok(raw) = std::env::var("ANNA_POLICY_SIGNING_KEY") else {
         return None;
     };
-    let trimmed = raw.trim();
-    if trimmed.is_empty()
-        || trimmed.eq_ignore_ascii_case("off")
-        || trimmed.eq_ignore_ascii_case("false")
+    let signing_key_value = raw.trim();
+    if signing_key_value.is_empty()
+        || signing_key_value.eq_ignore_ascii_case("off")
+        || signing_key_value.eq_ignore_ascii_case("false")
     {
         return None;
     }
-    Some(trimmed.to_string())
+    Some(signing_key_value.to_string())
 }
 
 fn sorted_set_values(set: Option<&HashSet<String>>) -> Vec<String> {
-    let mut values = set
-        .map(|v| v.iter().cloned().collect::<Vec<_>>())
-        .unwrap_or_default();
-    values.sort();
-    values
+    let mut sorted_values = Vec::new();
+    if let Some(set_values) = set {
+        sorted_values.reserve(set_values.len());
+        for value in set_values {
+            sorted_values.push(value.to_owned());
+        }
+    }
+    sorted_values.sort();
+    sorted_values
 }
 
 async fn emit_audit_event(state: &AppState, event: &str, data: serde_json::Value) {
@@ -2665,9 +2924,9 @@ async fn append_audit_event(
 
 fn daemon_node_id() -> String {
     if let Ok(raw) = std::env::var("ANNA_DAEMON_NODE_ID") {
-        let trimmed = raw.trim();
-        if !trimmed.is_empty() {
-            return trimmed.to_string();
+        let node_id_value = raw.trim();
+        if !node_id_value.is_empty() {
+            return node_id_value.to_string();
         }
     }
 
@@ -2684,10 +2943,10 @@ fn trigger_lease_config(node_id: &str) -> Option<TriggerLeaseConfig> {
     let Ok(raw) = std::env::var("ANNA_TRIGGER_LEASE_FILE") else {
         return None;
     };
-    let trimmed = raw.trim();
-    if trimmed.is_empty()
-        || trimmed.eq_ignore_ascii_case("off")
-        || trimmed.eq_ignore_ascii_case("false")
+    let lease_file_value = raw.trim();
+    if lease_file_value.is_empty()
+        || lease_file_value.eq_ignore_ascii_case("off")
+        || lease_file_value.eq_ignore_ascii_case("false")
     {
         return None;
     }
@@ -2699,7 +2958,7 @@ fn trigger_lease_config(node_id: &str) -> Option<TriggerLeaseConfig> {
         .unwrap_or(15);
     Some(TriggerLeaseConfig {
         node_id: node_id.to_string(),
-        lease_file: PathBuf::from(trimmed),
+        lease_file: PathBuf::from(lease_file_value),
         ttl_sec,
     })
 }
@@ -2742,20 +3001,20 @@ fn chat_intents_reload_interval() -> Option<Duration> {
     let Ok(raw) = std::env::var("ANNA_CHAT_INTENTS_RELOAD_SEC") else {
         return Some(Duration::from_secs(2));
     };
-    let trimmed = raw.trim();
-    if trimmed.is_empty()
-        || trimmed.eq_ignore_ascii_case("off")
-        || trimmed.eq_ignore_ascii_case("false")
-        || trimmed == "0"
+    let chat_reload_value = raw.trim();
+    if chat_reload_value.is_empty()
+        || chat_reload_value.eq_ignore_ascii_case("off")
+        || chat_reload_value.eq_ignore_ascii_case("false")
+        || chat_reload_value == "0"
     {
         return None;
     }
-    match trimmed.parse::<u64>() {
+    match chat_reload_value.parse::<u64>() {
         Ok(seconds) if seconds >= 1 => Some(Duration::from_secs(seconds)),
         _ => {
             eprintln!(
                 "anna-rs daemon: invalid ANNA_CHAT_INTENTS_RELOAD_SEC='{}' (expected integer >=1, or off/false/0)",
-                trimmed
+                chat_reload_value
             );
             Some(Duration::from_secs(2))
         }
@@ -2763,39 +3022,39 @@ fn chat_intents_reload_interval() -> Option<Duration> {
 }
 
 fn daemon_chat_intents() -> HashMap<String, ChatIntentConfig> {
-    let mut out = HashMap::new();
+    let mut merged_intents = HashMap::new();
 
     if let Some(path) = chat_intents_file() {
         match load_chat_intents_file(&path) {
-            Ok(file_intents) => out.extend(file_intents),
+            Ok(file_intents) => merged_intents.extend(file_intents),
             Err(err) => eprintln!("anna-rs daemon: failed loading chat intents file: {}", err),
         }
     }
 
     if let Ok(raw) = std::env::var("ANNA_CHAT_INTENTS") {
         // Explicit env mapping overrides file entries when keys collide.
-        out.extend(parse_chat_intents_value(&raw));
+        merged_intents.extend(parse_chat_intents_value(&raw));
     }
 
-    out
+    merged_intents
 }
 
 fn parse_chat_intents_value(raw: &str) -> HashMap<String, ChatIntentConfig> {
-    let mut out = HashMap::new();
+    let mut parsed_intents = HashMap::new();
     for item in raw.split([',', ';', '\n']) {
-        let trimmed = item.trim();
-        if trimmed.is_empty() {
+        let chat_intent_item_trimmed = item.trim();
+        if chat_intent_item_trimmed.is_empty() {
             continue;
         }
-        let Some((intent_raw, workflow_raw)) = trimmed.split_once('=') else {
+        let Some((intent_raw, workflow_raw)) = chat_intent_item_trimmed.split_once('=') else {
             eprintln!(
                 "anna-rs daemon: ignoring invalid ANNA_CHAT_INTENTS entry '{}'",
-                trimmed
+                chat_intent_item_trimmed
             );
             continue;
         };
         insert_chat_intent_entry(
-            &mut out,
+            &mut parsed_intents,
             intent_raw,
             ChatIntentConfig {
                 workflow: workflow_raw.to_string(),
@@ -2805,97 +3064,155 @@ fn parse_chat_intents_value(raw: &str) -> HashMap<String, ChatIntentConfig> {
                 max_iterations_cap: None,
             },
             "ANNA_CHAT_INTENTS",
-            trimmed,
+            chat_intent_item_trimmed,
         );
     }
-    out
+    parsed_intents
 }
 
 fn chat_intents_file() -> Option<PathBuf> {
     let Ok(raw) = std::env::var("ANNA_CHAT_INTENTS_FILE") else {
         return None;
     };
-    let trimmed = raw.trim();
-    if trimmed.is_empty()
-        || trimmed.eq_ignore_ascii_case("off")
-        || trimmed.eq_ignore_ascii_case("false")
+    let intents_file_value = raw.trim();
+    if intents_file_value.is_empty()
+        || intents_file_value.eq_ignore_ascii_case("off")
+        || intents_file_value.eq_ignore_ascii_case("false")
     {
         return None;
     }
-    Some(PathBuf::from(trimmed))
+    Some(PathBuf::from(intents_file_value))
 }
 
 fn load_chat_intents_file(path: &FsPath) -> Result<HashMap<String, ChatIntentConfig>> {
-    let raw = std::fs::read_to_string(path)
+    let chat_intents_doc_raw = std::fs::read_to_string(path)
         .with_context(|| format!("failed reading '{}'", path.display()))?;
-    parse_chat_intents_doc(&raw, &path.display().to_string())
+    parse_chat_intents_doc(&chat_intents_doc_raw, &path.display().to_string())
 }
 
 fn parse_chat_intents_doc(raw: &str, source: &str) -> Result<HashMap<String, ChatIntentConfig>> {
     let parsed: ChatIntentDoc = serde_yaml::from_str(raw)
         .with_context(|| format!("failed parsing chat intents from '{}'", source))?;
-    let mut out = HashMap::new();
+    let mut intent_config_map = HashMap::new();
     match parsed {
         ChatIntentDoc::Wrapped { intents } | ChatIntentDoc::List(intents) => {
-            for item in intents {
-                let raw_entry = format!(
-                    "intent='{}' workflow='{}'",
-                    item.intent, item.config.workflow
-                );
-                insert_chat_intent_entry(
-                    &mut out,
-                    &item.intent,
-                    ChatIntentConfig {
-                        workflow: item.config.workflow,
-                        allowed_callers: item.config.allowed_callers,
-                        allowed_owners: item.config.allowed_owners,
-                        required_tags: item.config.required_tags,
-                        max_iterations_cap: item.config.max_iterations_cap,
-                    },
-                    source,
-                    &raw_entry,
-                );
-            }
+            insert_list_chat_intents(&mut intent_config_map, intents, source);
         }
-        ChatIntentDoc::Map(map) => {
-            for (intent, value) in map {
-                let (config, raw_entry) = match value {
-                    ChatIntentMapValue::Workflow(workflow) => {
-                        let raw_entry = format!("{}={}", intent, workflow);
-                        (
-                            ChatIntentConfig {
-                                workflow,
-                                allowed_callers: Vec::new(),
-                                allowed_owners: Vec::new(),
-                                required_tags: Vec::new(),
-                                max_iterations_cap: None,
-                            },
-                            raw_entry,
-                        )
-                    }
-                    ChatIntentMapValue::Config(config) => {
-                        let raw_entry =
-                            format!("intent='{}' workflow='{}'", intent, config.workflow);
-                        (
-                            ChatIntentConfig {
-                                workflow: config.workflow,
-                                allowed_callers: config.allowed_callers,
-                                allowed_owners: config.allowed_owners,
-                                required_tags: config.required_tags,
-                                max_iterations_cap: config.max_iterations_cap,
-                            },
-                            raw_entry,
-                        )
-                    }
-                };
-                insert_chat_intent_entry(&mut out, &intent, config, source, &raw_entry);
-            }
-        }
+        ChatIntentDoc::Map(map) => insert_map_chat_intents(&mut intent_config_map, map, source),
     }
-    if out.is_empty() {
+    if intent_config_map.is_empty() {
         bail!("chat intents source '{}' has no valid entries", source);
     }
-    Ok(out)
+    Ok(intent_config_map)
+}
+
+fn insert_list_chat_intents(
+    out: &mut HashMap<String, ChatIntentConfig>,
+    intents: Vec<ChatIntentEntry>,
+    source: &str,
+) {
+    for item in intents {
+        let raw_entry_label = format!("intent='{}' workflow='{}'", item.intent, item.config.workflow);
+        insert_chat_intent_entry(
+            out,
+            &item.intent,
+            chat_intent_config_from_doc(item.config),
+            source,
+            &raw_entry_label,
+        );
+    }
+}
+
+fn chat_intent_config_from_doc(doc: ChatIntentConfigDoc) -> ChatIntentConfig {
+    ChatIntentConfig {
+        workflow: doc.workflow,
+        allowed_callers: doc.allowed_callers,
+        allowed_owners: doc.allowed_owners,
+        required_tags: doc.required_tags,
+        max_iterations_cap: doc.max_iterations_cap,
+    }
+}
+
+fn parse_chat_intent_map_entry(
+    intent: &str,
+    value: ChatIntentMapValue,
+) -> (ChatIntentConfig, String) {
+    match value {
+        ChatIntentMapValue::Workflow(workflow) => (
+            ChatIntentConfig {
+                workflow: workflow.clone(),
+                allowed_callers: Vec::new(),
+                allowed_owners: Vec::new(),
+                required_tags: Vec::new(),
+                max_iterations_cap: None,
+            },
+            format!("{}={}", intent, workflow),
+        ),
+        ChatIntentMapValue::Config(config_doc) => {
+            let map_raw_entry_label = format!("intent='{}' workflow='{}'", intent, config_doc.workflow);
+            (chat_intent_config_from_doc(config_doc), map_raw_entry_label)
+        }
+    }
+}
+
+fn insert_map_chat_intents(
+    out: &mut HashMap<String, ChatIntentConfig>,
+    map: HashMap<String, ChatIntentMapValue>,
+    source: &str,
+) {
+    for (intent, value) in map {
+        let (config, map_entry_raw) = parse_chat_intent_map_entry(&intent, value);
+        insert_chat_intent_entry(out, &intent, config, source, &map_entry_raw);
+    }
+}
+
+fn normalize_sorted_dedup(values: &[String]) -> Vec<String> {
+    let mut canonical_values = values
+        .iter()
+        .map(|v| v.trim().to_ascii_lowercase())
+        .filter(|v| !v.is_empty())
+        .collect::<Vec<_>>();
+    canonical_values.sort();
+    canonical_values.dedup();
+    canonical_values
+}
+
+fn normalize_owner_list(values: &[String]) -> Vec<String> {
+    let mut canonical_owners = values
+        .iter()
+        .filter_map(|owner| owner_key(Some(owner.as_str())))
+        .collect::<Vec<_>>();
+    canonical_owners.sort();
+    canonical_owners.dedup();
+    canonical_owners
+}
+
+fn normalized_chat_intent_entry_or_none(
+    intent_raw: &str,
+    mut config: ChatIntentConfig,
+    source: &str,
+    raw_entry: &str,
+) -> Option<(String, ChatIntentConfig)> {
+    let normalized_intent_key = intent_raw.trim().to_ascii_lowercase();
+    config.workflow = config.workflow.trim().to_string();
+    if normalized_intent_key.is_empty() || config.workflow.is_empty() {
+        eprintln!(
+            "anna-rs daemon: ignoring invalid chat intent entry '{}' from {}",
+            raw_entry, source
+        );
+        return None;
+    }
+    if config.max_iterations_cap == Some(0) {
+        eprintln!(
+            "anna-rs daemon: ignoring invalid chat intent entry '{}' from {} (max_iterations_cap must be >=1)",
+            raw_entry, source
+        );
+        return None;
+    }
+    config.allowed_callers = normalize_sorted_dedup(&config.allowed_callers);
+    config.allowed_owners = normalize_owner_list(&config.allowed_owners);
+    config.required_tags = normalize_sorted_dedup(&config.required_tags);
+    Some((normalized_intent_key, config))
 }
 
 fn insert_chat_intent_entry(
@@ -2905,59 +3222,12 @@ fn insert_chat_intent_entry(
     source: &str,
     raw_entry: &str,
 ) {
-    let intent = intent_raw.trim().to_ascii_lowercase();
-    let workflow = config.workflow.trim().to_string();
-    if intent.is_empty() || workflow.is_empty() {
-        eprintln!(
-            "anna-rs daemon: ignoring invalid chat intent entry '{}' from {}",
-            raw_entry, source
-        );
+    let Some((normalized_intent_key, normalized_config)) =
+        normalized_chat_intent_entry_or_none(intent_raw, config, source, raw_entry)
+    else {
         return;
-    }
-    if config.max_iterations_cap == Some(0) {
-        eprintln!(
-            "anna-rs daemon: ignoring invalid chat intent entry '{}' from {} (max_iterations_cap must be >=1)",
-            raw_entry, source
-        );
-        return;
-    }
-
-    let mut allowed_callers = config
-        .allowed_callers
-        .iter()
-        .map(|caller| caller.trim().to_ascii_lowercase())
-        .filter(|caller| !caller.is_empty())
-        .collect::<Vec<_>>();
-    allowed_callers.sort();
-    allowed_callers.dedup();
-
-    let mut allowed_owners = config
-        .allowed_owners
-        .iter()
-        .filter_map(|owner| owner_key(Some(owner.as_str())))
-        .collect::<Vec<_>>();
-    allowed_owners.sort();
-    allowed_owners.dedup();
-
-    let mut required_tags = config
-        .required_tags
-        .iter()
-        .map(|tag| tag.trim().to_ascii_lowercase())
-        .filter(|tag| !tag.is_empty())
-        .collect::<Vec<_>>();
-    required_tags.sort();
-    required_tags.dedup();
-
-    out.insert(
-        intent,
-        ChatIntentConfig {
-            workflow,
-            allowed_callers,
-            allowed_owners,
-            required_tags,
-            max_iterations_cap: config.max_iterations_cap,
-        },
-    );
+    };
+    out.insert(normalized_intent_key, normalized_config);
 }
 
 fn evaluate_chat_intent_guardrails(
@@ -2967,7 +3237,22 @@ fn evaluate_chat_intent_guardrails(
     caller: Option<&str>,
 ) -> ChatIntentGuardrailOutcome {
     let mut reasons = Vec::new();
+    guardrail_allowed_caller_reasons(rule, caller, &mut reasons);
+    guardrail_allowed_owner_reasons(rule, entry, &mut reasons);
+    guardrail_required_tag_reasons(rule, entry, &mut reasons);
+    let guardrail_effective_iterations =
+        guardrail_effective_max_iterations(rule.max_iterations_cap, requested_max_iterations, &mut reasons);
+    ChatIntentGuardrailOutcome {
+        reasons,
+        effective_max_iterations: guardrail_effective_iterations,
+    }
+}
 
+fn guardrail_allowed_caller_reasons(
+    rule: &ChatIntentConfig,
+    caller: Option<&str>,
+    reasons: &mut Vec<String>,
+) {
     if !rule.allowed_callers.is_empty() {
         let normalized_caller = caller
             .map(|v| v.trim().to_ascii_lowercase())
@@ -2984,14 +3269,20 @@ fn evaluate_chat_intent_guardrails(
             ));
         }
     }
+}
 
+fn guardrail_allowed_owner_reasons(
+    rule: &ChatIntentConfig,
+    entry: &WorkflowEntry,
+    reasons: &mut Vec<String>,
+) {
     if !rule.allowed_owners.is_empty() {
         let workflow_owner = owner_key(entry.owner.as_deref());
-        let allowed = workflow_owner
+        let owner_is_allowed = workflow_owner
             .as_ref()
             .map(|owner| rule.allowed_owners.contains(owner))
             .unwrap_or(false);
-        if !allowed {
+        if !owner_is_allowed {
             reasons.push(format!(
                 "workflow owner '{}' is not allowed (allowed owners: {})",
                 entry.owner.as_deref().unwrap_or(""),
@@ -2999,7 +3290,13 @@ fn evaluate_chat_intent_guardrails(
             ));
         }
     }
+}
 
+fn guardrail_required_tag_reasons(
+    rule: &ChatIntentConfig,
+    entry: &WorkflowEntry,
+    reasons: &mut Vec<String>,
+) {
     if !rule.required_tags.is_empty() {
         let entry_tags = entry
             .tags
@@ -3007,24 +3304,30 @@ fn evaluate_chat_intent_guardrails(
             .map(|tag| tag.trim().to_ascii_lowercase())
             .filter(|tag| !tag.is_empty())
             .collect::<HashSet<_>>();
-        let mut missing = rule
+        let mut missing_required_tags = rule
             .required_tags
             .iter()
             .filter(|tag| !entry_tags.contains(*tag))
             .cloned()
             .collect::<Vec<_>>();
-        missing.sort();
-        missing.dedup();
-        if !missing.is_empty() {
+        missing_required_tags.sort();
+        missing_required_tags.dedup();
+        if !missing_required_tags.is_empty() {
             reasons.push(format!(
                 "workflow missing required chat tags: {}",
-                missing.join(", ")
+                missing_required_tags.join(", ")
             ));
         }
     }
+}
 
-    let mut effective_max_iterations = requested_max_iterations;
-    if let Some(cap) = rule.max_iterations_cap {
+fn guardrail_effective_max_iterations(
+    max_iterations_cap: Option<u32>,
+    requested_max_iterations: Option<u32>,
+    reasons: &mut Vec<String>,
+) -> Option<u32> {
+    let mut resolved_max_iterations = requested_max_iterations;
+    if let Some(cap) = max_iterations_cap {
         match requested_max_iterations {
             Some(value) if value > cap => reasons.push(format!(
                 "requested max_iterations={} exceeds chat cap={}",
@@ -3032,15 +3335,11 @@ fn evaluate_chat_intent_guardrails(
             )),
             Some(_) => {}
             None => {
-                effective_max_iterations = Some(cap);
+                resolved_max_iterations = Some(cap);
             }
         }
     }
-
-    ChatIntentGuardrailOutcome {
-        reasons,
-        effective_max_iterations,
-    }
+    resolved_max_iterations
 }
 
 fn daemon_owner_concurrency_policy() -> OwnerConcurrencyPolicy {
@@ -3050,18 +3349,18 @@ fn daemon_owner_concurrency_policy() -> OwnerConcurrencyPolicy {
     let mut policy = OwnerConcurrencyPolicy::default();
 
     for item in raw.split([',', ';', '\n']) {
-        let trimmed = item.trim();
-        if trimmed.is_empty() {
+        let owner_limit_item = item.trim();
+        if owner_limit_item.is_empty() {
             continue;
         }
-        let Some((owner_raw, limit_raw)) = trimmed.split_once('=') else {
+        let Some((owner_raw, limit_raw)) = owner_limit_item.split_once('=') else {
             eprintln!(
                 "anna-rs daemon: ignoring invalid ANNA_OWNER_MAX_CONCURRENCY entry '{}'",
-                trimmed
+                owner_limit_item
             );
             continue;
         };
-        let owner = owner_raw.trim().to_ascii_lowercase();
+        let owner_key_value = owner_raw.trim().to_ascii_lowercase();
         let limit = match limit_raw.trim().parse::<usize>() {
             Ok(v) if v >= 1 => v,
             _ => {
@@ -3073,10 +3372,10 @@ fn daemon_owner_concurrency_policy() -> OwnerConcurrencyPolicy {
                 continue;
             }
         };
-        if owner == "*" {
+        if owner_key_value == "*" {
             policy.default_limit = Some(limit);
-        } else if !owner.is_empty() {
-            policy.per_owner.insert(owner, limit);
+        } else if !owner_key_value.is_empty() {
+            policy.per_owner.insert(owner_key_value, limit);
         }
     }
 
@@ -3084,10 +3383,10 @@ fn daemon_owner_concurrency_policy() -> OwnerConcurrencyPolicy {
 }
 
 fn owner_limit_for(owner: Option<&str>, policy: &OwnerConcurrencyPolicy) -> Option<usize> {
-    let owner = owner_key(owner)?;
+    let normalized_owner = owner_key(owner)?;
     policy
         .per_owner
-        .get(&owner)
+        .get(&normalized_owner)
         .copied()
         .or(policy.default_limit)
 }
@@ -3109,25 +3408,25 @@ fn env_usize_or(name: &str, default: usize) -> usize {
 
 fn flow_registry_file() -> Option<PathBuf> {
     if let Ok(raw) = std::env::var("ANNA_FLOW_REGISTRY_FILE") {
-        let trimmed = raw.trim();
-        if trimmed.is_empty()
-            || trimmed.eq_ignore_ascii_case("off")
-            || trimmed.eq_ignore_ascii_case("false")
+        let flow_registry_value = raw.trim();
+        if flow_registry_value.is_empty()
+            || flow_registry_value.eq_ignore_ascii_case("off")
+            || flow_registry_value.eq_ignore_ascii_case("false")
         {
             return None;
         }
-        return Some(PathBuf::from(trimmed));
+        return Some(PathBuf::from(flow_registry_value));
     }
     None
 }
 
 fn daemon_state_file() -> Option<PathBuf> {
     if let Ok(raw) = std::env::var("ANNA_DAEMON_STATE_FILE") {
-        let trimmed = raw.trim();
-        if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("off") {
+        let state_file_value = raw.trim();
+        if state_file_value.is_empty() || state_file_value.eq_ignore_ascii_case("off") {
             return None;
         }
-        return Some(PathBuf::from(trimmed));
+        return Some(PathBuf::from(state_file_value));
     }
     std::env::var("HOME")
         .ok()
@@ -3138,20 +3437,20 @@ fn daemon_policy_snapshot_file() -> Option<PathBuf> {
     let Ok(raw) = std::env::var("ANNA_POLICY_SNAPSHOT_FILE") else {
         return None;
     };
-    let trimmed = raw.trim();
-    if trimmed.is_empty()
-        || trimmed.eq_ignore_ascii_case("off")
-        || trimmed.eq_ignore_ascii_case("false")
+    let policy_snapshot_value = raw.trim();
+    if policy_snapshot_value.is_empty()
+        || policy_snapshot_value.eq_ignore_ascii_case("off")
+        || policy_snapshot_value.eq_ignore_ascii_case("false")
     {
         return None;
     }
-    Some(PathBuf::from(trimmed))
+    Some(PathBuf::from(policy_snapshot_value))
 }
 
 async fn load_daemon_state(
     path: &FsPath,
 ) -> Result<(HashMap<String, SessionInfo>, HashMap<String, HitlPending>)> {
-    let raw = match tokio::fs::read_to_string(path).await {
+    let daemon_state_raw = match tokio::fs::read_to_string(path).await {
         Ok(v) => v,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
             return Ok((HashMap::new(), HashMap::new()));
@@ -3162,53 +3461,54 @@ async fn load_daemon_state(
         }
     };
 
-    let mut parsed: DaemonStateSnapshot = serde_json::from_str(&raw)
+    let mut daemon_state_snapshot: DaemonStateSnapshot = serde_json::from_str(&daemon_state_raw)
         .with_context(|| format!("failed parsing daemon state file '{}'", path.display()))?;
-    let now = now_unix_secs();
-    for (id, session) in &mut parsed.sessions {
+    let recovered_at = now_unix_secs();
+    for (id, session) in &mut daemon_state_snapshot.sessions {
         if session.id.trim().is_empty() {
-            session.id = id.clone();
+            session.id = id.to_owned();
         }
         if session.status == "running" {
             session.status = "interrupted".to_string();
-            session.updated_at = now;
+            session.updated_at = recovered_at;
             session
                 .errors
                 .push("daemon restarted while session was running".to_string());
         }
     }
-    for (id, hitl) in &mut parsed.hitl {
+    for (id, hitl) in &mut daemon_state_snapshot.hitl {
         if hitl.id.trim().is_empty() {
-            hitl.id = id.clone();
+            hitl.id = id.to_owned();
         }
     }
-    Ok((parsed.sessions, parsed.hitl))
+    Ok((daemon_state_snapshot.sessions, daemon_state_snapshot.hitl))
 }
 
 async fn chat_intents_reload_loop(state: AppState, interval: Duration) {
     loop {
         sleep(interval).await;
-        let next = daemon_chat_intents();
+        let reloaded_intents = daemon_chat_intents();
         let mut write = state.chat_intents.write().await;
-        if *write != next {
-            *write = next.clone();
-            let mut routes = next
+        if *write != reloaded_intents {
+            *write = reloaded_intents.to_owned();
+            let mut reloaded_routes = reloaded_intents
                 .iter()
                 .map(|(intent, rule)| format!("{}={}", intent, rule.workflow))
                 .collect::<Vec<_>>();
-            routes.sort();
-            if routes.is_empty() {
+            reloaded_routes.sort();
+            if reloaded_routes.is_empty() {
                 println!("anna-rs chat intents reloaded: <empty>");
             } else {
-                println!("anna-rs chat intents reloaded: {}", routes.join(","));
+                let reloaded_routes_joined = reloaded_routes.join(",");
+                println!("anna-rs chat intents reloaded: {reloaded_routes_joined}");
             }
             drop(write);
             emit_audit_event(
                 &state,
                 "chat_intents_reloaded",
                 json!({
-                    "count": next.len(),
-                    "routes": routes,
+                    "count": reloaded_intents.len(),
+                    "routes": reloaded_routes,
                 }),
             )
             .await;
@@ -3226,14 +3526,14 @@ async fn state_persist_loop(state: AppState, path: PathBuf) {
 }
 
 async fn persist_daemon_state(state: &AppState, path: &FsPath) -> Result<()> {
-    let sessions = state.sessions.read().await.clone();
-    let hitl = state.hitl.read().await.clone();
-    let snapshot = DaemonStateSnapshot {
-        sessions,
-        hitl,
+    let persisted_sessions = state.sessions.read().await.clone();
+    let persisted_hitl = state.hitl.read().await.clone();
+    let persisted_state_snapshot = DaemonStateSnapshot {
+        sessions: persisted_sessions,
+        hitl: persisted_hitl,
         saved_at: now_unix_secs(),
     };
-    let raw = serde_json::to_string_pretty(&snapshot)?;
+    let daemon_state_raw_json = serde_json::to_string_pretty(&persisted_state_snapshot)?;
 
     if let Some(parent) = path.parent() {
         tokio::fs::create_dir_all(parent).await.with_context(|| {
@@ -3244,14 +3544,14 @@ async fn persist_daemon_state(state: &AppState, path: &FsPath) -> Result<()> {
         })?;
     }
 
-    let tmp = temp_state_path(path);
-    tokio::fs::write(&tmp, raw)
+    let daemon_state_tmp_path = temp_state_path(path);
+    tokio::fs::write(&daemon_state_tmp_path, daemon_state_raw_json)
         .await
-        .with_context(|| format!("failed writing daemon state temp file '{}'", tmp.display()))?;
-    tokio::fs::rename(&tmp, path).await.with_context(|| {
+        .with_context(|| format!("failed writing daemon state temp file '{}'", daemon_state_tmp_path.display()))?;
+    tokio::fs::rename(&daemon_state_tmp_path, path).await.with_context(|| {
         format!(
             "failed moving daemon state file '{}' -> '{}'",
-            tmp.display(),
+            daemon_state_tmp_path.display(),
             path.display()
         )
     })?;
@@ -3268,8 +3568,9 @@ async fn policy_snapshot_persist_loop(state: AppState, path: PathBuf) {
 }
 
 async fn persist_policy_snapshot(state: &AppState, path: &FsPath) -> Result<()> {
-    let snapshot = build_policy_snapshot(state).await;
-    let raw = serde_json::to_string_pretty(&snapshot).context("serialize policy snapshot json")?;
+    let policy_snapshot_doc = build_policy_snapshot(state).await;
+    let policy_snapshot_raw_json =
+        serde_json::to_string_pretty(&policy_snapshot_doc).context("serialize policy snapshot json")?;
 
     if let Some(parent) = path.parent() {
         tokio::fs::create_dir_all(parent).await.with_context(|| {
@@ -3280,14 +3581,14 @@ async fn persist_policy_snapshot(state: &AppState, path: &FsPath) -> Result<()> 
         })?;
     }
 
-    let tmp = temp_state_path(path);
-    tokio::fs::write(&tmp, raw)
+    let policy_snapshot_tmp_path = temp_state_path(path);
+    tokio::fs::write(&policy_snapshot_tmp_path, policy_snapshot_raw_json)
         .await
-        .with_context(|| format!("failed writing policy snapshot temp '{}'", tmp.display()))?;
-    tokio::fs::rename(&tmp, path).await.with_context(|| {
+        .with_context(|| format!("failed writing policy snapshot temp '{}'", policy_snapshot_tmp_path.display()))?;
+    tokio::fs::rename(&policy_snapshot_tmp_path, path).await.with_context(|| {
         format!(
             "failed moving policy snapshot '{}' -> '{}'",
-            tmp.display(),
+            policy_snapshot_tmp_path.display(),
             path.display()
         )
     })?;
@@ -3295,7 +3596,7 @@ async fn persist_policy_snapshot(state: &AppState, path: &FsPath) -> Result<()> 
 }
 
 async fn build_policy_snapshot(state: &AppState) -> serde_json::Value {
-    let trigger = state.trigger_leader_state.read().await.clone();
+    let trigger_state_snapshot = state.trigger_leader_state.read().await.clone();
     let policy_core = build_policy_core(state).await;
     let (policy_revision, policy_signature) =
         policy_revision_and_signature(&policy_core, state.policy_signing_key.as_deref());
@@ -3315,22 +3616,42 @@ async fn build_policy_snapshot(state: &AppState) -> serde_json::Value {
         "chat_intents": policy_core["chat_intents"].clone(),
         "trigger_policy": policy_core["trigger_policy"].clone(),
         "trigger_scheduler": {
-            "enabled": trigger.enabled,
-            "is_leader": trigger.is_leader,
-            "node_id": trigger.node_id,
-            "holder": trigger.holder,
-            "expires_at": trigger.expires_at,
-            "lease_file": trigger.lease_file,
+            "enabled": trigger_state_snapshot.enabled,
+            "is_leader": trigger_state_snapshot.is_leader,
+            "node_id": trigger_state_snapshot.node_id,
+            "holder": trigger_state_snapshot.holder,
+            "expires_at": trigger_state_snapshot.expires_at,
+            "lease_file": trigger_state_snapshot.lease_file,
         },
         "policy_core": policy_core,
     })
 }
 
 async fn build_policy_core(state: &AppState) -> serde_json::Value {
-    let trigger = state.trigger_leader_state.read().await.clone();
-    let chat_intents = state.chat_intents.read().await.clone();
+    let trigger_state_core = state.trigger_leader_state.read().await.clone();
+    let chat_intents_snapshot = state.chat_intents.read().await.clone();
+    let owner_limit_entries_json = owner_limit_entries_json(state);
+    let chat_map = chat_intents_policy_map(chat_intents_snapshot);
 
-    let mut owner_limits = state
+    json!({
+        "registry_enabled": state.registry_file.is_some(),
+        "auth_enabled": state.auth_token.is_some(),
+        "offline_mode": state.offline_mode,
+        "node_capabilities": sorted_set_values(Some(&state.node_capabilities)),
+        "allowed_providers": sorted_set_values(state.allowed_providers.as_ref()),
+        "owner_limits": owner_limit_entries_json,
+        "owner_default_limit": state.owner_policy.default_limit,
+        "chat_intents": chat_map,
+        "trigger_policy": {
+            "leader_election_enabled": trigger_state_core.enabled,
+            "node_id": trigger_state_core.node_id,
+            "lease_file": trigger_state_core.lease_file,
+        },
+    })
+}
+
+fn owner_limit_entries_json(state: &AppState) -> Vec<Value> {
+    let mut owner_entries = state
         .owner_policy
         .per_owner
         .iter()
@@ -3341,18 +3662,23 @@ async fn build_policy_core(state: &AppState) -> serde_json::Value {
             })
         })
         .collect::<Vec<_>>();
-    owner_limits.sort_by(|a, b| {
+    owner_entries.sort_by(|a, b| {
         a.get("owner")
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .cmp(b.get("owner").and_then(|v| v.as_str()).unwrap_or(""))
     });
+    owner_entries
+}
 
-    let mut chat_routes = chat_intents.into_iter().collect::<Vec<_>>();
+fn chat_intents_policy_map(
+    chat_intents_snapshot: HashMap<String, ChatIntentConfig>,
+) -> serde_json::Map<String, Value> {
+    let mut chat_routes = chat_intents_snapshot.into_iter().collect::<Vec<_>>();
     chat_routes.sort_by(|a, b| a.0.cmp(&b.0));
-    let mut chat_map = serde_json::Map::new();
+    let mut intent_map = serde_json::Map::new();
     for (intent, rule) in chat_routes {
-        chat_map.insert(
+        intent_map.insert(
             intent,
             json!({
                 "workflow": rule.workflow,
@@ -3363,22 +3689,7 @@ async fn build_policy_core(state: &AppState) -> serde_json::Value {
             }),
         );
     }
-
-    json!({
-        "registry_enabled": state.registry_file.is_some(),
-        "auth_enabled": state.auth_token.is_some(),
-        "offline_mode": state.offline_mode,
-        "node_capabilities": sorted_set_values(Some(&state.node_capabilities)),
-        "allowed_providers": sorted_set_values(state.allowed_providers.as_ref()),
-        "owner_limits": owner_limits,
-        "owner_default_limit": state.owner_policy.default_limit,
-        "chat_intents": chat_map,
-        "trigger_policy": {
-            "leader_election_enabled": trigger.enabled,
-            "node_id": trigger.node_id,
-            "lease_file": trigger.lease_file,
-        },
-    })
+    intent_map
 }
 
 fn policy_revision_and_signature(
@@ -3396,10 +3707,10 @@ fn policy_revision_and_signature(
 }
 
 fn temp_state_path(path: &FsPath) -> PathBuf {
-    let mut tmp = path.to_path_buf();
+    let mut tmp_path_state = path.to_path_buf();
     if let Some(name) = path.file_name().and_then(|v| v.to_str()) {
-        tmp.set_file_name(format!("{}.tmp", name));
-        return tmp;
+        tmp_path_state.set_file_name(format!("{}.tmp", name));
+        return tmp_path_state;
     }
     path.with_extension("tmp")
 }
@@ -3432,20 +3743,20 @@ fn prune_hitl_in_place(hitl: &mut HashMap<String, HitlPending>, max_hitl: usize)
         return;
     }
 
-    let mut removable = hitl
+    let mut removable_hitl = hitl
         .iter()
         .filter(|(_, h)| h.status == "resolved")
         .map(|(id, h)| (id.clone(), h.created_at))
         .collect::<Vec<_>>();
-    removable.sort_by_key(|(_, created_at)| *created_at);
+    removable_hitl.sort_by_key(|(_, created_at)| *created_at);
 
-    let mut remove_count = hitl.len().saturating_sub(max_hitl);
-    for (id, _) in removable {
-        if remove_count == 0 {
+    let mut hitl_remove_count = hitl.len().saturating_sub(max_hitl);
+    for (id, _) in removable_hitl {
+        if hitl_remove_count == 0 {
             break;
         }
         if hitl.remove(&id).is_some() {
-            remove_count -= 1;
+            hitl_remove_count -= 1;
         }
     }
 }
@@ -3460,27 +3771,27 @@ fn etag_value(revision: &str) -> String {
     format!("\"{}\"", revision.trim())
 }
 
-fn normalize_etag_token(token: &str) -> Option<String> {
-    let mut trimmed = token.trim();
-    if let Some(rest) = trimmed.strip_prefix("W/") {
-        trimmed = rest.trim();
+fn normalize_etag_value(raw_etag: &str) -> Option<String> {
+    let mut normalized_etag_candidate = raw_etag.trim();
+    if let Some(rest) = normalized_etag_candidate.strip_prefix("W/") {
+        normalized_etag_candidate = rest.trim();
     }
-    let stripped = trimmed.strip_prefix('"')?.strip_suffix('"')?;
-    let out = stripped.trim();
-    if out.is_empty() {
+    let stripped = normalized_etag_candidate.strip_prefix('"')?.strip_suffix('"')?;
+    let normalized_etag = stripped.trim();
+    if normalized_etag.is_empty() {
         return None;
     }
-    Some(out.to_string())
+    Some(normalized_etag.to_string())
 }
 
 fn etag_header_matches_value(raw: &str, revision: &str) -> bool {
-    let revision = revision.trim();
+    let revision_trimmed = revision.trim();
     raw.split(',')
         .map(str::trim)
         .any(|candidate| match candidate {
             "*" => true,
-            other => normalize_etag_token(other)
-                .map(|tag| tag == revision)
+            other => normalize_etag_value(other)
+                .map(|tag| tag == revision_trimmed)
                 .unwrap_or(false),
         })
 }
@@ -3501,19 +3812,19 @@ fn if_match_allows(headers: &HeaderMap, revision: &str) -> bool {
 }
 
 fn not_modified_with_etag(revision: &str) -> axum::response::Response {
-    let mut response = StatusCode::NOT_MODIFIED.into_response();
-    set_etag_header(&mut response, revision);
-    response
+    let mut not_modified_response = StatusCode::NOT_MODIFIED.into_response();
+    set_etag_header(&mut not_modified_response, revision);
+    not_modified_response
 }
 
 fn precondition_failed_with_etag(revision: &str) -> axum::response::Response {
-    let mut response = (
+    let mut precondition_response = (
         StatusCode::PRECONDITION_FAILED,
         "policy revision precondition failed",
     )
         .into_response();
-    set_etag_header(&mut response, revision);
-    response
+    set_etag_header(&mut precondition_response, revision);
+    precondition_response
 }
 
 fn ensure_authorized(state: &AppState, headers: &HeaderMap) -> Option<axum::response::Response> {
@@ -3569,7 +3880,7 @@ fn workflow_public_id(entry: &WorkflowEntry) -> String {
         .flow_id
         .as_ref()
         .filter(|v| !v.trim().is_empty())
-        .cloned()
+        .map(ToOwned::to_owned)
         .unwrap_or_else(|| entry.file_name.clone())
 }
 
@@ -3585,7 +3896,7 @@ fn build_running_indexes(
     let mut by_workflow = HashMap::new();
     let mut by_owner = HashMap::new();
     for session in sessions.values().filter(|v| v.status == "running") {
-        *by_workflow.entry(session.workflow.clone()).or_insert(0) += 1;
+        *by_workflow.entry(session.workflow.to_owned()).or_insert(0) += 1;
         if let Some(owner) = owner_key(session.owner.as_deref()) {
             *by_owner.entry(owner).or_insert(0) += 1;
         }
@@ -3611,12 +3922,12 @@ fn matches_workflow_meta_filters(
     }
 
     if let Some(required) = owner_filter {
-        let owner = item
+        let normalized_owner_filter = item
             .owner
             .as_deref()
             .map(|v| v.trim().to_ascii_lowercase())
             .unwrap_or_default();
-        if owner != required {
+        if normalized_owner_filter != required {
             return false;
         }
     }
@@ -3643,38 +3954,38 @@ async fn find_workflows_with_registry(
     root: &FsPath,
     registry_file: Option<&FsPath>,
 ) -> Result<Vec<String>> {
-    let mut out = find_workflow_entries_with_registry(root, registry_file)
+    let mut workflow_ids = find_workflow_entries_with_registry(root, registry_file)
         .await?
         .into_iter()
         .map(|v| workflow_public_id(&v))
         .collect::<Vec<_>>();
-    out.sort();
-    out.dedup();
-    Ok(out)
+    workflow_ids.sort();
+    workflow_ids.dedup();
+    Ok(workflow_ids)
 }
 
 async fn read_session_logs(runtime_session_id: &str) -> Result<HashMap<String, String>> {
-    let mut out = HashMap::new();
+    let mut session_logs = HashMap::new();
     let dir_path = session_dir(runtime_session_id);
-    let mut dir = tokio::fs::read_dir(&dir_path).await?;
-    while let Some(entry) = dir.next_entry().await? {
-        let path = entry.path();
-        if path.is_file()
-            && path
+    let mut read_dir_handle = tokio::fs::read_dir(&dir_path).await?;
+    while let Some(entry) = read_dir_handle.next_entry().await? {
+        let log_file_path = entry.path();
+        if log_file_path.is_file()
+            && log_file_path
                 .extension()
                 .and_then(|e| e.to_str())
                 .map(|e| e == "log")
                 .unwrap_or(false)
-            && let Some(stage_id) = path
+            && let Some(stage_id) = log_file_path
                 .file_stem()
                 .and_then(|s| s.to_str())
-                .map(|s| s.to_string())
+                .map(str::to_owned)
         {
-            let content = tokio::fs::read_to_string(&path).await.unwrap_or_default();
-            out.insert(stage_id, content);
+            let content = tokio::fs::read_to_string(&log_file_path).await.unwrap_or_default();
+            session_logs.insert(stage_id, content);
         }
     }
-    Ok(out)
+    Ok(session_logs)
 }
 
 async fn stream_logs(mut socket: WebSocket, state: AppState, req_id: String) {
@@ -3684,7 +3995,7 @@ async fn stream_logs(mut socket: WebSocket, state: AppState, req_id: String) {
         let (payload, should_close) = build_ws_payload(&state, &req_id).await;
         if payload != last_payload {
             if socket
-                .send(Message::Text(payload.clone().into()))
+                .send(Message::Text(payload.as_str().into()))
                 .await
                 .is_err()
             {
@@ -3701,16 +4012,16 @@ async fn stream_logs(mut socket: WebSocket, state: AppState, req_id: String) {
 }
 
 async fn build_ws_payload(state: &AppState, req_id: &str) -> (String, bool) {
-    let info = { state.sessions.read().await.get(req_id).cloned() };
-    let Some(info) = info else {
-        let frame = WsLogFrame {
+    let session_info_opt = { state.sessions.read().await.get(req_id).cloned() };
+    let Some(info) = session_info_opt else {
+        let ws_frame_not_found = WsLogFrame {
             id: req_id.to_string(),
             status: "not_found".to_string(),
             runtime_session_id: None,
             logs: HashMap::new(),
             errors: vec!["session not found".to_string()],
         };
-        return (to_json(frame), true);
+        return (to_json(ws_frame_not_found), true);
     };
 
     let logs = match info.runtime_session_id.as_deref() {
@@ -3718,14 +4029,14 @@ async fn build_ws_payload(state: &AppState, req_id: &str) -> (String, bool) {
         None => HashMap::new(),
     };
     let should_close = matches!(info.status.as_str(), "done" | "failed" | "stopped");
-    let frame = WsLogFrame {
+    let ws_frame = WsLogFrame {
         id: info.id,
         status: info.status,
         runtime_session_id: info.runtime_session_id,
         logs,
         errors: info.errors,
     };
-    (to_json(frame), should_close)
+    (to_json(ws_frame), should_close)
 }
 
 fn to_json(frame: WsLogFrame) -> String {
@@ -3785,71 +4096,84 @@ enum TriggerLaunchOutcome {
 }
 
 async fn load_flow_registry(path: &FsPath) -> Result<Vec<FlowRegistryEntry>> {
-    let raw = tokio::fs::read_to_string(path)
+    let registry_raw_doc = tokio::fs::read_to_string(path)
         .await
         .with_context(|| format!("failed reading flow registry '{}'", path.display()))?;
-    let parsed: FlowRegistryDoc = serde_yaml::from_str(&raw)
+    let registry_doc: FlowRegistryDoc = serde_yaml::from_str(&registry_raw_doc)
         .with_context(|| format!("failed parsing flow registry '{}'", path.display()))?;
 
-    let mut entries = match parsed {
+    let mut registry_entries_value = match registry_doc {
         FlowRegistryDoc::Wrapped { flows } => flows,
         FlowRegistryDoc::List(items) => items,
     };
-    if entries.is_empty() {
+    if registry_entries_value.is_empty() {
         bail!("flow registry '{}' has no entries", path.display());
     }
 
-    let mut flow_ids = HashSet::new();
-    for item in &mut entries {
-        item.flow_id = item.flow_id.trim().to_string();
-        item.path = item.path.trim().to_string();
-        item.owner = item
-            .owner
-            .as_ref()
-            .map(|v| v.trim().to_string())
-            .filter(|v| !v.is_empty());
-        item.version = item
-            .version
-            .as_ref()
-            .map(|v| v.trim().to_string())
-            .filter(|v| !v.is_empty());
-        if item.flow_id.is_empty() {
-            bail!(
-                "flow registry '{}' has entry with empty flow_id",
-                path.display()
-            );
-        }
-        if item.path.is_empty() {
-            bail!(
-                "flow registry '{}' has entry '{}' with empty path",
-                path.display(),
-                item.flow_id
-            );
-        }
-        if !flow_ids.insert(item.flow_id.clone()) {
-            bail!(
-                "flow registry '{}' has duplicate flow_id '{}'",
-                path.display(),
-                item.flow_id
-            );
-        }
-        if item.max_concurrency == Some(0) {
-            bail!(
-                "flow registry '{}' has entry '{}' with invalid max_concurrency=0",
-                path.display(),
-                item.flow_id
-            );
-        }
+    let mut seen_flow_ids = HashSet::new();
+    for registry_entry in &mut registry_entries_value {
+        normalize_registry_entry_fields(registry_entry);
+        validate_registry_entry_or_bail(registry_entry, path, &mut seen_flow_ids)?;
     }
-    Ok(entries)
+    Ok(registry_entries_value)
+}
+
+fn normalize_registry_entry_fields(registry_entry: &mut FlowRegistryEntry) {
+    registry_entry.flow_id = registry_entry.flow_id.trim().to_string();
+    registry_entry.path = registry_entry.path.trim().to_string();
+    registry_entry.owner = registry_entry
+        .owner
+        .as_ref()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty());
+    registry_entry.version = registry_entry
+        .version
+        .as_ref()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty());
+}
+
+fn validate_registry_entry_or_bail(
+    registry_entry: &FlowRegistryEntry,
+    path: &FsPath,
+    seen_flow_ids: &mut HashSet<String>,
+) -> Result<()> {
+    if registry_entry.flow_id.is_empty() {
+        bail!(
+            "flow registry '{}' has entry with empty flow_id",
+            path.display()
+        );
+    }
+    if registry_entry.path.is_empty() {
+        bail!(
+            "flow registry '{}' has entry '{}' with empty path",
+            path.display(),
+            registry_entry.flow_id
+        );
+    }
+    if !seen_flow_ids.insert(registry_entry.flow_id.to_owned()) {
+        bail!(
+            "flow registry '{}' has duplicate flow_id '{}'",
+            path.display(),
+            registry_entry.flow_id
+        );
+    }
+    if registry_entry.max_concurrency == Some(0) {
+        bail!(
+            "flow registry '{}' has entry '{}' with invalid max_concurrency=0",
+            path.display(),
+            registry_entry.flow_id
+        );
+    }
+    Ok(())
 }
 
 fn resolve_registry_workflow_path(plays_dir: &FsPath, raw_path: &str) -> PathBuf {
-    let path = PathBuf::from(raw_path.trim());
-    if path.is_absolute() {
-        path
+    let resolved_path = PathBuf::from(raw_path.trim());
+    if resolved_path.is_absolute() {
+        resolved_path
     } else {
-        plays_dir.join(path)
+        plays_dir.join(resolved_path)
     }
 }
 
@@ -3858,55 +4182,55 @@ async fn find_workflow_entries_with_registry(
     registry_file: Option<&FsPath>,
 ) -> Result<Vec<WorkflowEntry>> {
     if let Some(registry_path) = registry_file {
-        let registry_entries = load_flow_registry(registry_path).await?;
-        let mut out = Vec::new();
-        for spec in registry_entries {
-            let path = resolve_registry_workflow_path(root, &spec.path);
-            let wf = Workflow::load(&path).with_context(|| {
+        let loaded_registry_entries = load_flow_registry(registry_path).await?;
+        let mut registry_workflow_entries = Vec::new();
+        for spec in loaded_registry_entries {
+            let registry_workflow_path = resolve_registry_workflow_path(root, &spec.path);
+            let registry_workflow = Workflow::load(&registry_workflow_path).with_context(|| {
                 format!(
                     "flow registry '{}' entry '{}' points to invalid workflow '{}'",
                     registry_path.display(),
                     spec.flow_id,
-                    path.display()
+                    registry_workflow_path.display()
                 )
             })?;
-            let file_name = path
+            let file_name = registry_workflow_path
                 .file_name()
                 .and_then(|n| n.to_str())
                 .map(|s| s.to_string())
                 .ok_or_else(|| {
-                    anyhow::anyhow!("invalid workflow filename in '{}'", path.display())
+                    anyhow::anyhow!("invalid workflow filename in '{}'", registry_workflow_path.display())
                 })?;
-            let required_providers = collect_required_providers(&wf);
-            out.push(WorkflowEntry {
+            let registry_required_providers = collect_required_providers(&registry_workflow);
+            registry_workflow_entries.push(WorkflowEntry {
                 file_name,
                 flow_id: Some(spec.flow_id),
-                workflow_name: wf.name,
-                path,
+                workflow_name: registry_workflow.name,
+                path: registry_workflow_path,
                 tags: spec.tags,
                 required_capabilities: spec.required_capabilities,
-                required_providers,
+                required_providers: registry_required_providers,
                 owner: spec.owner,
                 version: spec.version,
                 max_concurrency: spec.max_concurrency,
-                trigger_webhook: wf.trigger.webhook,
-                trigger_watch: wf.trigger.watch,
-                trigger_cron: wf.trigger.cron,
-                trigger_interval: wf.trigger.interval,
-                workflow_workdir: wf.workdir,
+                trigger_webhook: registry_workflow.trigger.webhook,
+                trigger_watch: registry_workflow.trigger.watch,
+                trigger_cron: registry_workflow.trigger.cron,
+                trigger_interval: registry_workflow.trigger.interval,
+                workflow_workdir: registry_workflow.workdir,
             });
         }
-        return Ok(out);
+        return Ok(registry_workflow_entries);
     }
 
-    let mut out = Vec::new();
-    let mut dir = tokio::fs::read_dir(root).await?;
-    while let Some(entry) = dir.next_entry().await? {
-        let path = entry.path();
-        if !path.is_file() {
+    let mut discovered_workflow_entries = Vec::new();
+    let mut root_dir_reader = tokio::fs::read_dir(root).await?;
+    while let Some(entry) = root_dir_reader.next_entry().await? {
+        let workflow_path = entry.path();
+        if !workflow_path.is_file() {
             continue;
         }
-        if !path
+        if !workflow_path
             .extension()
             .and_then(|e| e.to_str())
             .map(|e| e == "anna")
@@ -3914,7 +4238,7 @@ async fn find_workflow_entries_with_registry(
         {
             continue;
         }
-        let Some(file_name) = path
+        let Some(file_name) = workflow_path
             .file_name()
             .and_then(|n| n.to_str())
             .map(|s| s.to_string())
@@ -3922,30 +4246,30 @@ async fn find_workflow_entries_with_registry(
             continue;
         };
 
-        let wf = match Workflow::load(&path) {
+        let discovered_workflow = match Workflow::load(&workflow_path) {
             Ok(v) => v,
             Err(_) => continue,
         };
-        let required_providers = collect_required_providers(&wf);
-        out.push(WorkflowEntry {
+        let discovered_required_providers = collect_required_providers(&discovered_workflow);
+        discovered_workflow_entries.push(WorkflowEntry {
             file_name,
             flow_id: None,
-            workflow_name: wf.name,
-            path,
+            workflow_name: discovered_workflow.name,
+            path: workflow_path,
             tags: vec![],
             required_capabilities: vec![],
-            required_providers,
+            required_providers: discovered_required_providers,
             owner: None,
             version: None,
             max_concurrency: None,
-            trigger_webhook: wf.trigger.webhook,
-            trigger_watch: wf.trigger.watch,
-            trigger_cron: wf.trigger.cron,
-            trigger_interval: wf.trigger.interval,
-            workflow_workdir: wf.workdir,
+            trigger_webhook: discovered_workflow.trigger.webhook,
+            trigger_watch: discovered_workflow.trigger.watch,
+            trigger_cron: discovered_workflow.trigger.cron,
+            trigger_interval: discovered_workflow.trigger.interval,
+            workflow_workdir: discovered_workflow.workdir,
         });
     }
-    Ok(out)
+    Ok(discovered_workflow_entries)
 }
 
 async fn resolve_registered_workflow_entry_with_registry(
@@ -3954,21 +4278,21 @@ async fn resolve_registered_workflow_entry_with_registry(
     name: &str,
 ) -> Result<Option<WorkflowEntry>> {
     let normalized = name.trim();
-    let entries = find_workflow_entries_with_registry(root, registry_file).await?;
-    for entry in &entries {
+    let registry_or_discovered_entries = find_workflow_entries_with_registry(root, registry_file).await?;
+    for entry in &registry_or_discovered_entries {
         if entry.file_name == normalized
             || entry.workflow_name == normalized
             || entry.flow_id.as_deref() == Some(normalized)
         {
-            return Ok(Some(entry.clone()));
+            return Ok(Some(entry.to_owned()));
         }
     }
 
     if !normalized.ends_with(".anna") {
-        let candidate = format!("{}.anna", normalized);
-        for entry in &entries {
-            if entry.file_name == candidate {
-                return Ok(Some(entry.clone()));
+        let candidate_file_name = format!("{}.anna", normalized);
+        for entry in &registry_or_discovered_entries {
+            if entry.file_name == candidate_file_name {
+                return Ok(Some(entry.to_owned()));
             }
         }
     }
@@ -3981,56 +4305,53 @@ async fn launch_workflow_from_entry(
     trigger_source: &str,
 ) -> Result<TriggerLaunchOutcome> {
     let (running, owner_running) = running_counts_for_entry(state, entry).await;
-    let owner_max_concurrency = owner_limit_for(entry.owner.as_deref(), &state.owner_policy);
-    let readiness = evaluate_flow_readiness(
+    let owner_limit_launch = owner_limit_for(entry.owner.as_deref(), &state.owner_policy);
+    let readiness_launch = evaluate_flow_readiness(
         entry,
         &state.node_capabilities,
         state.allowed_providers.as_ref(),
-        running,
-        Some(1),
-        owner_running,
-        owner_max_concurrency,
+        flow_readiness_runtime(running, Some(1), owner_running, owner_limit_launch),
     );
-    if !readiness.missing_capabilities.is_empty() {
+    if !readiness_launch.missing_capabilities.is_empty() {
         println!(
             "anna-rs daemon trigger={} workflow='{}' skipped: missing capabilities [{}]",
             trigger_source,
             entry.workflow_name,
-            readiness.missing_capabilities.join(", ")
+            readiness_launch.missing_capabilities.join(", ")
         );
         return Ok(TriggerLaunchOutcome::SkippedCapability(
-            readiness.missing_capabilities,
+            readiness_launch.missing_capabilities,
         ));
     }
-    if !readiness.missing_providers.is_empty() {
+    if !readiness_launch.missing_providers.is_empty() {
         println!(
             "anna-rs daemon trigger={} workflow='{}' skipped: blocked providers [{}]",
             trigger_source,
             entry.workflow_name,
-            readiness.missing_providers.join(", ")
+            readiness_launch.missing_providers.join(", ")
         );
         return Ok(TriggerLaunchOutcome::SkippedProvider(
-            readiness.missing_providers,
+            readiness_launch.missing_providers,
         ));
     }
 
-    if readiness.owner_concurrency_blocked {
+    if readiness_launch.owner_concurrency_blocked {
         println!(
             "anna-rs daemon trigger={} workflow='{}' skipped: owner limit running={} max={}",
             trigger_source,
             entry.workflow_name,
-            readiness.owner_running,
-            readiness.owner_max_concurrency.unwrap_or(0)
+            readiness_launch.owner_running,
+            readiness_launch.owner_max_concurrency.unwrap_or(0)
         );
         return Ok(TriggerLaunchOutcome::SkippedConcurrency {
-            running: readiness.owner_running,
-            max_concurrency: readiness.owner_max_concurrency.unwrap_or(0),
+            running: readiness_launch.owner_running,
+            max_concurrency: readiness_launch.owner_max_concurrency.unwrap_or(0),
         });
     }
 
-    if readiness.concurrency_blocked {
-        let max_concurrency = readiness.max_concurrency.unwrap_or(1);
-        if max_concurrency == 1 {
+    if readiness_launch.concurrency_blocked {
+        let readiness_max_concurrency = readiness_launch.max_concurrency.unwrap_or(1);
+        if readiness_max_concurrency == 1 {
             println!(
                 "anna-rs daemon trigger={} workflow='{}' skipped: already running",
                 trigger_source, entry.workflow_name
@@ -4039,33 +4360,34 @@ async fn launch_workflow_from_entry(
         }
         println!(
             "anna-rs daemon trigger={} workflow='{}' skipped: concurrency limit running={} max={}",
-            trigger_source, entry.workflow_name, readiness.running, max_concurrency
+            trigger_source, entry.workflow_name, readiness_launch.running, readiness_max_concurrency
         );
         return Ok(TriggerLaunchOutcome::SkippedConcurrency {
-            running: readiness.running,
-            max_concurrency,
+            running: readiness_launch.running,
+            max_concurrency: readiness_max_concurrency,
         });
     }
 
-    let mut wf = Workflow::load(&entry.path)?;
-    if wf.workdir.is_none() {
-        wf.workdir = Some(state.plays_dir.display().to_string());
+    let mut workflow_to_launch = Workflow::load(&entry.path)?;
+    if workflow_to_launch.workdir.is_none() {
+        workflow_to_launch.workdir = Some(state.plays_dir.display().to_string());
     }
     let source = format!("trigger:{}", trigger_source);
-    let req_id = launch_workflow(state, wf, None, entry.owner.clone(), &source).await?;
+    let launched_req_id_trigger =
+        launch_workflow(state, workflow_to_launch, None, entry.owner.clone(), &source).await?;
     println!(
         "anna-rs daemon trigger={} workflow='{}' request_id={}",
-        trigger_source, entry.workflow_name, req_id
+        trigger_source, entry.workflow_name, launched_req_id_trigger
     );
-    Ok(TriggerLaunchOutcome::Launched(req_id))
+    Ok(TriggerLaunchOutcome::Launched(launched_req_id_trigger))
 }
 
 async fn running_counts_for_entry(state: &AppState, entry: &WorkflowEntry) -> (usize, usize) {
     let target_owner = owner_key(entry.owner.as_deref());
-    let sessions = state.sessions.read().await;
+    let sessions_guard_running = state.sessions.read().await;
     let mut running_workflow = 0usize;
     let mut running_owner = 0usize;
-    for session in sessions.values().filter(|s| s.status == "running") {
+    for session in sessions_guard_running.values().filter(|s| s.status == "running") {
         if session.workflow == entry.workflow_name {
             running_workflow += 1;
         }
@@ -4086,65 +4408,62 @@ async fn launch_registered_entry_with_options(
     launch_source: &str,
 ) -> std::result::Result<String, axum::response::Response> {
     let (running, owner_running) = running_counts_for_entry(state, entry).await;
-    let owner_max_concurrency = owner_limit_for(entry.owner.as_deref(), &state.owner_policy);
-    let readiness = evaluate_flow_readiness(
+    let owner_limit_registered_launch = owner_limit_for(entry.owner.as_deref(), &state.owner_policy);
+    let readiness_registered_launch = evaluate_flow_readiness(
         entry,
         &state.node_capabilities,
         state.allowed_providers.as_ref(),
-        running,
-        None,
-        owner_running,
-        owner_max_concurrency,
+        flow_readiness_runtime(running, None, owner_running, owner_limit_registered_launch),
     );
-    if !readiness.missing_capabilities.is_empty() {
+    if !readiness_registered_launch.missing_capabilities.is_empty() {
         return Err((
             StatusCode::FORBIDDEN,
             format!(
                 "workflow '{}' requires missing capabilities: {}",
                 requested_name,
-                readiness.missing_capabilities.join(", ")
+                readiness_registered_launch.missing_capabilities.join(", ")
             ),
         )
             .into_response());
     }
-    if !readiness.missing_providers.is_empty() {
+    if !readiness_registered_launch.missing_providers.is_empty() {
         return Err((
             StatusCode::FORBIDDEN,
             format!(
                 "workflow '{}' requires blocked providers: {}",
                 requested_name,
-                readiness.missing_providers.join(", ")
+                readiness_registered_launch.missing_providers.join(", ")
             ),
         )
             .into_response());
     }
-    if readiness.owner_concurrency_blocked {
+    if readiness_registered_launch.owner_concurrency_blocked {
         return Err((
             StatusCode::TOO_MANY_REQUESTS,
             format!(
                 "workflow '{}' owner concurrency limit reached: owner='{}' running={} max_concurrency={}",
                 requested_name,
                 entry.owner.as_deref().unwrap_or(""),
-                readiness.owner_running,
-                readiness.owner_max_concurrency.unwrap_or(0)
+                readiness_registered_launch.owner_running,
+                readiness_registered_launch.owner_max_concurrency.unwrap_or(0)
             ),
         )
             .into_response());
     }
-    if readiness.concurrency_blocked {
+    if readiness_registered_launch.concurrency_blocked {
         return Err((
             StatusCode::TOO_MANY_REQUESTS,
             format!(
                 "workflow '{}' concurrency limit reached: running={} max_concurrency={}",
                 requested_name,
-                readiness.running,
-                readiness.max_concurrency.unwrap_or(0)
+                readiness_registered_launch.running,
+                readiness_registered_launch.max_concurrency.unwrap_or(0)
             ),
         )
             .into_response());
     }
 
-    let mut workflow = match Workflow::load(&entry.path) {
+    let mut loaded_workflow_registered = match Workflow::load(&entry.path) {
         Ok(v) => v,
         Err(err) => {
             return Err((
@@ -4154,14 +4473,14 @@ async fn launch_registered_entry_with_options(
                 .into_response());
         }
     };
-    if workflow.workdir.is_none() {
-        workflow.workdir = Some(state.plays_dir.display().to_string());
+    if loaded_workflow_registered.workdir.is_none() {
+        loaded_workflow_registered.workdir = Some(state.plays_dir.display().to_string());
     }
-    workflow.vars.extend(options.vars);
+    loaded_workflow_registered.vars.extend(options.vars);
 
     match launch_workflow(
         state,
-        workflow,
+        loaded_workflow_registered,
         options.max_iterations,
         entry.owner.clone(),
         launch_source,
@@ -4181,21 +4500,21 @@ fn parse_run_registered_options(body: &str) -> Result<RunRegisteredOptions> {
     if body.trim().is_empty() {
         return Ok(RunRegisteredOptions::default());
     }
-    let parsed = serde_json::from_str::<RunRegisteredOptions>(body)
+    let run_options_parsed = serde_json::from_str::<RunRegisteredOptions>(body)
         .context("invalid run options json body, expected {\"vars\":{...},\"max_iterations\":N}")?;
-    Ok(parsed)
+    Ok(run_options_parsed)
 }
 
 fn parse_chat_run_request(body: &str) -> Result<ChatRunRequest> {
     if body.trim().is_empty() {
         bail!("chat run body is required, expected {{\"intent\":\"...\"}}");
     }
-    let parsed = serde_json::from_str::<ChatRunRequest>(body)
+    let chat_run_parsed = serde_json::from_str::<ChatRunRequest>(body)
         .context("invalid chat run json body, expected {\"intent\":\"...\",\"vars\":{...},\"max_iterations\":N}")?;
-    if parsed.intent.trim().is_empty() {
+    if chat_run_parsed.intent.trim().is_empty() {
         bail!("chat run requires non-empty 'intent'");
     }
-    Ok(parsed)
+    Ok(chat_run_parsed)
 }
 
 async fn launch_workflow(
@@ -4205,34 +4524,34 @@ async fn launch_workflow(
     owner: Option<String>,
     launch_source: &str,
 ) -> Result<String> {
-    let req_id = crate::session::gen_session_id();
+    let new_req_id = crate::session::gen_session_id();
     let runtime_session_id = crate::session::gen_session_id();
     let workflow_name = workflow.name.clone();
     let owner_for_audit = owner.clone();
-    let now = now_unix_secs();
+    let launched_at_unix = now_unix_secs();
     {
-        let mut sessions = state.sessions.write().await;
-        sessions.insert(
-            req_id.clone(),
+        let mut sessions_guard_launch_insert = state.sessions.write().await;
+        sessions_guard_launch_insert.insert(
+            new_req_id.clone(),
             SessionInfo {
-                id: req_id.clone(),
+                id: new_req_id.clone(),
                 status: "running".to_string(),
                 workflow: workflow_name.clone(),
                 owner: owner.clone(),
-                created_at: now,
-                updated_at: now,
+                created_at: launched_at_unix,
+                updated_at: launched_at_unix,
                 runtime_session_id: Some(runtime_session_id.clone()),
                 outputs: HashMap::new(),
                 errors: Vec::new(),
             },
         );
-        prune_sessions_in_place(&mut sessions, state.retention.max_sessions);
+        prune_sessions_in_place(&mut sessions_guard_launch_insert, state.retention.max_sessions);
     }
     emit_audit_event(
         state,
         "workflow_launched",
         json!({
-            "request_id": req_id.clone(),
+            "request_id": new_req_id.clone(),
             "runtime_session_id": runtime_session_id.clone(),
             "workflow": workflow_name.clone(),
             "owner": owner_for_audit.clone(),
@@ -4243,7 +4562,7 @@ async fn launch_workflow(
     .await;
 
     let state_for_task = state.clone();
-    let req_id_for_task = req_id.clone();
+    let req_id_for_task = new_req_id.clone();
     let workflow_name_for_task = workflow.name.clone();
     let source_for_task = launch_source.to_string();
     let owner_for_task = owner.clone();
@@ -4262,13 +4581,13 @@ async fn launch_workflow(
             .await;
         let elapsed_ms = started.elapsed().as_millis() as u64;
 
-        let mut sessions = state_for_task.sessions.write().await;
+        let mut sessions_guard_task_update = state_for_task.sessions.write().await;
         let event_data = match run {
             Ok(result) => {
                 let runtime_id = result.session_id.clone();
                 let outputs_count = result.outputs.len();
                 let errors_count = result.errors.len();
-                if let Some(info) = sessions.get_mut(&req_id_for_task) {
+                if let Some(info) = sessions_guard_task_update.get_mut(&req_id_for_task) {
                     info.status = "done".to_string();
                     info.updated_at = now_unix_secs();
                     info.runtime_session_id = Some(runtime_id.clone());
@@ -4289,7 +4608,7 @@ async fn launch_workflow(
             }
             Err(err) => {
                 let message = err.to_string();
-                if let Some(info) = sessions.get_mut(&req_id_for_task) {
+                if let Some(info) = sessions_guard_task_update.get_mut(&req_id_for_task) {
                     info.status = "failed".to_string();
                     info.updated_at = now_unix_secs();
                     info.errors.push(message.clone());
@@ -4306,8 +4625,11 @@ async fn launch_workflow(
                 })
             }
         };
-        prune_sessions_in_place(&mut sessions, state_for_task.retention.max_sessions);
-        drop(sessions);
+        prune_sessions_in_place(
+            &mut sessions_guard_task_update,
+            state_for_task.retention.max_sessions,
+        );
+        drop(sessions_guard_task_update);
         emit_audit_event(&state_for_task, "workflow_finished", event_data).await;
         state_for_task
             .handles
@@ -4315,8 +4637,8 @@ async fn launch_workflow(
             .await
             .remove(&req_id_for_task);
     });
-    state.handles.write().await.insert(req_id.clone(), handle);
-    Ok(req_id)
+    state.handles.write().await.insert(new_req_id.clone(), handle);
+    Ok(new_req_id)
 }
 
 #[cfg(test)]
@@ -4325,6 +4647,7 @@ mod tests {
         ChatIntentConfig, DaemonHitl, DaemonStateSnapshot, HitlPending, SessionInfo,
         TriggerLeaseConfig, WorkflowEntry, WorkflowMetaResponse, collect_required_providers,
         collect_watch_snapshot, evaluate_chat_intent_guardrails, evaluate_flow_readiness,
+        flow_readiness_runtime,
         find_workflow_entries_with_registry, is_authorized, load_daemon_state, load_flow_registry,
         matches_workflow_meta_filters, missing_required_capabilities, parse_chat_intents_doc,
         parse_chat_intents_value, parse_chat_run_request, parse_run_registered_options,
@@ -4343,103 +4666,104 @@ mod tests {
 
     #[tokio::test]
     async fn resolves_workflow_by_file_and_name() {
-        let dir = std::env::temp_dir().join(format!(
+        let dir_resolve = std::env::temp_dir().join(format!(
             "anna-daemon-reg-{}-{}",
             std::process::id(),
             rand::random::<u32>()
         ));
-        tokio::fs::create_dir_all(&dir)
+        tokio::fs::create_dir_all(&dir_resolve)
             .await
             .expect("create temp dir");
-        let file = dir.join("demo.anna");
+        let workflow_file = dir_resolve.join("demo.anna");
         tokio::fs::write(
-            &file,
+            &workflow_file,
             "name: demo-workflow\nstages:\n  - id: hello\n    exec: \"echo hi\"\n",
         )
         .await
         .expect("write workflow");
 
-        let by_file = resolve_registered_workflow_entry_with_registry(&dir, None, "demo.anna")
+        let by_file = resolve_registered_workflow_entry_with_registry(&dir_resolve, None, "demo.anna")
             .await
             .expect("resolve by file")
             .map(|v| v.path);
-        assert_eq!(by_file.as_deref(), Some(file.as_path()));
+        assert_eq!(by_file.as_deref(), Some(workflow_file.as_path()));
 
-        let by_name = resolve_registered_workflow_entry_with_registry(&dir, None, "demo-workflow")
+        let by_name =
+            resolve_registered_workflow_entry_with_registry(&dir_resolve, None, "demo-workflow")
             .await
             .expect("resolve by workflow name")
             .map(|v| v.path);
-        assert_eq!(by_name.as_deref(), Some(file.as_path()));
+        assert_eq!(by_name.as_deref(), Some(workflow_file.as_path()));
 
-        let by_stem = resolve_registered_workflow_entry_with_registry(&dir, None, "demo")
+        let by_stem = resolve_registered_workflow_entry_with_registry(&dir_resolve, None, "demo")
             .await
             .expect("resolve by stem")
             .map(|v| v.path);
-        assert_eq!(by_stem.as_deref(), Some(file.as_path()));
+        assert_eq!(by_stem.as_deref(), Some(workflow_file.as_path()));
     }
 
     #[tokio::test]
     async fn loads_flow_registry_and_rejects_duplicates() {
-        let dir = std::env::temp_dir().join(format!(
+        let dir_registry = std::env::temp_dir().join(format!(
             "anna-daemon-flow-reg-{}-{}",
             std::process::id(),
             rand::random::<u32>()
         ));
-        tokio::fs::create_dir_all(&dir)
+        tokio::fs::create_dir_all(&dir_registry)
             .await
             .expect("create temp dir");
 
-        let valid = dir.join("registry.yml");
+        let valid = dir_registry.join("registry.yml");
         tokio::fs::write(
             &valid,
             "flows:\n  - flow_id: alpha\n    path: a.anna\n    max_concurrency: 2\n  - flow_id: beta\n    path: b.anna\n",
         )
         .await
         .expect("write valid registry");
-        let parsed = load_flow_registry(&valid)
+        let parsed_registry = load_flow_registry(&valid)
             .await
             .expect("parse valid registry");
-        assert_eq!(parsed.len(), 2);
-        assert_eq!(parsed[0].flow_id, "alpha");
-        assert_eq!(parsed[0].max_concurrency, Some(2));
+        assert_eq!(parsed_registry.len(), 2);
+        assert_eq!(parsed_registry[0].flow_id, "alpha");
+        assert_eq!(parsed_registry[0].max_concurrency, Some(2));
 
-        let duplicate = dir.join("registry-dup.yml");
+        let duplicate = dir_registry.join("registry-dup.yml");
         tokio::fs::write(
             &duplicate,
             "flows:\n  - flow_id: same\n    path: a.anna\n  - flow_id: same\n    path: b.anna\n",
         )
         .await
         .expect("write duplicate registry");
-        let err = load_flow_registry(&duplicate)
+        let duplicate_registry_error = load_flow_registry(&duplicate)
             .await
             .expect_err("duplicate flow_id should fail");
-        assert!(err.to_string().contains("duplicate flow_id"));
+        assert!(duplicate_registry_error.to_string().contains("duplicate flow_id"));
 
-        let invalid_concurrency = dir.join("registry-invalid.yml");
+        let invalid_concurrency = dir_registry.join("registry-invalid.yml");
         tokio::fs::write(
             &invalid_concurrency,
             "flows:\n  - flow_id: bad\n    path: a.anna\n    max_concurrency: 0\n",
         )
         .await
         .expect("write invalid registry");
-        let err = load_flow_registry(&invalid_concurrency)
+        let invalid_concurrency_error = load_flow_registry(&invalid_concurrency)
             .await
             .expect_err("max_concurrency=0 should fail");
-        assert!(err.to_string().contains("max_concurrency=0"));
+        assert!(invalid_concurrency_error.to_string().contains("max_concurrency=0"));
     }
 
     #[tokio::test]
     async fn registry_entries_filter_directory_scan_and_support_flow_id() {
-        let dir = std::env::temp_dir().join(format!(
+        let dir_registry_entries = std::env::temp_dir().join(format!(
             "anna-daemon-registry-entries-{}-{}",
             std::process::id(),
             rand::random::<u32>()
         ));
-        tokio::fs::create_dir_all(&dir)
+        tokio::fs::create_dir_all(&dir_registry_entries)
             .await
             .expect("create temp dir");
 
-        let included = dir.join("included.anna");
+        let included = dir_registry_entries.join("included.anna");
         tokio::fs::write(
             &included,
             "name: included-flow\nstages:\n  - id: hello\n    exec: \"echo hi\"\n",
@@ -4447,13 +4771,13 @@ mod tests {
         .await
         .expect("write included workflow");
         tokio::fs::write(
-            dir.join("not-listed.anna"),
+            dir_registry_entries.join("not-listed.anna"),
             "name: hidden-flow\nstages:\n  - id: hello\n    exec: \"echo hidden\"\n",
         )
         .await
         .expect("write non-listed workflow");
 
-        let registry = dir.join("flows.yml");
+        let registry = dir_registry_entries.join("flows.yml");
         tokio::fs::write(
             &registry,
             "flows:\n  - flow_id: prod-deploy\n    path: included.anna\n",
@@ -4461,15 +4785,23 @@ mod tests {
         .await
         .expect("write registry");
 
-        let entries = find_workflow_entries_with_registry(&dir, Some(&registry))
+        let workflow_entries_registry =
+            find_workflow_entries_with_registry(&dir_registry_entries, Some(&registry))
             .await
             .expect("load registry-based entries");
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].workflow_name, "included-flow");
-        assert_eq!(entries[0].flow_id.as_deref(), Some("prod-deploy"));
+        assert_eq!(workflow_entries_registry.len(), 1);
+        assert_eq!(workflow_entries_registry[0].workflow_name, "included-flow");
+        assert_eq!(
+            workflow_entries_registry[0].flow_id.as_deref(),
+            Some("prod-deploy")
+        );
 
         let by_flow_id =
-            resolve_registered_workflow_entry_with_registry(&dir, Some(&registry), "prod-deploy")
+            resolve_registered_workflow_entry_with_registry(
+                &dir_registry_entries,
+                Some(&registry),
+                "prod-deploy",
+            )
                 .await
                 .expect("resolve by flow_id")
                 .map(|v| v.path);
@@ -4478,7 +4810,7 @@ mod tests {
 
     #[test]
     fn missing_capability_filter_works_with_wildcard_and_case() {
-        let entry = WorkflowEntry {
+        let workflow_entry_capability = WorkflowEntry {
             file_name: "x.anna".to_string(),
             flow_id: Some("x".to_string()),
             workflow_name: "x".to_string(),
@@ -4501,21 +4833,23 @@ mod tests {
             "http".to_string(),
             "VaUlT".to_ascii_lowercase(),
         ]);
-        let missing = missing_required_capabilities(&entry, &node);
-        assert!(missing.is_empty());
+        let missing_supported_caps = missing_required_capabilities(&workflow_entry_capability, &node);
+        assert!(missing_supported_caps.is_empty());
 
         let restricted = std::collections::HashSet::from(["k8s".to_string()]);
-        let missing = missing_required_capabilities(&entry, &restricted);
-        assert_eq!(missing, vec!["vault".to_string()]);
+        let missing_restricted_caps =
+            missing_required_capabilities(&workflow_entry_capability, &restricted);
+        assert_eq!(missing_restricted_caps, vec!["vault".to_string()]);
 
         let wildcard = std::collections::HashSet::from(["*".to_string()]);
-        let missing = missing_required_capabilities(&entry, &wildcard);
-        assert!(missing.is_empty());
+        let missing_with_wildcard =
+            missing_required_capabilities(&workflow_entry_capability, &wildcard);
+        assert!(missing_with_wildcard.is_empty());
     }
 
     #[test]
     fn evaluate_flow_readiness_checks_concurrency_and_capabilities() {
-        let entry = WorkflowEntry {
+        let workflow_entry_readiness = WorkflowEntry {
             file_name: "x.anna".to_string(),
             flow_id: Some("x".to_string()),
             workflow_name: "x".to_string(),
@@ -4533,25 +4867,40 @@ mod tests {
             workflow_workdir: None,
         };
 
-        let caps = std::collections::HashSet::from(["k8s".to_string()]);
-        let ok = evaluate_flow_readiness(&entry, &caps, None, 1, None, 0, None);
-        assert!(ok.can_run());
-        assert!(!ok.concurrency_blocked);
-        assert!(!ok.owner_concurrency_blocked);
+        let readiness_caps = std::collections::HashSet::from(["k8s".to_string()]);
+        let readiness_ok = evaluate_flow_readiness(
+            &workflow_entry_readiness,
+            &readiness_caps,
+            None,
+            flow_readiness_runtime(1, None, 0, None),
+        );
+        assert!(readiness_ok.can_run());
+        assert!(!readiness_ok.concurrency_blocked);
+        assert!(!readiness_ok.owner_concurrency_blocked);
 
-        let blocked = evaluate_flow_readiness(&entry, &caps, None, 2, None, 0, None);
-        assert!(!blocked.can_run());
-        assert!(blocked.concurrency_blocked);
+        let readiness_blocked = evaluate_flow_readiness(
+            &workflow_entry_readiness,
+            &readiness_caps,
+            None,
+            flow_readiness_runtime(2, None, 0, None),
+        );
+        assert!(!readiness_blocked.can_run());
+        assert!(readiness_blocked.concurrency_blocked);
 
         let missing_caps = std::collections::HashSet::from(["shell".to_string()]);
-        let missing = evaluate_flow_readiness(&entry, &missing_caps, None, 0, None, 0, None);
-        assert!(!missing.can_run());
-        assert_eq!(missing.missing_capabilities, vec!["k8s".to_string()]);
+        let readiness_missing = evaluate_flow_readiness(
+            &workflow_entry_readiness,
+            &missing_caps,
+            None,
+            flow_readiness_runtime(0, None, 0, None),
+        );
+        assert!(!readiness_missing.can_run());
+        assert_eq!(readiness_missing.missing_capabilities, vec!["k8s".to_string()]);
     }
 
     #[test]
     fn evaluate_flow_readiness_blocks_missing_provider() {
-        let entry = WorkflowEntry {
+        let workflow_entry_provider = WorkflowEntry {
             file_name: "x.anna".to_string(),
             flow_id: Some("x".to_string()),
             workflow_name: "x".to_string(),
@@ -4569,16 +4918,21 @@ mod tests {
             workflow_workdir: None,
         };
 
-        let caps = std::collections::HashSet::new();
-        let allowed = std::collections::HashSet::from(["shell".to_string()]);
-        let readiness = evaluate_flow_readiness(&entry, &caps, Some(&allowed), 0, None, 0, None);
-        assert!(!readiness.can_run());
-        assert_eq!(readiness.missing_providers, vec!["cli".to_string()]);
+        let provider_caps = std::collections::HashSet::new();
+        let provider_allowlist = std::collections::HashSet::from(["shell".to_string()]);
+        let provider_readiness = evaluate_flow_readiness(
+            &workflow_entry_provider,
+            &provider_caps,
+            Some(&provider_allowlist),
+            flow_readiness_runtime(0, None, 0, None),
+        );
+        assert!(!provider_readiness.can_run());
+        assert_eq!(provider_readiness.missing_providers, vec!["cli".to_string()]);
     }
 
     #[test]
     fn collect_required_providers_detects_hooks_vote_and_stage_provider() {
-        let workflow = Workflow {
+        let provider_detection_workflow = Workflow {
             name: "providers-test".to_string(),
             mode: "once".to_string(),
             memory: false,
@@ -4610,16 +4964,16 @@ mod tests {
             source_path: None,
         };
 
-        let providers = collect_required_providers(&workflow);
+        let detected_providers = collect_required_providers(&provider_detection_workflow);
         assert_eq!(
-            providers,
+            detected_providers,
             vec!["cli".to_string(), "llm".to_string(), "shell".to_string()]
         );
     }
 
     #[test]
     fn evaluate_flow_readiness_uses_default_concurrency_when_requested() {
-        let entry = WorkflowEntry {
+        let workflow_entry_default_concurrency = WorkflowEntry {
             file_name: "x.anna".to_string(),
             flow_id: Some("x".to_string()),
             workflow_name: "x".to_string(),
@@ -4636,13 +4990,23 @@ mod tests {
             trigger_interval: None,
             workflow_workdir: None,
         };
-        let caps = std::collections::HashSet::new();
+        let default_concurrency_caps = std::collections::HashSet::new();
 
-        let manual = evaluate_flow_readiness(&entry, &caps, None, 100, None, 0, None);
+        let manual = evaluate_flow_readiness(
+            &workflow_entry_default_concurrency,
+            &default_concurrency_caps,
+            None,
+            flow_readiness_runtime(100, None, 0, None),
+        );
         assert!(manual.can_run());
         assert_eq!(manual.max_concurrency, None);
 
-        let trigger_default = evaluate_flow_readiness(&entry, &caps, None, 1, Some(1), 0, None);
+        let trigger_default = evaluate_flow_readiness(
+            &workflow_entry_default_concurrency,
+            &default_concurrency_caps,
+            None,
+            flow_readiness_runtime(1, Some(1), 0, None),
+        );
         assert!(!trigger_default.can_run());
         assert!(trigger_default.concurrency_blocked);
         assert_eq!(trigger_default.max_concurrency, Some(1));
@@ -4650,7 +5014,7 @@ mod tests {
 
     #[test]
     fn evaluate_flow_readiness_blocks_owner_limit() {
-        let entry = WorkflowEntry {
+        let workflow_entry_owner_limit = WorkflowEntry {
             file_name: "x.anna".to_string(),
             flow_id: Some("x".to_string()),
             workflow_name: "x".to_string(),
@@ -4667,32 +5031,37 @@ mod tests {
             trigger_interval: None,
             workflow_workdir: None,
         };
-        let caps = std::collections::HashSet::new();
-        let readiness = evaluate_flow_readiness(&entry, &caps, None, 0, None, 3, Some(3));
-        assert!(!readiness.can_run());
-        assert!(readiness.owner_concurrency_blocked);
-        assert_eq!(readiness.owner_running, 3);
-        assert_eq!(readiness.owner_max_concurrency, Some(3));
+        let owner_limit_caps = std::collections::HashSet::new();
+        let owner_limit_readiness = evaluate_flow_readiness(
+            &workflow_entry_owner_limit,
+            &owner_limit_caps,
+            None,
+            flow_readiness_runtime(0, None, 3, Some(3)),
+        );
+        assert!(!owner_limit_readiness.can_run());
+        assert!(owner_limit_readiness.owner_concurrency_blocked);
+        assert_eq!(owner_limit_readiness.owner_running, 3);
+        assert_eq!(owner_limit_readiness.owner_max_concurrency, Some(3));
     }
 
     #[test]
     fn owner_limit_for_prefers_specific_over_default() {
-        let policy = super::OwnerConcurrencyPolicy {
+        let owner_policy_fixture = super::OwnerConcurrencyPolicy {
             per_owner: std::collections::HashMap::from([
                 ("platform".to_string(), 5usize),
                 ("ops".to_string(), 2usize),
             ]),
             default_limit: Some(1),
         };
-        assert_eq!(super::owner_limit_for(Some("platform"), &policy), Some(5));
-        assert_eq!(super::owner_limit_for(Some("ops"), &policy), Some(2));
-        assert_eq!(super::owner_limit_for(Some("other"), &policy), Some(1));
-        assert_eq!(super::owner_limit_for(None, &policy), None);
+        assert_eq!(super::owner_limit_for(Some("platform"), &owner_policy_fixture), Some(5));
+        assert_eq!(super::owner_limit_for(Some("ops"), &owner_policy_fixture), Some(2));
+        assert_eq!(super::owner_limit_for(Some("other"), &owner_policy_fixture), Some(1));
+        assert_eq!(super::owner_limit_for(None, &owner_policy_fixture), None);
     }
 
     #[test]
     fn build_running_indexes_tracks_workflow_and_owner_counts() {
-        let sessions = std::collections::HashMap::from([
+        let sessions_fixture = std::collections::HashMap::from([
             (
                 "a".to_string(),
                 SessionInfo {
@@ -4736,61 +5105,66 @@ mod tests {
                 },
             ),
         ]);
-        let (by_workflow, by_owner) = super::build_running_indexes(&sessions);
+        let (by_workflow, by_owner) = super::build_running_indexes(&sessions_fixture);
         assert_eq!(by_workflow.get("deploy"), Some(&2usize));
         assert_eq!(by_owner.get("platform"), Some(&2usize));
     }
 
     #[test]
     fn parse_run_registered_options_supports_empty_and_json() {
-        let empty = parse_run_registered_options("  ").expect("empty body should be accepted");
-        assert!(empty.vars.is_empty());
-        assert_eq!(empty.max_iterations, None);
+        let empty_run_options =
+            parse_run_registered_options("  ").expect("empty body should be accepted");
+        assert!(empty_run_options.vars.is_empty());
+        assert_eq!(empty_run_options.max_iterations, None);
 
-        let parsed = parse_run_registered_options(
+        let parsed_run_options = parse_run_registered_options(
             r#"{"vars":{"ENV":"prod","REGION":"eu"},"max_iterations":2}"#,
         )
         .expect("valid json body");
         assert_eq!(
-            parsed.vars,
+            parsed_run_options.vars,
             std::collections::HashMap::from([
                 (String::from("ENV"), String::from("prod")),
                 (String::from("REGION"), String::from("eu")),
             ])
         );
-        assert_eq!(parsed.max_iterations, Some(2));
+        assert_eq!(parsed_run_options.max_iterations, Some(2));
     }
 
     #[test]
     fn parse_chat_run_request_requires_intent() {
-        let err = parse_chat_run_request("{}").expect_err("intent is required");
-        assert!(err.to_string().contains("requires non-empty 'intent'"));
+        let missing_intent_error = parse_chat_run_request("{}").expect_err("intent is required");
+        assert!(missing_intent_error.to_string().contains("requires non-empty 'intent'"));
 
-        let parsed = parse_chat_run_request(
+        let parsed_chat_request = parse_chat_run_request(
             r#"{"intent":"deploy","vars":{"ENV":"prod"},"max_iterations":2}"#,
         )
         .expect("valid chat request");
-        assert_eq!(parsed.intent, "deploy");
-        assert_eq!(parsed.vars.get("ENV").map(String::as_str), Some("prod"));
-        assert_eq!(parsed.max_iterations, Some(2));
+        assert_eq!(parsed_chat_request.intent, "deploy");
+        assert_eq!(
+            parsed_chat_request.vars.get("ENV").map(String::as_str),
+            Some("prod")
+        );
+        assert_eq!(parsed_chat_request.max_iterations, Some(2));
     }
 
     #[test]
     fn parse_chat_intents_value_handles_invalid_entries() {
-        let parsed = parse_chat_intents_value("deploy=prod-deploy,ops=ops-flow,bad-entry, =empty,");
+        let parsed_intents_value =
+            parse_chat_intents_value("deploy=prod-deploy,ops=ops-flow,bad-entry, =empty,");
         assert_eq!(
-            parsed.get("deploy").map(|v| v.workflow.as_str()),
+            parsed_intents_value.get("deploy").map(|v| v.workflow.as_str()),
             Some("prod-deploy")
         );
         assert_eq!(
-            parsed.get("ops").map(|v| v.workflow.as_str()),
+            parsed_intents_value.get("ops").map(|v| v.workflow.as_str()),
             Some("ops-flow")
         );
         assert_eq!(
-            parsed.get("deploy").map(|v| v.max_iterations_cap),
+            parsed_intents_value.get("deploy").map(|v| v.max_iterations_cap),
             Some(None)
         );
-        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed_intents_value.len(), 2);
     }
 
     #[test]
@@ -4838,22 +5212,22 @@ mod tests {
 
     #[test]
     fn parse_chat_intents_doc_rejects_empty_result() {
-        let err = parse_chat_intents_doc("intents: []\n", "inline-empty")
+        let empty_doc_error = parse_chat_intents_doc("intents: []\n", "inline-empty")
             .expect_err("empty intent list should fail");
-        assert!(err.to_string().contains("has no valid entries"));
+        assert!(empty_doc_error.to_string().contains("has no valid entries"));
     }
 
     #[tokio::test]
     async fn resolve_trigger_leadership_renews_and_fails_over() {
-        let dir = std::env::temp_dir().join(format!(
+        let lease_test_dir = std::env::temp_dir().join(format!(
             "anna-trigger-lease-{}-{}",
             std::process::id(),
             rand::random::<u32>()
         ));
-        tokio::fs::create_dir_all(&dir)
+        tokio::fs::create_dir_all(&lease_test_dir)
             .await
             .expect("create temp lease dir");
-        let lease_file = dir.join("trigger-lease.json");
+        let lease_file = lease_test_dir.join("trigger-lease.json");
 
         let node_a = TriggerLeaseConfig {
             node_id: "node-a".to_string(),
@@ -4890,7 +5264,7 @@ mod tests {
 
     #[test]
     fn trigger_leader_state_change_ignores_lease_refresh_only() {
-        let previous = super::TriggerLeaderState {
+        let prior_state = super::TriggerLeaderState {
             enabled: true,
             is_leader: true,
             node_id: "node-a".to_string(),
@@ -4900,18 +5274,18 @@ mod tests {
         };
         let next_refresh = super::TriggerLeaderState {
             expires_at: Some(200),
-            ..previous.clone()
+            ..prior_state.clone()
         };
         assert!(!super::trigger_leader_state_changed(
-            &previous,
+            &prior_state,
             &next_refresh
         ));
 
         let next_holder = super::TriggerLeaderState {
             holder: Some("node-b".to_string()),
-            ..previous.clone()
+            ..prior_state.clone()
         };
-        assert!(super::trigger_leader_state_changed(&previous, &next_holder));
+        assert!(super::trigger_leader_state_changed(&prior_state, &next_holder));
     }
 
     #[test]
@@ -4944,7 +5318,7 @@ mod tests {
 
     #[test]
     fn evaluate_chat_intent_guardrails_blocks_owner_tag_and_max_iterations() {
-        let entry = WorkflowEntry {
+        let guardrail_entry = WorkflowEntry {
             file_name: "deploy.anna".to_string(),
             flow_id: Some("deploy".to_string()),
             workflow_name: "deploy".to_string(),
@@ -4969,13 +5343,19 @@ mod tests {
             required_tags: vec!["prod".to_string()],
             max_iterations_cap: Some(2),
         };
-        let ok = evaluate_chat_intent_guardrails(&ok_rule, &entry, None, Some("ops-bot"));
-        assert!(ok.reasons.is_empty());
-        assert_eq!(ok.effective_max_iterations, Some(2));
+        let guardrails_ok =
+            evaluate_chat_intent_guardrails(&ok_rule, &guardrail_entry, None, Some("ops-bot"));
+        assert!(guardrails_ok.reasons.is_empty());
+        assert_eq!(guardrails_ok.effective_max_iterations, Some(2));
 
-        let blocked = evaluate_chat_intent_guardrails(&ok_rule, &entry, Some(9), Some("ops-bot"));
-        assert!(!blocked.reasons.is_empty());
-        assert!(blocked.reasons[0].contains("max_iterations"));
+        let blocked_max_iterations = evaluate_chat_intent_guardrails(
+            &ok_rule,
+            &guardrail_entry,
+            Some(9),
+            Some("ops-bot"),
+        );
+        assert!(!blocked_max_iterations.reasons.is_empty());
+        assert!(blocked_max_iterations.reasons[0].contains("max_iterations"));
 
         let strict_rule = ChatIntentConfig {
             workflow: "deploy".to_string(),
@@ -4984,17 +5364,23 @@ mod tests {
             required_tags: vec!["critical".to_string()],
             max_iterations_cap: None,
         };
-        let blocked = evaluate_chat_intent_guardrails(&strict_rule, &entry, None, Some("ops-bot"));
-        assert_eq!(blocked.reasons.len(), 3);
+        let blocked_strict =
+            evaluate_chat_intent_guardrails(&strict_rule, &guardrail_entry, None, Some("ops-bot"));
+        assert_eq!(blocked_strict.reasons.len(), 3);
         assert!(
-            blocked
+            blocked_strict
                 .reasons
                 .iter()
                 .any(|v| v.contains("allowed callers"))
         );
-        assert!(blocked.reasons.iter().any(|v| v.contains("allowed owners")));
         assert!(
-            blocked
+            blocked_strict
+                .reasons
+                .iter()
+                .any(|v| v.contains("allowed owners"))
+        );
+        assert!(
+            blocked_strict
                 .reasons
                 .iter()
                 .any(|v| v.contains("required chat tags"))
@@ -5003,7 +5389,7 @@ mod tests {
 
     #[test]
     fn workflow_meta_filters_match_expected_values() {
-        let item = WorkflowMetaResponse {
+        let workflow_meta_item = WorkflowMetaResponse {
             id: "prod-deploy".to_string(),
             workflow: "deploy".to_string(),
             file: "deploy.anna".to_string(),
@@ -5029,35 +5415,35 @@ mod tests {
         };
 
         assert!(matches_workflow_meta_filters(
-            &item,
+            &workflow_meta_item,
             Some("prod"),
             Some("platform"),
             Some("k8s"),
             Some(false)
         ));
         assert!(!matches_workflow_meta_filters(
-            &item,
+            &workflow_meta_item,
             Some("staging"),
             None,
             None,
             None
         ));
         assert!(!matches_workflow_meta_filters(
-            &item,
+            &workflow_meta_item,
             None,
             Some("security"),
             None,
             None
         ));
         assert!(!matches_workflow_meta_filters(
-            &item,
+            &workflow_meta_item,
             None,
             None,
             Some("http"),
             None
         ));
         assert!(!matches_workflow_meta_filters(
-            &item,
+            &workflow_meta_item,
             None,
             None,
             None,
@@ -5067,87 +5453,96 @@ mod tests {
 
     #[tokio::test]
     async fn finds_webhook_metadata() {
-        let dir = std::env::temp_dir().join(format!(
+        let hook_temp_dir = std::env::temp_dir().join(format!(
             "anna-daemon-hook-{}-{}",
             std::process::id(),
             rand::random::<u32>()
         ));
-        tokio::fs::create_dir_all(&dir)
+        tokio::fs::create_dir_all(&hook_temp_dir)
             .await
             .expect("create temp dir");
         tokio::fs::write(
-            dir.join("hooked.anna"),
+            hook_temp_dir.join("hooked.anna"),
             "name: hooked\ntrigger:\n  webhook: /deploy\nstages:\n  - id: hello\n    exec: \"echo hi\"\n",
         )
         .await
         .expect("write workflow");
 
-        let entries = find_workflow_entries_with_registry(&dir, None)
+        let hook_entries_test = find_workflow_entries_with_registry(&hook_temp_dir, None)
             .await
             .expect("find entries");
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].workflow_name, "hooked");
-        assert_eq!(entries[0].trigger_webhook.as_deref(), Some("/deploy"));
+        assert_eq!(hook_entries_test.len(), 1);
+        assert_eq!(hook_entries_test[0].workflow_name, "hooked");
+        assert_eq!(
+            hook_entries_test[0].trigger_webhook.as_deref(),
+            Some("/deploy")
+        );
     }
 
     #[tokio::test]
     async fn finds_trigger_metadata() {
-        let dir = std::env::temp_dir().join(format!(
+        let trigger_temp_dir = std::env::temp_dir().join(format!(
             "anna-daemon-triggers-{}-{}",
             std::process::id(),
             rand::random::<u32>()
         ));
-        tokio::fs::create_dir_all(&dir)
+        tokio::fs::create_dir_all(&trigger_temp_dir)
             .await
             .expect("create temp dir");
         tokio::fs::write(
-            dir.join("triggered.anna"),
+            trigger_temp_dir.join("triggered.anna"),
             "name: trig\ntrigger:\n  interval: 15s\n  cron: \"0/30 * * * * * *\"\n  watch: \"*.rs\"\nstages:\n  - id: hello\n    exec: \"echo hi\"\n",
         )
         .await
         .expect("write workflow");
 
-        let entries = find_workflow_entries_with_registry(&dir, None)
+        let trigger_entries_test = find_workflow_entries_with_registry(&trigger_temp_dir, None)
             .await
             .expect("find entries");
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].workflow_name, "trig");
-        assert_eq!(entries[0].trigger_interval.as_deref(), Some("15s"));
-        assert_eq!(entries[0].trigger_cron.as_deref(), Some("0/30 * * * * * *"));
-        assert_eq!(entries[0].trigger_watch.as_deref(), Some("*.rs"));
+        assert_eq!(trigger_entries_test.len(), 1);
+        assert_eq!(trigger_entries_test[0].workflow_name, "trig");
+        assert_eq!(
+            trigger_entries_test[0].trigger_interval.as_deref(),
+            Some("15s")
+        );
+        assert_eq!(
+            trigger_entries_test[0].trigger_cron.as_deref(),
+            Some("0/30 * * * * * *")
+        );
+        assert_eq!(trigger_entries_test[0].trigger_watch.as_deref(), Some("*.rs"));
     }
 
     #[test]
     fn resolve_watch_pattern_defaults_recursive_filename_glob() {
         let root = std::path::PathBuf::from("/tmp/anna-watch");
-        let pattern = resolve_watch_pattern(&root, "*.go");
-        assert_eq!(pattern, "/tmp/anna-watch/**/*.go");
+        let watch_pattern_default = resolve_watch_pattern(&root, "*.go");
+        assert_eq!(watch_pattern_default, "/tmp/anna-watch/**/*.go");
     }
 
     #[test]
     fn collect_watch_snapshot_changes_when_file_updates() {
-        let dir = std::env::temp_dir().join(format!(
+        let watch_snapshot_dir = std::env::temp_dir().join(format!(
             "anna-watch-snap-{}-{}",
             std::process::id(),
             rand::random::<u32>()
         ));
-        std::fs::create_dir_all(&dir).expect("create temp dir");
-        let file = dir.join("x.txt");
-        std::fs::write(&file, "a").expect("write first content");
+        std::fs::create_dir_all(&watch_snapshot_dir).expect("create temp dir");
+        let watch_file_path = watch_snapshot_dir.join("x.txt");
+        std::fs::write(&watch_file_path, "a").expect("write first content");
 
-        let pattern = format!("{}/**/*.txt", dir.display());
-        let before = collect_watch_snapshot(&pattern).expect("collect before snapshot");
+        let watch_glob_pattern = format!("{}/**/*.txt", watch_snapshot_dir.display());
+        let before = collect_watch_snapshot(&watch_glob_pattern).expect("collect before snapshot");
         std::thread::sleep(std::time::Duration::from_millis(2));
-        std::fs::write(&file, "bbb").expect("write updated content");
-        let after = collect_watch_snapshot(&pattern).expect("collect after snapshot");
+        std::fs::write(&watch_file_path, "bbb").expect("write updated content");
+        let after = collect_watch_snapshot(&watch_glob_pattern).expect("collect after snapshot");
         assert_ne!(before, after);
     }
 
     #[tokio::test]
     async fn daemon_hitl_handler_waits_for_resolution() {
-        let pending = Arc::new(RwLock::new(HashMap::<String, HitlPending>::new()));
+        let pending_map = Arc::new(RwLock::new(HashMap::<String, HitlPending>::new()));
         let handler = DaemonHitl {
-            pending: pending.clone(),
+            pending: pending_map.clone(),
             max_hitl: 32,
         };
 
@@ -5165,22 +5560,25 @@ mod tests {
         });
 
         tokio::time::sleep(Duration::from_millis(50)).await;
-        let request_id = {
-            let read = pending.read().await;
-            read.keys()
+        let pending_request_id_test = {
+            let pending_read_guard = pending_map.read().await;
+            pending_read_guard
+                .keys()
                 .next()
                 .cloned()
                 .expect("pending hitl request should exist")
         };
         {
-            let mut write = pending.write().await;
-            let item = write.get_mut(&request_id).expect("pending request by id");
-            item.decision = Some("approve".to_string());
-            item.status = "resolved".to_string();
+            let mut pending_write_guard = pending_map.write().await;
+            let pending_item_mut = pending_write_guard
+                .get_mut(&pending_request_id_test)
+                .expect("pending request by id");
+            pending_item_mut.decision = Some("approve".to_string());
+            pending_item_mut.status = "resolved".to_string();
         }
 
-        let decision = waiter.await.expect("join waiter");
-        assert_eq!(decision, "approve");
+        let resolved_decision = waiter.await.expect("join waiter");
+        assert_eq!(resolved_decision, "approve");
     }
 
     #[test]
@@ -5203,13 +5601,19 @@ mod tests {
 
     #[test]
     fn request_caller_prefers_caller_then_role() {
-        let mut headers = HeaderMap::new();
-        headers.insert("x-anna-caller", HeaderValue::from_static("Ops-Bot"));
-        assert_eq!(super::request_caller(&headers).as_deref(), Some("ops-bot"));
+        let mut caller_headers = HeaderMap::new();
+        caller_headers.insert("x-anna-caller", HeaderValue::from_static("Ops-Bot"));
+        assert_eq!(
+            super::request_caller(&caller_headers).as_deref(),
+            Some("ops-bot")
+        );
 
-        headers.remove("x-anna-caller");
-        headers.insert("x-anna-role", HeaderValue::from_static("Platform"));
-        assert_eq!(super::request_caller(&headers).as_deref(), Some("platform"));
+        caller_headers.remove("x-anna-caller");
+        caller_headers.insert("x-anna-role", HeaderValue::from_static("Platform"));
+        assert_eq!(
+            super::request_caller(&caller_headers).as_deref(),
+            Some("platform")
+        );
     }
 
     #[test]
@@ -5263,13 +5667,13 @@ mod tests {
 
     #[tokio::test]
     async fn load_state_marks_running_sessions_interrupted() {
-        let file = std::env::temp_dir().join(format!(
+        let state_file_path = std::env::temp_dir().join(format!(
             "anna-daemon-state-{}-{}.json",
             std::process::id(),
             rand::random::<u32>()
         ));
-        let mut sessions = HashMap::new();
-        sessions.insert(
+        let mut session_map_load = HashMap::new();
+        session_map_load.insert(
             "a1".to_string(),
             SessionInfo {
                 id: "a1".to_string(),
@@ -5283,19 +5687,20 @@ mod tests {
                 errors: vec![],
             },
         );
-        let snapshot = DaemonStateSnapshot {
-            sessions,
+        let state_snapshot_doc = DaemonStateSnapshot {
+            sessions: session_map_load,
             hitl: HashMap::new(),
             saved_at: 1,
         };
         tokio::fs::write(
-            &file,
-            serde_json::to_string(&snapshot).expect("serialize snapshot"),
+            &state_file_path,
+            serde_json::to_string(&state_snapshot_doc).expect("serialize snapshot"),
         )
         .await
         .expect("write state file");
 
-        let (loaded_sessions, _hitl) = load_daemon_state(&file).await.expect("load state");
+        let (loaded_sessions, _hitl) =
+            load_daemon_state(&state_file_path).await.expect("load state");
         let loaded = loaded_sessions
             .get("a1")
             .expect("session should exist after load");
@@ -5319,8 +5724,8 @@ mod tests {
 
     #[test]
     fn prune_sessions_removes_oldest_non_running_first() {
-        let mut sessions = HashMap::new();
-        sessions.insert(
+        let mut session_map_prune = HashMap::new();
+        session_map_prune.insert(
             "running".to_string(),
             SessionInfo {
                 id: "running".to_string(),
@@ -5334,7 +5739,7 @@ mod tests {
                 errors: vec![],
             },
         );
-        sessions.insert(
+        session_map_prune.insert(
             "old".to_string(),
             SessionInfo {
                 id: "old".to_string(),
@@ -5348,7 +5753,7 @@ mod tests {
                 errors: vec![],
             },
         );
-        sessions.insert(
+        session_map_prune.insert(
             "new".to_string(),
             SessionInfo {
                 id: "new".to_string(),
@@ -5363,16 +5768,16 @@ mod tests {
             },
         );
 
-        prune_sessions_in_place(&mut sessions, 2);
-        assert!(sessions.contains_key("running"));
-        assert!(sessions.contains_key("new"));
-        assert!(!sessions.contains_key("old"));
+        prune_sessions_in_place(&mut session_map_prune, 2);
+        assert!(session_map_prune.contains_key("running"));
+        assert!(session_map_prune.contains_key("new"));
+        assert!(!session_map_prune.contains_key("old"));
     }
 
     #[test]
     fn prune_hitl_prefers_resolved_items() {
-        let mut hitl = HashMap::new();
-        hitl.insert(
+        let mut hitl_map_prune = HashMap::new();
+        hitl_map_prune.insert(
             "pending".to_string(),
             HitlPending {
                 id: "pending".to_string(),
@@ -5386,7 +5791,7 @@ mod tests {
                 created_at: 1,
             },
         );
-        hitl.insert(
+        hitl_map_prune.insert(
             "resolved-old".to_string(),
             HitlPending {
                 id: "resolved-old".to_string(),
@@ -5400,7 +5805,7 @@ mod tests {
                 created_at: 1,
             },
         );
-        hitl.insert(
+        hitl_map_prune.insert(
             "resolved-new".to_string(),
             HitlPending {
                 id: "resolved-new".to_string(),
@@ -5415,27 +5820,27 @@ mod tests {
             },
         );
 
-        prune_hitl_in_place(&mut hitl, 2);
-        assert!(hitl.contains_key("pending"));
-        assert!(hitl.contains_key("resolved-new"));
-        assert!(!hitl.contains_key("resolved-old"));
+        prune_hitl_in_place(&mut hitl_map_prune, 2);
+        assert!(hitl_map_prune.contains_key("pending"));
+        assert!(hitl_map_prune.contains_key("resolved-new"));
+        assert!(!hitl_map_prune.contains_key("resolved-old"));
     }
 
     #[tokio::test]
     async fn persist_policy_snapshot_writes_effective_policy() {
-        let dir = std::env::temp_dir().join(format!(
+        let policy_snapshot_dir = std::env::temp_dir().join(format!(
             "anna-policy-snapshot-{}-{}",
             std::process::id(),
             rand::random::<u32>()
         ));
-        tokio::fs::create_dir_all(&dir)
+        tokio::fs::create_dir_all(&policy_snapshot_dir)
             .await
             .expect("create temp policy dir");
-        let path = dir.join("policy.snapshot.json");
-        let state = super::AppState {
+        let policy_snapshot_path = policy_snapshot_dir.join("policy.snapshot.json");
+        let app_state_snapshot = super::AppState {
             executor: Executor::new(),
-            plays_dir: dir.clone(),
-            registry_file: Some(dir.join("flows.registry.yml")),
+            plays_dir: policy_snapshot_dir.clone(),
+            registry_file: Some(policy_snapshot_dir.join("flows.registry.yml")),
             chat_intents: Arc::new(RwLock::new(HashMap::from([(
                 "deploy".to_string(),
                 ChatIntentConfig {
@@ -5473,30 +5878,31 @@ mod tests {
                 max_hitl: 100,
             },
         };
-        persist_policy_snapshot(&state, &path)
+        persist_policy_snapshot(&app_state_snapshot, &policy_snapshot_path)
             .await
             .expect("persist policy snapshot");
 
-        let raw = tokio::fs::read_to_string(&path)
+        let persisted_snapshot_raw = tokio::fs::read_to_string(&policy_snapshot_path)
             .await
             .expect("read policy snapshot");
-        let parsed: serde_json::Value =
-            serde_json::from_str(&raw).expect("policy snapshot should be valid json");
-        assert_eq!(parsed["offline_mode"].as_bool(), Some(true));
+        let persisted_snapshot_doc: serde_json::Value =
+            serde_json::from_str(&persisted_snapshot_raw)
+                .expect("policy snapshot should be valid json");
+        assert_eq!(persisted_snapshot_doc["offline_mode"].as_bool(), Some(true));
         assert_eq!(
-            parsed["node_capabilities"],
+            persisted_snapshot_doc["node_capabilities"],
             serde_json::json!(["shell", "vault"])
         );
         assert_eq!(
-            parsed["allowed_providers"],
+            persisted_snapshot_doc["allowed_providers"],
             serde_json::json!(["shell", "vault"])
         );
         assert_eq!(
-            parsed["chat_intents"]["deploy"]["workflow"].as_str(),
+            persisted_snapshot_doc["chat_intents"]["deploy"]["workflow"].as_str(),
             Some("prod-deploy")
         );
         assert_eq!(
-            parsed["trigger_scheduler"]["is_leader"].as_bool(),
+            persisted_snapshot_doc["trigger_scheduler"]["is_leader"].as_bool(),
             Some(true)
         );
     }
@@ -5508,16 +5914,16 @@ mod tests {
             "shell".to_string(),
             "http".to_string(),
         ]);
-        let values = super::sorted_set_values(Some(&set));
+        let sorted_values_copy = super::sorted_set_values(Some(&set));
         assert_eq!(
-            values,
+            sorted_values_copy,
             vec!["http".to_string(), "shell".to_string(), "vault".to_string()]
         );
     }
 
     #[test]
     fn policy_revision_is_stable_for_same_core() {
-        let core = serde_json::json!({
+        let policy_core_fixture = serde_json::json!({
             "registry_enabled": true,
             "auth_enabled": true,
             "offline_mode": false,
@@ -5541,8 +5947,8 @@ mod tests {
             }
         });
 
-        let (a_rev, a_sig) = super::policy_revision_and_signature(&core, None);
-        let (b_rev, b_sig) = super::policy_revision_and_signature(&core, None);
+        let (a_rev, a_sig) = super::policy_revision_and_signature(&policy_core_fixture, None);
+        let (b_rev, b_sig) = super::policy_revision_and_signature(&policy_core_fixture, None);
         assert_eq!(a_rev, b_rev);
         assert_eq!(a_sig, None);
         assert_eq!(b_sig, None);
@@ -5551,7 +5957,7 @@ mod tests {
 
     #[test]
     fn policy_revision_signature_uses_hmac_sha256() {
-        let core = serde_json::json!({
+        let policy_core_for_sig = serde_json::json!({
             "registry_enabled": true,
             "chat_intents": {},
             "owner_limits": [],
@@ -5560,8 +5966,10 @@ mod tests {
             "trigger_policy": {"leader_election_enabled": false, "node_id": "node-a", "lease_file": serde_json::Value::Null}
         });
 
-        let (rev_a, sig_a) = super::policy_revision_and_signature(&core, Some("secret-a"));
-        let (rev_b, sig_b) = super::policy_revision_and_signature(&core, Some("secret-b"));
+        let (rev_a, sig_a) =
+            super::policy_revision_and_signature(&policy_core_for_sig, Some("secret-a"));
+        let (rev_b, sig_b) =
+            super::policy_revision_and_signature(&policy_core_for_sig, Some("secret-b"));
         assert_eq!(rev_a, rev_b);
         assert!(sig_a.is_some());
         assert!(sig_b.is_some());
@@ -5571,17 +5979,17 @@ mod tests {
 
     #[tokio::test]
     async fn append_audit_event_writes_ndjson_line() {
-        let dir = std::env::temp_dir().join(format!(
+        let audit_dir = std::env::temp_dir().join(format!(
             "anna-audit-{}-{}",
             std::process::id(),
             rand::random::<u32>()
         ));
-        tokio::fs::create_dir_all(&dir)
+        tokio::fs::create_dir_all(&audit_dir)
             .await
             .expect("create temp audit dir");
-        let path = dir.join("audit.log");
+        let audit_log_path = audit_dir.join("audit.log");
         let config = super::AuditLogConfig {
-            path: path.clone(),
+            path: audit_log_path.clone(),
             node_id: "node-test".to_string(),
         };
         super::append_audit_event(
@@ -5592,19 +6000,19 @@ mod tests {
         .await
         .expect("append audit event");
 
-        let raw = tokio::fs::read_to_string(&path)
+        let audit_log_raw = tokio::fs::read_to_string(&audit_log_path)
             .await
             .expect("read audit log");
-        let line = raw.lines().last().expect("audit line should exist");
-        let parsed: serde_json::Value =
+        let line = audit_log_raw.lines().last().expect("audit line should exist");
+        let audit_log_entry: serde_json::Value =
             serde_json::from_str(line).expect("audit line should be valid json");
-        assert_eq!(parsed["event"].as_str(), Some("workflow_launched"));
-        assert_eq!(parsed["node_id"].as_str(), Some("node-test"));
-        assert_eq!(parsed["data"]["request_id"].as_str(), Some("req-1"));
+        assert_eq!(audit_log_entry["event"].as_str(), Some("workflow_launched"));
+        assert_eq!(audit_log_entry["node_id"].as_str(), Some("node-test"));
+        assert_eq!(audit_log_entry["data"]["request_id"].as_str(), Some("req-1"));
         assert_eq!(
-            parsed["data"]["source"].as_str(),
+            audit_log_entry["data"]["source"].as_str(),
             Some("api_workflow_named")
         );
-        assert!(parsed["ts"].as_u64().is_some());
+        assert!(audit_log_entry["ts"].as_u64().is_some());
     }
 }
