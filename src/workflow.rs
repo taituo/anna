@@ -10,6 +10,7 @@ fn default_mode() -> String {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+/// Trigger configuration for webhook/watch/cron/interval launches.
 pub struct TriggerConfig {
     #[serde(default)]
     pub webhook: Option<String>,
@@ -22,6 +23,7 @@ pub struct TriggerConfig {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+/// Single workflow stage definition.
 pub struct Stage {
     #[serde(default)]
     pub id: String,
@@ -104,6 +106,7 @@ pub struct Stage {
 }
 
 impl Stage {
+    /// Returns the effective provider name, defaulting to `shell`.
     pub fn provider_name(&self) -> &str {
         if self.provider.trim().is_empty() {
             "shell"
@@ -112,10 +115,12 @@ impl Stage {
         }
     }
 
+    /// Parses optional stage timeout as `Duration`.
     pub fn timeout_duration(&self) -> Result<Option<Duration>> {
         parse_optional_duration(self.timeout.as_deref())
     }
 
+    /// Parses stage retry delay, defaulting to one second.
     pub fn retry_delay_duration(&self) -> Result<Duration> {
         match self.retry_delay.as_deref() {
             Some(s) => parse_duration(s)
@@ -124,6 +129,7 @@ impl Stage {
         }
     }
 
+    /// Parses loop interval, defaulting to one second.
     pub fn loop_interval_duration(&self) -> Result<Duration> {
         match self.interval.as_deref() {
             Some(s) => parse_duration(s)
@@ -134,6 +140,7 @@ impl Stage {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+/// Full workflow definition loaded from `.anna` yaml.
 pub struct Workflow {
     pub name: String,
     #[serde(default = "default_mode")]
@@ -157,6 +164,7 @@ pub struct Workflow {
 }
 
 impl Workflow {
+    /// Loads, parses and validates a workflow from disk.
     pub fn load(path: &Path) -> Result<Self> {
         let raw = std::fs::read_to_string(path)
             .with_context(|| format!("failed to read workflow '{}'", path.display()))?;
@@ -167,65 +175,25 @@ impl Workflow {
         Ok(wf)
     }
 
+    /// Validates workflow shape and stage dependencies.
     pub fn validate(&self) -> Result<()> {
-        if self.name.trim().is_empty() {
-            bail!("workflow name is required");
-        }
-        if self.mode != "once" && self.mode != "continuous" {
-            bail!("workflow mode must be 'once' or 'continuous'");
-        }
-        if self.stages.is_empty() {
-            bail!("workflow must contain at least one stage");
-        }
-
-        let mut known_stage_ids = HashSet::new();
-        for stage in &self.stages {
-            if stage.id.trim().is_empty() {
-                bail!("stage id is required");
-            }
-            if !known_stage_ids.insert(stage.id.clone()) {
-                bail!("duplicate stage id '{}'", stage.id);
-            }
-            if let Some(trust) = &stage.trust
-                && trust != "none"
-                && trust != "read"
-                && trust != "all"
-            {
-                bail!("invalid trust '{}' in stage '{}'", trust, stage.id);
-            }
-        }
-
-        let mut prior_stages = HashSet::new();
-        for stage in &self.stages {
-            for need in &stage.needs {
-                if !known_stage_ids.contains(need) {
-                    bail!(
-                        "stage '{}' references unknown dependency '{}'",
-                        stage.id,
-                        need
-                    );
-                }
-                if !prior_stages.contains(need) {
-                    bail!(
-                        "stage '{}' dependency '{}' must reference an earlier stage",
-                        stage.id,
-                        need
-                    );
-                }
-            }
-            prior_stages.insert(stage.id.clone());
-        }
+        validate_workflow_shape(self)?;
+        let stage_id_set = collect_and_validate_stage_ids(&self.stages)?;
+        validate_stage_dependencies(&self.stages, &stage_id_set)?;
         Ok(())
     }
 
+    /// Returns true if any stage is marked as loop stage.
     pub fn has_loop(&self) -> bool {
         self.stages.iter().any(|s| s.loop_stage)
     }
 
+    /// Returns true when workflow mode is `continuous`.
     pub fn is_continuous(&self) -> bool {
         self.mode == "continuous"
     }
 
+    /// Returns effective loop interval for continuous mode.
     pub fn interval(&self) -> Duration {
         for stage in &self.stages {
             if stage.loop_stage
@@ -239,6 +207,69 @@ impl Workflow {
     }
 }
 
+fn validate_workflow_shape(workflow: &Workflow) -> Result<()> {
+    if workflow.name.trim().is_empty() {
+        bail!("workflow name is required");
+    }
+    if workflow.mode != "once" && workflow.mode != "continuous" {
+        bail!("workflow mode must be 'once' or 'continuous'");
+    }
+    if workflow.stages.is_empty() {
+        bail!("workflow must contain at least one stage");
+    }
+    Ok(())
+}
+
+fn collect_and_validate_stage_ids(stages: &[Stage]) -> Result<HashSet<String>> {
+    let mut seen_stage_ids = HashSet::new();
+    for stage in stages {
+        if stage.id.trim().is_empty() {
+            bail!("stage id is required");
+        }
+        if !seen_stage_ids.insert(stage.id.to_owned()) {
+            bail!("duplicate stage id '{}'", stage.id);
+        }
+        validate_stage_trust(stage)?;
+    }
+    Ok(seen_stage_ids)
+}
+
+fn validate_stage_trust(stage: &Stage) -> Result<()> {
+    if let Some(trust) = &stage.trust
+        && trust != "none"
+        && trust != "read"
+        && trust != "all"
+    {
+        bail!("invalid trust '{}' in stage '{}'", trust, stage.id);
+    }
+    Ok(())
+}
+
+fn validate_stage_dependencies(stages: &[Stage], known_stage_ids: &HashSet<String>) -> Result<()> {
+    let mut prior_stages = HashSet::new();
+    for stage in stages {
+        for need in &stage.needs {
+            if !known_stage_ids.contains(need) {
+                bail!(
+                    "stage '{}' references unknown dependency '{}'",
+                    stage.id,
+                    need
+                );
+            }
+            if !prior_stages.contains(need) {
+                bail!(
+                    "stage '{}' dependency '{}' must reference an earlier stage",
+                    stage.id,
+                    need
+                );
+            }
+        }
+        prior_stages.insert(stage.id.to_owned());
+    }
+    Ok(())
+}
+
+/// Parses an optional human duration string.
 pub fn parse_optional_duration(raw: Option<&str>) -> Result<Option<Duration>> {
     match raw {
         Some(v) => Ok(Some(
@@ -248,88 +279,7 @@ pub fn parse_optional_duration(raw: Option<&str>) -> Result<Option<Duration>> {
     }
 }
 
+
 #[cfg(test)]
-mod tests {
-    use super::{Stage, Workflow};
-    use std::collections::HashMap;
-    use std::time::Duration;
-
-    fn base_workflow(stages: Vec<Stage>) -> Workflow {
-        Workflow {
-            name: "wf".to_string(),
-            mode: "once".to_string(),
-            memory: false,
-            tags: vec![],
-            vars: HashMap::new(),
-            env: HashMap::new(),
-            workdir: None,
-            trigger: Default::default(),
-            stages,
-            source_path: None,
-        }
-    }
-
-    #[test]
-    fn allows_dependency_on_prior_stage() {
-        let wf = base_workflow(vec![
-            Stage {
-                id: "a".to_string(),
-                exec: Some("echo a".to_string()),
-                ..Default::default()
-            },
-            Stage {
-                id: "b".to_string(),
-                needs: vec!["a".to_string()],
-                exec: Some("echo b".to_string()),
-                ..Default::default()
-            },
-        ]);
-        wf.validate().expect("workflow should validate");
-    }
-
-    #[test]
-    fn rejects_dependency_on_later_stage() {
-        let wf = base_workflow(vec![
-            Stage {
-                id: "b".to_string(),
-                needs: vec!["a".to_string()],
-                exec: Some("echo b".to_string()),
-                ..Default::default()
-            },
-            Stage {
-                id: "a".to_string(),
-                exec: Some("echo a".to_string()),
-                ..Default::default()
-            },
-        ]);
-        let err = wf.validate().expect_err("workflow should fail validation");
-        assert!(err.to_string().contains("must reference an earlier stage"));
-    }
-
-    #[test]
-    fn loop_stage_does_not_implicitly_make_workflow_continuous() {
-        let wf = base_workflow(vec![Stage {
-            id: "looped".to_string(),
-            loop_stage: true,
-            exec: Some("echo hi".to_string()),
-            ..Default::default()
-        }]);
-        assert!(!wf.is_continuous());
-        assert!(wf.has_loop());
-    }
-
-    #[test]
-    fn stage_loop_interval_uses_default_when_missing() {
-        let stage = Stage {
-            id: "looped".to_string(),
-            loop_stage: true,
-            ..Default::default()
-        };
-        assert_eq!(
-            stage
-                .loop_interval_duration()
-                .expect("default loop interval should parse"),
-            Duration::from_secs(1)
-        );
-    }
-}
+#[path = "workflow_tests.rs"]
+mod tests;
