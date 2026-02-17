@@ -74,7 +74,7 @@ pub(super) fn validate_stage_dependencies(
 }
 
 /// Parses an optional human duration string.
-pub fn parse_optional_duration(raw: Option<&str>) -> Result<Option<Duration>> {
+pub(super) fn parse_optional_duration(raw: Option<&str>) -> Result<Option<Duration>> {
     match raw {
         Some(v) => Ok(Some(
             parse_duration(v).with_context(|| format!("invalid duration '{}'", v))?,

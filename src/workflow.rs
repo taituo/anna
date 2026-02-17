@@ -7,7 +7,7 @@ use std::time::Duration;
 
 #[path = "workflow_support.rs"]
 mod workflow_support;
-pub use workflow_support::parse_optional_duration;
+use workflow_support::parse_optional_duration;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 /// Trigger configuration for webhook/watch/cron/interval launches.
@@ -107,7 +107,7 @@ pub struct Stage {
 
 impl Stage {
     /// Returns the effective provider name, defaulting to `shell`.
-    pub fn provider_name(&self) -> &str {
+    pub(crate) fn provider_name(&self) -> &str {
         if self.provider.trim().is_empty() {
             "shell"
         } else {
@@ -116,12 +116,12 @@ impl Stage {
     }
 
     /// Parses optional stage timeout as `Duration`.
-    pub fn timeout_duration(&self) -> Result<Option<Duration>> {
+    pub(crate) fn timeout_duration(&self) -> Result<Option<Duration>> {
         parse_optional_duration(self.timeout.as_deref())
     }
 
     /// Parses stage retry delay, defaulting to one second.
-    pub fn retry_delay_duration(&self) -> Result<Duration> {
+    pub(crate) fn retry_delay_duration(&self) -> Result<Duration> {
         match self.retry_delay.as_deref() {
             Some(s) => parse_duration(s)
                 .with_context(|| format!("invalid retry_delay for stage '{}': {}", self.id, s)),
@@ -130,7 +130,7 @@ impl Stage {
     }
 
     /// Parses loop interval, defaulting to one second.
-    pub fn loop_interval_duration(&self) -> Result<Duration> {
+    pub(crate) fn loop_interval_duration(&self) -> Result<Duration> {
         match self.interval.as_deref() {
             Some(s) => parse_duration(s)
                 .with_context(|| format!("invalid interval for stage '{}': {}", self.id, s)),
@@ -176,25 +176,20 @@ impl Workflow {
     }
 
     /// Validates workflow shape and stage dependencies.
-    pub fn validate(&self) -> Result<()> {
+    pub(crate) fn validate(&self) -> Result<()> {
         workflow_support::validate_workflow_shape(self)?;
         let stage_id_set = workflow_support::collect_and_validate_stage_ids(&self.stages)?;
         workflow_support::validate_stage_dependencies(&self.stages, &stage_id_set)?;
         Ok(())
     }
 
-    /// Returns true if any stage is marked as loop stage.
-    pub fn has_loop(&self) -> bool {
-        self.stages.iter().any(|s| s.loop_stage)
-    }
-
     /// Returns true when workflow mode is `continuous`.
-    pub fn is_continuous(&self) -> bool {
+    pub(crate) fn is_continuous(&self) -> bool {
         self.mode == "continuous"
     }
 
     /// Returns effective loop interval for continuous mode.
-    pub fn interval(&self) -> Duration {
+    pub(crate) fn interval(&self) -> Duration {
         for stage in &self.stages {
             if stage.loop_stage
                 && let Some(i) = &stage.interval

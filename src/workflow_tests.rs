@@ -65,7 +65,7 @@
             ..Default::default()
         }]);
         assert!(!loop_only_workflow.is_continuous());
-        assert!(loop_only_workflow.has_loop());
+        assert!(loop_only_workflow.stages.iter().any(|s| s.loop_stage));
     }
 
     #[test]
