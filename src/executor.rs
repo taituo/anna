@@ -199,7 +199,9 @@ impl Executor {
 
         stage_result
     }
+}
 
+impl Executor {
     async fn execute_stage_loop(
         &self,
         workflow: &Workflow,
@@ -592,7 +594,9 @@ impl Executor {
             )),
         }
     }
+}
 
+impl Executor {
     async fn execute_forks(
         &self,
         workflow: &Workflow,
